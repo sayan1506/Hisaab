@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
-from .money import paise
+from ..common.money import paise
 
 # --------------------------------------------------------------------------
 # Frozen file schemas. Invariant I9 asserts each written header equals these,

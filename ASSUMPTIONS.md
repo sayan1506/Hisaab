@@ -102,6 +102,37 @@ asks how you picked it.
 | 28 | **Seeds 1–5 are development seeds. Seed 99 is the holdout** and is not run until Phase 12. The reported numbers come from the holdout. | 🟡 |
 | 29 | Files are written with `newline=""` and `lineterminator="\n"`, so output is byte-identical across Windows and POSIX. Asserted by a no-CR check on the written bytes. | 🟢 |
 
+## Scoring (Phase 2) — what the reported numbers mean
+
+The definitions behind every figure in the metric block. Judge question #1 in §21 of
+the spec is *"what exactly counts as a match?"*, and these rows are the answer.
+
+| # | Assumption | Status |
+|---|---|---|
+| 30 | **The unit of account is the bank credit**, not the payment. Coverage is resolved gateway credits ÷ total gateway credits. Phase 1 has 60 payments = 60 settlements = 60 credits, so every candidate denominator looks identical; Phase 5 makes many payments settle as one credit, and the choice then decides what the headline means. Payment-side coverage is a secondary metric, never the headline. | 🟡 |
+| 31 | **Correctness is set equality on `payment_ids`, with no partial credit.** A match containing four of a batch's five payments is wrong, not 80% right. Partial credit would let a matcher that guesses broadly outscore one that abstains honestly, which is backwards for finance and backwards for this track. | 🟡 |
+| 32 | **A right answer on a row planted as unresolvable still counts as a wrong match.** `--dup-amounts` (Phase 8) plants two credits sharing a date and an amount: the inputs cannot separate them, so a matcher that commits has even odds of being right by luck. Crediting that would reward guessing over abstaining. Counted in its own cell (`lucky_guess`), which also makes a non-zero count the cheapest available leak detector. | 🟡 |
+| 33 | **Non-gateway rows are excluded from the headline** and reported as their own precision/recall pair. Correctly ignoring noise is the easiest row in the file; counting it as coverage would inflate the rate. | 🟡 |
+| 34 | **Effort estimate: minutes per exception, by reason code** — 3 min (`NON_GATEWAY_CREDIT`), 5 (`PARTIAL_SETTLEMENT_PENDING`, `ROUNDING_DRIFT`), 8 (`AMBIGUOUS_DUPLICATE_AMOUNT`), 10 (`NO_CANDIDATE`, `REFUND_UNLINKED`), 12 (`UNEXPLAINED_RESIDUAL`), 15 (`AMBIGUOUS_MULTI_SUBSET`, `CREDIT_MISSING`, `SETTLEMENT_MISSING`), 20 (`FX_RATE_GAP`). Declared in `metrics.MINUTES_PER_EXCEPTION`, which asserts the table covers every reason code so a new code cannot silently price at zero. **These are estimates, not measurements** — nobody was timed. Phase 9 refines them into per-group figures. | 🔴 |
+| 35 | **By-hand baseline: 2 minutes per bank row** — open the statement, find the settlement, tick it off. 60 rows ≈ 2 hours, which is the "vs ~2 h by hand" comparison in the metric block. Declared in `report.BY_HAND_MINUTES_PER_ROW`. Also an estimate; it is the denominator of any time-saved claim, so it is stated rather than implied. | 🔴 |
+| 36 | **A low score exits 0.** The scorer's exit code reports whether a number could be produced, never whether the number is good: 0 scored, 1 the verdict file could not be trusted, 2 bad usage. A scorer that failed on a bad score could not measure a bad matcher, which is the matcher it will spend the most time measuring. | 🟢 |
+| 37 | **Wall clock is excluded from the reproducibility comparison.** The metric JSON confines it to a `timing` object, as `run_manifest.json` does, so two runs of one matcher on one seed differ only inside that object. The human-readable block prints it freely. | 🟢 |
+
+On #34 and #35: both feed the only figure in the submission that is neither measured
+nor derived — "est. human time to clear". The honest position is that the shape of the
+claim (exceptions are a small fraction of the batch) is robust, while the absolute
+minutes are not. State them; do not defend them.
+
+**The break-even the two assumptions imply, which the write-up must not walk past.** An
+exception costs more per row than a routine tick-off, because the easy path already
+failed. At 10 min per exception against a 2 min-per-row baseline, the tool saves time
+only while exceptions stay **under 20% of bank rows** — below that the comparison
+flatters, above it the honest reading is that a human would have been faster. The stub
+fixture makes this visible on purpose: 60 exceptions score `10 h 00 min` against
+`~2 h 00 min` by hand, which is the metric block correctly reporting that a matcher
+which resolves nothing is worse than useless. Phase 13 should quote the ratio, not just
+the minutes.
+
 ## Structural guarantees, not assumptions
 
 Listed for completeness, because a judge is more likely to ask about these than
@@ -110,8 +141,16 @@ about the fee rates.
 - `truth.json` is written to a **separate directory** from the CSVs, is read only
   through `hisaab/scoring/truth_io.py`, and `tools/check_isolation.py` fails the
   build if anything on the matching path can reach it.
-- **Matched + exceptions = total, exactly.** No record is dropped. (Enforced from
-  Phase 2, when the scorer exists.)
+- **Matched + exceptions = total, exactly.** No record is dropped. Enforced since
+  Phase 2 in two places: `verdict_io.reconcile` refuses a verdict file that misses,
+  duplicates or invents a bank row, naming the offending IDs, and `metrics.score`
+  re-asserts `resolved + ignored + exceptions == total` before computing anything. A
+  matcher that omits rows cannot score well by dropping the hard ones — it does not
+  score at all.
+- **The scorer reads the answer key; the validator does not.** `verdict_io.py` checks
+  the matcher's output against plain values — the credit IDs to cover, the seed, the
+  month — and imports nothing that could reach `truth.json`. It is the one scoring
+  module deliberately absent from `check_isolation.py`'s allowlist.
 - The matching engine is **deterministic by design**. No LLM sits on the match
   path; the model explains, triages, parses narration and answers Q&A, all
   downstream of every decision. Reproducibility and defensibility are the reason.
@@ -124,3 +163,5 @@ about the fee rates.
 - [ ] Confirm the T+n cycle in #15/#16 is a defensible default and state that it varies (Phase 4)
 - [ ] Freeze #23's tolerances in code and stop touching them (Phase 3)
 - [ ] Decide whether a real holiday calendar is worth adding to #10 (Phase 4)
+- [ ] Replace #34's per-code minutes with per-group estimates once exceptions are
+      ranked (Phase 9), and decide whether #35's baseline is worth timing for real

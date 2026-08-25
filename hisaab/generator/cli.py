@@ -25,10 +25,10 @@ import time
 from dataclasses import fields
 from pathlib import Path
 
+from ..common.money import fmt
 from .config import GenConfig, MessFlags
 from .emit import DETERMINISTIC_FILES, emit
 from .invariants import InvariantError, check_story
-from .money import fmt
 from .story import build
 
 EXIT_OK = 0

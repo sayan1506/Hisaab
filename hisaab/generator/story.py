@@ -47,8 +47,8 @@ from .config import (
     WHOLE_RUPEE_PERCENT,
     GenConfig,
 )
+from ..common.money import RUPEE, rupees
 from .model import Credit, Decomposition, Payment, Settlement, Story
-from .money import RUPEE, rupees
 from .rng import substream, weighted_choice
 
 #: UTR tails are 4 digits, matching the ``XXXX4471`` shape in Appendix A. Drawn

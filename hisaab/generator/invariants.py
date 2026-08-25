@@ -50,7 +50,7 @@ from .model import (
     Decomposition,
     Story,
 )
-from .money import RUPEE
+from ..common.money import RUPEE
 
 #: I8a: expected fixed points of a true random permutation is 1, independent of n.
 #: Five is a generous ceiling that still fails loudly on identity ordering.

@@ -76,6 +76,22 @@ TRUTH_READERS: tuple[str, ...] = (
     "tools/verify_output.py",   # gate 4: re-checks written files against truth
     "tools/repro_check.py",     # gates 1/2/6: hashes truth.json across runs
     "tools/check_isolation.py",  # this file
+    # --- Phase 2's scoring harness -------------------------------------------
+    # Five entries, and the check below is coarser than it looks: importing
+    # *anything* under hisaab.scoring counts as reaching truth, because a module
+    # that can import the package can import the loader. So a module lands here
+    # either because it genuinely opens the answer key, or because it imports a
+    # sibling that does. The distinction is worth writing down per entry.
+    "hisaab/scoring/cli.py",       # genuinely opens truth, then hands plain values down
+    "hisaab/scoring/metrics.py",   # genuinely joins verdicts against the answer key
+    "hisaab/scoring/report.py",    # transitive: imports Metrics for the type, never Truth
+    "hisaab/scoring/__main__.py",  # transitive: imports .cli
+    "tools/fixtures.py",           # gate 8: the oracle and saboteur read truth by design
+    # Deliberately ABSENT: hisaab/scoring/verdict_io.py. It validates the matcher's
+    # output -- the one scoring job with no business seeing the answers -- so it takes
+    # the credit IDs, seed and month as plain arguments and imports no sibling that
+    # could reach truth. A change that hands it a Truth object fails this gate, which
+    # is the intended outcome rather than an inconvenience.
 )
 
 #: Trees allowed to **name** the truth path. Naming is not reading: the generator

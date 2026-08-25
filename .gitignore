@@ -12,3 +12,7 @@ __pycache__/
 # running anything.
 data/
 truth/
+
+# Matcher and scorer output. Same reasoning: matches.json regenerates from the
+# data plus a matcher, and tools/fixtures.py writes here by default.
+out/

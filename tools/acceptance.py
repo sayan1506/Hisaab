@@ -1,11 +1,10 @@
-"""Phase 1 acceptance — all seven gates, one command.
+"""Acceptance — every gate, one command.
 
     python tools/acceptance.py
 
-Section 8 of .plan/phase1.md lists seven gates. Running them individually means
-remembering seven commands and, eventually, forgetting one. This runs the lot and
-exits non-zero if any fails, so "Phase 1 is done" is a claim with a check behind it
-rather than a feeling.
+Running the gates individually means remembering N commands and, eventually,
+forgetting one. This runs the lot and exits non-zero if any fails, so "the phase is
+done" is a claim with a check behind it rather than a feeling.
 
   0. every module's own self-check passes
   1. byte-identical output at a fixed seed, across two processes
@@ -15,10 +14,16 @@ rather than a feeling.
   5. the answer key is unreachable from the matching path
   6. n=200 stays fast enough to rerun after every change
   7. ASSUMPTIONS.md exists and covers what the write-up has to state
+  8. the scorer reports the known answer on four known-answer fixtures  [Phase 2]
+
+**This file grows a gate per phase; it never turns over.** Gates 0-7 are Phase 1's and
+still run, because row 1 of the mess dial is the regression check -- "if clean mode is
+not 100%, the code is broken" only works if clean mode keeps being measured. Gate 8
+arrived with Phase 2's scoring harness.
 
 Gates 1, 2 and 6 live in ``repro_check.py``; gates 4 and part of 3 in
-``verify_output.py``; gate 5 in ``check_isolation.py``. This module owns gates 0,
-3 and 7, and sequences the rest.
+``verify_output.py``; gate 5 in ``check_isolation.py``; gate 8 in ``fixtures.py``. This
+module owns gates 0, 3 and 7, and sequences the rest.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ from hisaab.generator.story import build  # noqa: E402
 SELF_CHECK_MODULES: tuple[str, ...] = (
     "hisaab.common.ids",
     "hisaab.common.reasons",
-    "hisaab.generator.money",
+    "hisaab.common.money",
     "hisaab.generator.rng",
     "hisaab.generator.bizdays",
     "hisaab.generator.config",
@@ -50,6 +55,13 @@ SELF_CHECK_MODULES: tuple[str, ...] = (
     "hisaab.generator.story",
     "hisaab.generator.invariants",
     "hisaab.generator.emit",
+    # --- Phase 2, the scoring harness. Contract first, then the reader that
+    # validates it, then the join, then the formatter -- so a failure points at the
+    # deepest broken thing rather than at whatever imported it.
+    "hisaab.common.verdict",
+    "hisaab.scoring.verdict_io",
+    "hisaab.scoring.metrics",
+    "hisaab.scoring.report",
 )
 
 #: Gate 3's seed matrix. Seed 99 is absent on purpose: it is the holdout, and it is
@@ -70,6 +82,12 @@ REQUIRED_ASSUMPTION_TOPICS: dict[str, tuple[str, ...]] = {
     "timezone handling": ("IST", "UTC"),
     "money representation": ("paise",),
     "ID widths": ("pay_0001", "ID width"),
+    # --- Phase 2. Both are figures nobody measured, which is exactly why the file
+    # has to keep carrying them: "est. human time to clear" is the one number in the
+    # submission that is neither derived nor verified.
+    "exception effort estimate": ("minutes per exception", "per exception"),
+    "by-hand baseline": ("by hand",),
+    "match definition": ("set equality", "unit of account"),
 }
 
 
@@ -182,6 +200,26 @@ def gates_1_2_6_reproducibility() -> None:
             print(f"    {line.rstrip()}" if line.startswith("    ") else f"    {line.strip()}")
 
 
+def gate_8_fixtures() -> None:
+    """Phase 2: the scorer reports the known answer on four known-answer fixtures.
+
+    Shells out to ``tools/fixtures.py --check``, which in turn scores each fixture by
+    running ``python -m hisaab.scoring``. Two levels of subprocess is deliberate: it
+    means the gate exercises the CLI's exit codes and the promise that line 1 of stdout
+    is the metric JSON, which is the contract Phase 11 parses. An in-process call would
+    leave all of that untested.
+
+    It also keeps this module off ``check_isolation.py``'s truth allowlist, the same way
+    gates 1, 2, 4, 5 and 6 do.
+    """
+    print("\ngate 8 -- the scorer, against four known-answer fixtures")
+    out = _run([sys.executable, "tools/fixtures.py", "--check"], "fixtures --check")
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("gate 8"):
+            print(f"    {stripped}")
+
+
 def gate_7_assumptions() -> None:
     """ASSUMPTIONS.md must exist and cover every topic the write-up has to state."""
     print("\ngate 7 -- ASSUMPTIONS.md")
@@ -207,12 +245,12 @@ def gate_7_assumptions() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Run every Phase 1 acceptance gate.")
+    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-2).")
     p.add_argument("--skip-slow", action="store_true",
                    help="skip the n=200 sweeps in gates 3 and 6")
     args = p.parse_args(argv)
 
-    print("Phase 1 acceptance -- generator, clean mode\n" + "=" * 62)
+    print("Acceptance -- generator (clean mode) + scoring harness\n" + "=" * 62)
     gates = [
         gate_0_self_checks,
         lambda: gate_3_invariants_across_seeds((12, 60) if args.skip_slow else (12, 60, 200)),
@@ -220,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
         gate_5_isolation,
         gates_1_2_6_reproducibility,
         gate_7_assumptions,
+        gate_8_fixtures,
     ]
     try:
         for gate in gates:
@@ -229,9 +268,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all seven gates pass -- Phase 1 is complete")
-    print("\nPhase 2 can start: truth.json's schema is stable (v1, read only through")
-    print("hisaab/scoring/truth_io.py) and data/ regenerates identically from a seed.")
+    print("all eight gates pass -- Phases 1 and 2 are complete")
+    print("\nPhase 3 can start. It gets a contract (hisaab/common/verdict.py), a target")
+    print("(the oracle scores 100% coverage with 0 wrong matches on this exact data, so a")
+    print("shortfall is the matcher's fault and not the data's), and a feedback loop in")
+    print("seconds. First move: run the stub through the scorer, confirm 0%, make it climb.")
+    print("\n    python tools/fixtures.py --fixture stub --out out/matches.json")
+    print("    python -m hisaab.scoring --matches out/matches.json --truth truth/")
     return 0
 
 
