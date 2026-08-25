@@ -1,0 +1,383 @@
+"""The story's entities, and the frozen shape of every file they emit.
+
+Two design decisions live here, and both are load-bearing:
+
+**Decision #10 — cardinality.** ``Settlement.payment_ids`` and
+``Credit.settlement_ids`` are ``list[str]`` from day one, even though both hold
+exactly one element in clean mode. Modelling them as scalars would force a
+data-model rewrite in Phase 5, which is the phase you least want to be
+refactoring in.
+
+**Generate forward, strip backward.** A ``Credit`` object knows exactly which
+settlements and payments produced it -- that is how the generator built it. Its
+``csv_row()`` emits **four fields**: row_id, value_date, amount_paise, narration.
+The linkage exists in memory and lands in ``truth.json``; it never reaches
+``bank_statement.csv``. Keeping ``csv_header()`` next to the dataclass is what
+makes that discipline visible at review time rather than buried in a writer.
+
+Every ``csv_row()`` returns strings already, so the CSV writer does no formatting
+and two runs cannot differ by a repr change.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+
+from .money import paise
+
+# --------------------------------------------------------------------------
+# Frozen file schemas. Invariant I9 asserts each written header equals these,
+# in order. Appendix A of the track spec is the source; do not widen them --
+# every field added to the bank statement is difficulty deleted from the
+# submission.
+# --------------------------------------------------------------------------
+
+PAYMENTS_HEADER = (
+    "payment_id", "order_id", "captured_at", "gross_paise", "method", "currency", "status",
+)
+SETTLEMENTS_HEADER = (
+    "settlement_id", "settled_on", "net_paise", "fee_paise", "gst_paise", "tds_paise", "utr",
+)
+SETTLEMENT_ITEMS_HEADER = ("settlement_id", "payment_id")
+BANK_HEADER = ("row_id", "value_date", "amount_paise", "narration")
+REFUNDS_HEADER = ("refund_id", "payment_id", "created_at", "amount_paise")
+
+
+def iso_utc(dt: datetime) -> str:
+    """Aware datetime -> ``2026-08-10T11:04:22Z``.
+
+    Refuses a naive datetime: an unlabelled local time written as ``Z`` is a
+    silent one-day error in Phase 4's date window (trap 3).
+    """
+    if dt.tzinfo is None:
+        raise ValueError(f"refusing to serialise a naive datetime: {dt!r}")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@dataclass(frozen=True, slots=True)
+class Payment:
+    """A captured payment, as the merchant's gateway export shows it."""
+
+    payment_id: str
+    order_id: str
+    captured_at: datetime      # IST-aware; emitted as UTC Z
+    gross_paise: int
+    method: str
+    currency: str = "INR"      # only --fx ever changes this
+    status: str = "captured"
+
+    def __post_init__(self) -> None:
+        paise(self.gross_paise)
+        assert self.gross_paise > 0, f"{self.payment_id}: gross must be positive"
+        assert self.captured_at.tzinfo is not None, f"{self.payment_id}: naive captured_at"
+
+    @property
+    def business_date(self) -> date:
+        """The IST calendar date. *The* date for all business logic.
+
+        Never use ``captured_at.date()`` on the UTC projection -- see trap 3.
+        """
+        return self.captured_at.date()
+
+    @staticmethod
+    def csv_header() -> tuple[str, ...]:
+        return PAYMENTS_HEADER
+
+    def csv_row(self) -> tuple[str, ...]:
+        return (
+            self.payment_id,
+            self.order_id,
+            iso_utc(self.captured_at),
+            str(self.gross_paise),
+            self.method,
+            self.currency,
+            self.status,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Refund:
+    """A refund. Phase 1 emits none -- refunds.csv is header-only."""
+
+    refund_id: str
+    payment_id: str
+    created_at: datetime
+    amount_paise: int
+
+    def __post_init__(self) -> None:
+        paise(self.amount_paise)
+        assert self.amount_paise > 0, f"{self.refund_id}: refund must be positive"
+
+    @staticmethod
+    def csv_header() -> tuple[str, ...]:
+        return REFUNDS_HEADER
+
+    def csv_row(self) -> tuple[str, ...]:
+        return (
+            self.refund_id,
+            self.payment_id,
+            iso_utc(self.created_at),
+            str(self.amount_paise),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Settlement:
+    """A gateway settlement. ``payment_ids`` is a list from day one (decision #10)."""
+
+    settlement_id: str
+    settled_on: date
+    payment_ids: list[str]
+    net_paise: int
+    fee_paise: int = 0
+    gst_paise: int = 0
+    tds_paise: int = 0
+    utr: str = ""
+
+    def __post_init__(self) -> None:
+        for amount in (self.net_paise, self.fee_paise, self.gst_paise, self.tds_paise):
+            paise(amount)
+        assert self.payment_ids, f"{self.settlement_id}: a settlement needs payments"
+        assert len(set(self.payment_ids)) == len(self.payment_ids), (
+            f"{self.settlement_id}: duplicate payment_ids"
+        )
+        assert self.net_paise > 0, f"{self.settlement_id}: net must be positive"
+
+    @staticmethod
+    def csv_header() -> tuple[str, ...]:
+        return SETTLEMENTS_HEADER
+
+    def csv_row(self) -> tuple[str, ...]:
+        return (
+            self.settlement_id,
+            self.settled_on.isoformat(),
+            str(self.net_paise),
+            str(self.fee_paise),
+            str(self.gst_paise),
+            str(self.tds_paise),
+            self.utr,
+        )
+
+    def item_rows(self) -> list[tuple[str, str]]:
+        """Rows for ``settlement_items.csv`` -- the membership declaration.
+
+        This is what Tier 2 reads and what ``--settlement-report-late`` withholds
+        in Phase 8, forcing real subset-sum instead of reading the answer off the
+        settlement report. It links payments to settlements only; the bank link
+        stays the hard part, which is the whole task.
+        """
+        return [(self.settlement_id, pid) for pid in self.payment_ids]
+
+
+@dataclass(frozen=True, slots=True)
+class Decomposition:
+    """The expected balance for one credit, to the paisa.
+
+    Lands in ``truth.json`` so Phase 4's *prove* stage can be scored against
+    truth's arithmetic, not just against ID sets. In clean mode every deduction
+    is zero and ``expected_credit_paise == gross_paise``.
+    """
+
+    gross_paise: int
+    fee_paise: int = 0
+    gst_paise: int = 0
+    tds_paise: int = 0
+    refunds_paise: int = 0
+    reserve_paise: int = 0
+
+    def __post_init__(self) -> None:
+        for amount in self.as_dict().values():
+            paise(amount)
+
+    @property
+    def expected_credit_paise(self) -> int:
+        return (
+            self.gross_paise
+            - self.fee_paise
+            - self.gst_paise
+            - self.tds_paise
+            - self.refunds_paise
+            - self.reserve_paise
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "gross_paise": self.gross_paise,
+            "fee_paise": self.fee_paise,
+            "gst_paise": self.gst_paise,
+            "tds_paise": self.tds_paise,
+            "refunds_paise": self.refunds_paise,
+            "reserve_paise": self.reserve_paise,
+        }
+
+    def as_truth(self) -> dict[str, int]:
+        return {**self.as_dict(), "expected_credit_paise": self.expected_credit_paise}
+
+
+@dataclass(frozen=True, slots=True)
+class Credit:
+    """A bank credit.
+
+    Carries its full provenance in memory. ``csv_row()`` emits four fields: a
+    date, an amount and a junk narration string. Real bank statements are exactly
+    this impoverished, and the moment a gateway identifier lands here the task
+    being scored has evaporated.
+    """
+
+    credit_id: str
+    value_date: date
+    amount_paise: int
+    narration: str
+    # --- provenance: truth.json only, never a CSV column ---
+    settlement_ids: list[str]
+    payment_ids: list[str]
+    decomposition: Decomposition
+    refunds_netted: list[str] = field(default_factory=list)
+    reserve_held_paise: int = 0
+    resolvable: bool = True
+    reason: str | None = None
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        paise(self.amount_paise)
+        paise(self.reserve_held_paise)
+        assert self.amount_paise > 0, f"{self.credit_id}: credit must be positive"
+        assert self.settlement_ids, f"{self.credit_id}: a gateway credit needs settlements"
+        assert self.narration, f"{self.credit_id}: narration must not be empty"
+        if self.resolvable:
+            assert self.reason is None, f"{self.credit_id}: resolvable row carries a reason"
+
+    @staticmethod
+    def csv_header() -> tuple[str, ...]:
+        return BANK_HEADER
+
+    def csv_row(self) -> tuple[str, ...]:
+        """Four fields. Do not extend this method."""
+        return (
+            self.credit_id,
+            self.value_date.isoformat(),
+            str(self.amount_paise),
+            self.narration,
+        )
+
+    def as_truth(self) -> dict[str, object]:
+        """The answer-key view. ``reason``/``note`` are present and explicitly
+        ``null`` in clean mode so Phase 8 needs no schema migration and Phase 2's
+        reader never branches on key presence."""
+        return {
+            "credit_id": self.credit_id,
+            "settlement_ids": list(self.settlement_ids),
+            "payment_ids": list(self.payment_ids),
+            "refunds_netted": list(self.refunds_netted),
+            "reserve_held_paise": self.reserve_held_paise,
+            "decomposition": self.decomposition.as_truth(),
+            "resolvable": self.resolvable,
+            "reason": self.reason,
+            "note": self.note,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Story:
+    """One complete generated month, before it is split into impoverished views.
+
+    Held in memory so ``invariants.check_story`` can validate the whole thing
+    *before* anything touches disk.
+    """
+
+    payments: list[Payment]
+    settlements: list[Settlement]
+    credits: list[Credit]
+    refunds: list[Refund] = field(default_factory=list)
+    unsettled_payment_ids: list[str] = field(default_factory=list)
+    settlements_without_credit: list[str] = field(default_factory=list)
+    non_gateway_credit_ids: list[str] = field(default_factory=list)
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "payments": len(self.payments),
+            "settlements": len(self.settlements),
+            "credits": len(self.credits),
+            "refunds": len(self.refunds),
+            "noise_rows": len(self.non_gateway_credit_ids),
+        }
+
+    def total_gross_paise(self) -> int:
+        return sum(p.gross_paise for p in self.payments)
+
+    def total_net_paise(self) -> int:
+        return sum(s.net_paise for s in self.settlements)
+
+    def total_credited_paise(self) -> int:
+        return sum(c.amount_paise for c in self.credits)
+
+
+if __name__ == "__main__":
+    from datetime import timedelta
+    from .config import IST
+
+    when = datetime(2026, 8, 10, 11, 4, 22, tzinfo=IST)
+    p = Payment("pay_0001", "ord_0001", when, 1_000_000, "card")
+    assert p.business_date == date(2026, 8, 10)
+    assert p.csv_row()[2] == "2026-08-10T05:34:22Z", p.csv_row()[2]
+    assert len(p.csv_row()) == len(PAYMENTS_HEADER) == 7
+
+    s = Settlement("setl_0001", date(2026, 8, 10), ["pay_0001"], 1_000_000, utr="XXXX4471")
+    assert s.item_rows() == [("setl_0001", "pay_0001")]
+    assert len(s.csv_row()) == len(SETTLEMENTS_HEADER) == 7
+
+    d = Decomposition(gross_paise=1_000_000)
+    assert d.expected_credit_paise == 1_000_000
+    assert Decomposition(1_700_000, 34_000, 6_120, 0, 300_000).expected_credit_paise == 1_359_880
+
+    c = Credit(
+        "C0001", date(2026, 8, 10), 1_000_000, "NEFT-RAZORPAYSOFT-XXXX4471",
+        settlement_ids=["setl_0001"], payment_ids=["pay_0001"], decomposition=d,
+    )
+    # The impoverishment check: four columns, and no linkage among them.
+    assert c.csv_row() == ("C0001", "2026-08-10", "1000000", "NEFT-RAZORPAYSOFT-XXXX4471")
+    assert len(c.csv_row()) == len(BANK_HEADER) == 4
+    assert not any("setl_" in cell or "pay_" in cell for cell in c.csv_row())
+    # truth.json keeps reason/note present-but-null.
+    t = c.as_truth()
+    assert t["reason"] is None and t["note"] is None and "note" in t
+    assert t["decomposition"]["expected_credit_paise"] == 1_000_000
+
+    st = Story([p], [s], [c])
+    assert st.counts() == {"payments": 1, "settlements": 1, "credits": 1,
+                           "refunds": 0, "noise_rows": 0}
+    assert st.total_gross_paise() == st.total_net_paise() == st.total_credited_paise()
+
+    # Guards must actually fire.
+    try:
+        iso_utc(datetime(2026, 8, 10, 11, 0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("iso_utc accepted a naive datetime")
+    try:
+        Payment("pay_0002", "ord_0002", when, 1_000_00, "card", status="captured")._replace  # type: ignore[attr-defined]
+    except AttributeError:
+        pass  # frozen dataclass, no _replace -- fine, just confirming immutability shape
+    try:
+        Settlement("setl_0002", date(2026, 8, 10), [], 100)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("Settlement accepted an empty payment list")
+    try:
+        Payment("pay_0003", "ord_0003", when, 1.0, "card")  # type: ignore[arg-type]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("Payment accepted a float amount")
+    # UTC-date equals IST-date across the whole clamped hour range (trap 3).
+    for hour in range(9, 22):
+        t2 = datetime(2026, 8, 10, hour, 30, tzinfo=IST)
+        assert t2.astimezone(timezone.utc).date() == t2.date() == date(2026, 8, 10), hour
+    # ... and demonstrably fails outside it, which is why the clamp exists.
+    late = datetime(2026, 8, 10, 2, 0, tzinfo=IST)
+    assert late.astimezone(timezone.utc).date() == date(2026, 8, 9)
+    assert (late - timedelta(hours=3)).date() == date(2026, 8, 9)
+    print("model.py self-check ok")

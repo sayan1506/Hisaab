@@ -1,0 +1,208 @@
+"""Command-line entry point.
+
+    python -m hisaab.generator --seed 42 --n 60 --month 2026-08 --out data/ --truth truth/
+
+All thirteen mess flags are declared here, every one defaulting to off, so Phases
+4 through 8 flip a boolean instead of refactoring the config. Clean mode is simply
+*all of them off*.
+
+Contract with the rest of the pipeline:
+
+  * **Line 1 of stdout is the resolved config, as JSON.** Phase 11's report header
+    consumes it. (``truth/run_manifest.json`` carries the same object under
+    ``config``, which is the more robust source once the report exists.)
+  * **Exit code is the verdict.** 0 = written and verified, 1 = an invariant
+    failed and nothing was written, 2 = bad usage. A silent bad run is worse than
+    a crash, so invariants run *before* the first byte hits disk.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from dataclasses import fields
+from pathlib import Path
+
+from .config import GenConfig, MessFlags
+from .emit import DETERMINISTIC_FILES, emit
+from .invariants import InvariantError, check_story
+from .money import fmt
+from .story import build
+
+EXIT_OK = 0
+EXIT_INVARIANT_FAILED = 1
+EXIT_USAGE = 2
+
+#: One line of --help per flag, in mess-dial order, so --help reads as a
+#: difficulty ramp rather than an alphabet soup.
+FLAG_HELP: dict[str, str] = {
+    "fees": "gateway fee + GST, so the amount never matches exactly (Phase 4)",
+    "settlement_delay": "T+n settlement with weekend skew (Phase 4)",
+    "batching": "many payments settle as one bank credit (Phase 5)",
+    "netted_refunds": "a refund for an earlier order reduces a payout (Phase 6)",
+    "reserve": "part of a payout held back, arrives later (Phase 6)",
+    "tds": "tax deducted at source (Phase 6)",
+    "noise_rows": "bank rows unrelated to the gateway, which must be ignored (Phase 7)",
+    "unsettled": "payments captured but never paid out (Phase 7)",
+    "dup_amounts": "identical date and amount, genuinely unresolvable (Phase 8)",
+    "fx": "rate moves between capture and settlement (Phase 8)",
+    "rounding_edge": "amounts where fee x GST lands on a half-paisa (Phase 8)",
+    "settlement_report_late": "withhold settlement_items.csv, forcing subset-sum (Phase 8)",
+    "utr_patchy": "UTR missing or truncated on some rows (Phase 8)",
+}
+
+
+def _month(value: str) -> tuple[int, int]:
+    """``2026-08`` -> ``(2026, 8)``.
+
+    A month is required rather than defaulted from ``date.today()`` (decision #7):
+    wall-clock dependence would make today's run differ from yesterday's at the
+    same seed, which quietly destroys the reproducibility claim.
+    """
+    try:
+        year_s, month_s = value.split("-")
+        year, month = int(year_s), int(month_s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM, got {value!r}") from None
+    if not 1 <= month <= 12:
+        raise argparse.ArgumentTypeError(f"month must be 01-12, got {value!r}")
+    if not 2000 <= year <= 2100:
+        raise argparse.ArgumentTypeError(f"year looks wrong: {value!r}")
+    return year, month
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m hisaab.generator",
+        description=(
+            "Generate synthetic payments, settlements and a bank statement, plus a "
+            "truth file the matcher must never read. Phase 1 is clean mode: every "
+            "mess flag off, one payment -> one settlement -> one bank credit."
+        ),
+        epilog=(
+            "Reproducibility: the same --seed and --month produce byte-identical "
+            "files. Verify with tools/repro_check.py."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--seed", type=int, default=42, help="master seed (default: 42)")
+    p.add_argument(
+        "--n", type=int, default=60,
+        help="record count; the track's floor is 50 (default: 60)",
+    )
+    p.add_argument(
+        "--month", type=_month, default=(2026, 8), metavar="YYYY-MM",
+        help="the month to generate, e.g. 2026-08 (default: 2026-08)",
+    )
+    p.add_argument("--out", type=Path, default=Path("data"),
+                   help="directory for the CSVs the matcher reads (default: data/)")
+    p.add_argument("--truth", type=Path, default=Path("truth"),
+                   help="directory for truth.json, which it must not (default: truth/)")
+    p.add_argument(
+        "--narration-styles", type=int, default=4, metavar="N",
+        help="bank narration templates in play, 1-4; 1 is sterile (default: 4)",
+    )
+    p.add_argument("--quiet", action="store_true",
+                   help="print only the resolved-config JSON line")
+
+    mess = p.add_argument_group(
+        "mess flags",
+        "All default to off. Clean mode is all of them off. Turn them on one at a "
+        "time, in this order -- each one tells you which capability is missing next.",
+    )
+    for f in fields(MessFlags):
+        mess.add_argument(
+            f"--{f.name.replace('_', '-')}", dest=f.name, action="store_true",
+            help=FLAG_HELP[f.name],
+        )
+    mess.add_argument("--all-mess", action="store_true",
+                     help="turn on every mess flag at once (not Phase 1)")
+    return p
+
+
+def config_from_args(args: argparse.Namespace) -> GenConfig:
+    year, month = args.month
+    flag_names = MessFlags.names()
+    flags = (
+        MessFlags.all_on()
+        if args.all_mess
+        else MessFlags(**{n: getattr(args, n) for n in flag_names})
+    )
+    return GenConfig(
+        seed=args.seed,
+        n=args.n,
+        year=year,
+        month=month,
+        out_dir=args.out,
+        truth_dir=args.truth,
+        narration_styles=args.narration_styles,
+        flags=flags,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        cfg = config_from_args(args)
+    except ValueError as e:  # GenConfig validation
+        parser.error(str(e))
+        return EXIT_USAGE  # unreachable; parser.error exits 2
+
+    # Line 1 of stdout: the resolved config, as JSON.
+    print(json.dumps(cfg.resolved(), ensure_ascii=False))
+
+    started = time.perf_counter()
+    story = build(cfg)
+    try:
+        report = check_story(story, cfg)
+    except InvariantError as e:
+        print(f"\nINVARIANT FAILED -- nothing written.\n  {e}", file=sys.stderr)
+        return EXIT_INVARIANT_FAILED
+    elapsed = time.perf_counter() - started
+
+    result = emit(story, cfg, report, elapsed_seconds=elapsed)
+    total = time.perf_counter() - started
+
+    if args.quiet:
+        return EXIT_OK
+
+    counts = story.counts()
+    mode = "clean" if cfg.clean_mode else f"mess[{','.join(cfg.flags.enabled())}]"
+    print(
+        f"\n{counts['payments']} records, {mode}, seed {cfg.seed}, {cfg.month_label} "
+        f"-- generated in {total * 1000:.0f} ms"
+    )
+    print(
+        f"  gross {fmt(story.total_gross_paise())}  =  "
+        f"net {fmt(story.total_net_paise())}  =  "
+        f"credited {fmt(story.total_credited_paise())}"
+    )
+    print(
+        f"  invariants pass: {report['date_blocks']} date blocks, "
+        f"numbering fixed points {report['numbering_fixed_points']}, "
+        f"within-block alignment {report['within_block_aligned']}"
+    )
+    print(f"\n  {result.data_dir}{Path().anchor}  (the matcher reads these)")
+    for name in ("payments.csv", "settlements.csv", "settlement_items.csv",
+                 "bank_statement.csv", "refunds.csv"):
+        n_rows = result.rows_written[name]
+        note = "  <- header only, on purpose" if n_rows == 0 else ""
+        print(f"    {name:<22} {n_rows:>4} rows  {result.hashes[name][:12]}{note}")
+    print(f"\n  {result.truth_dir}{Path().anchor}  (the matcher NEVER reads these)")
+    for name in ("truth.json", "run_manifest.json"):
+        print(f"    {name:<22} {result.rows_written[name]:>4} rows  {result.hashes[name][:12]}")
+    print(
+        f"\n  reproduce: python -m hisaab.generator --seed {cfg.seed} "
+        f"--n {cfg.n} --month {cfg.month_label}"
+    )
+    if not args.quiet:
+        assert set(DETERMINISTIC_FILES) <= set(result.hashes)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

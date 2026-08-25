@@ -1,3 +1,14 @@
 .claude
 .response
 .plan
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Generator output. Byte-reproducible from a seed (tools/repro_check.py proves
+# it), so versioning it would just add churn. Phase 13 can commit one frozen
+# holdout run as a submission artifact if a judge should see the data without
+# running anything.
+data/
+truth/
