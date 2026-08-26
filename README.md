@@ -44,8 +44,8 @@ Python 3.12. **No dependencies** — standard library only, no virtualenv needed
 # 1. Generate a month of data plus the answer key (byte-reproducible from the seed)
 python -m hisaab.generator --seed 42 --n 60
 
-# 2. Build a known-answer fixture and score it
-python tools/fixtures.py --fixture oracle --out out/matches.json
+# 2. Match it, then score the result against the answer key
+python -m hisaab.matcher --data data/ --out out/matches.json
 python -m hisaab.scoring --matches out/matches.json --truth truth/
 ```
 
@@ -57,7 +57,7 @@ The scorer prints the metric block:
 ```
 Records processed          60 bank rows (60 gateway, 0 non-gateway)
 Run                        seed 42, 2026-08, clean mode, flags: none
-Matcher                    fixture:oracle@1
+Matcher                    tier1@0.3.0
 
 Coverage                   60/60    (100.0%)   how often it committed
 Correctness                60/60    (100.0%)   how often it was right
@@ -72,13 +72,36 @@ Est. human time to clear   0 min   (vs ~2 h 00 min for the batch by hand)
 ```
 
 100% is expected *here* and is not the failing signal above: this is clean mode, the
-easiest rung of the difficulty dial, and the oracle fixture reads the answer key on
-purpose. It exists to prove the target is reachable on this data, so that when the real
-matcher falls short the shortfall is unambiguously the matcher's fault and not the
-dataset's.
+easiest rung of the difficulty dial, where one payment becomes one settlement becomes one
+bank credit with no fees and no delay. Row 1 of the difficulty dial **requires** 100% —
+it is the regression check, not an achievement.
+
+What that number does **not** prove is worth stating in the same breath:
+
+- **The date window is untested.** Every credit lands on its settlement's own date, so
+  ±1000 days scores exactly the same as ±0. The window has a real interface and a
+  unit-tested tie-break, but no end-to-end run here exercises either.
+- **The business-day calendar is exercised only by its own unit test**, including the edge
+  where a weekend settlement is zero business days from Monday's credit.
+- **The narration parser is not on the match path at all.** That is deliberate, and it is
+  gated — see [what Tier 1 refuses to do](#what-tier-1-does-and-what-it-refuses-to-do).
 
 Line 1 of stdout is the same block as JSON, for a caller that parses rather than reads.
 `--quiet` prints that line alone.
+
+### Compare against a known answer
+
+The matcher is measured against four fixtures whose scores are known before they run — a
+stub that abstains on everything, an oracle that copies the answer key, a saboteur that
+corrupts exactly six matches, and a zip that matches by row position:
+
+```bash
+python tools/fixtures.py --fixture oracle --out out/oracle.json
+python -m hisaab.scoring --matches out/oracle.json --truth truth/
+```
+
+The oracle exists to prove the target is *reachable* on this data, so a matcher shortfall
+is unambiguously the matcher's fault and not the dataset's. Tier 1 currently matches it.
 
 ### Verify the whole thing
 
@@ -87,32 +110,50 @@ python -m hisaab.generator --seed 42 --n 60   # if you have not already
 python tools/acceptance.py
 ```
 
-Eight gates, one command, exit code is the verdict. Byte-identical output at a fixed
+Nine gates, one command, exit code is the verdict. Byte-identical output at a fixed
 seed across two processes; invariants on three seeds in memory and again re-read from
-disk; the leak audit; truth isolation; throughput; the assumptions file; and the four
-known-answer fixtures.
+disk; the leak audit; truth isolation; throughput; the assumptions file; the four
+known-answer fixtures; and the matcher at 100/100/0 across three seeds × two sizes,
+including the check that blanking every bank narration changes no decision.
 
 ---
 
-## Current state — Phase 2 of 13
-
-Honest status, because the interesting part is not built yet:
+## Current state — Phase 3 of 13
 
 | | Phase | State |
 |---|---|---|
 | ✅ | **1. Generator, clean mode** | Done. Three CSVs plus an answer key, 1:1 exact matches |
 | ✅ | **2. Scoring harness** | Done. Coverage/correctness, the exception queue, four known-answer fixtures |
-| ⬜ | **3. Matcher, Tier 1** | Next. Normalize, block, exact-match — must hit 100% on clean mode |
+| ✅ | **3. Matcher, Tier 1** | Done. Exact `(value_date, net_paise)` join, 100/100/0 on clean mode |
 | ⬜ | 4–8. Fees, batching, adjustments, orphans, planted unresolvables | The difficulty dial, one flag at a time |
 | ⬜ | 9–13. Exception ranking, LLM layer, HTML report, holdout, write-up | |
-
-**There is no matcher yet.** Everything scored so far is a fixture with a known answer:
-a stub that abstains on every row, an oracle that reads the answer key, a saboteur that
-corrupts exactly six matches, and a zip that matches by row position.
 
 The scorer was built **before** the matcher on purpose. Building it second means spending
 Phase 3 eyeballing CSVs to decide whether a change helped; building it first turns every
 later change into a number that moves.
+
+### What Tier 1 does, and what it refuses to do
+
+One strategy: index settlements by amount, then require the credit's `value_date` to be
+within ±0 **business** days of the settlement's `settled_on`. Exactly one candidate
+resolves; two or more is `AMBIGUOUS_DUPLICATE_AMOUNT`; none is `NO_CANDIDATE`.
+Candidates are **counted**, never taken first — "a candidate exists" and "exactly one
+candidate exists" are different facts, and Phase 5's subset-sum depends on the
+distinction.
+
+Two shortcuts were available on this data and both are deliberately declined:
+
+- **The UTR tail resolves 60/60 on its own** — sixty distinct tails for sixty
+  settlements. Joining on it would score 100% while the amount arithmetic was never
+  exercised, and would *stay* at 100% through Phase 4 with no fee model ever written. The
+  tail is recorded as corroboration in each verdict's `note` and nothing branches on it.
+- **A bare `net_paise` is unique at n=60** — and collides 1–2 times at n=200 and 42–64
+  times at n=1000. So the key is the *pair*, the date does real work even at a ±0 window,
+  and a wider window would be actively harmful rather than merely unnecessary.
+
+The residual (`credit − Σ gross of matched payments`) is **computed**, not assumed. It is
+zero on every row in clean mode; computing it anyway means Phase 4's fee model moves a
+number that already exists.
 
 ### The difficulty dial
 
@@ -144,8 +185,20 @@ promised:
 - It is read only through `hisaab/scoring/truth_io.py`, in a package the matching path
   does not import.
 - `tools/check_isolation.py` **fails the build** if anything on the matching path imports
-  that package or names the truth file in executable code. The guard is already armed for
-  `hisaab/matcher/`, which does not exist yet.
+  that package or names the truth file in executable code. It scans `hisaab/matcher/`
+  statically, so it cannot be defeated by a module that behaves differently when imported.
+
+A sixth check closes a hole the first five left open: **nothing on the matching path may
+import `hisaab.generator` either.** That package knows the fee rates, the T+n settlement
+cycle and the narration templates — everything the matcher is supposed to infer — so
+importing it is reading the answer with extra steps, and the truth-file checks would pass
+it silently. Verified by a deliberate violation, not just asserted.
+
+That rule fixes where shared code lives, and the distinction is deliberate: **logic is
+shared through `hisaab/common/`, schemas are duplicated on purpose.** The business-day
+calendar is shared, because two calendars disagreeing by one day produce a plausible wrong
+answer that nothing detects. The five CSV header tuples are copied into the matcher's
+loader, because a drifted schema must fail loudly instead of hiding behind a shared symbol.
 
 The failure mode this prevents is silent and total: a matcher that reads the answer key
 still produces a match rate, an exception list, and a confident-looking report. Nothing
@@ -188,7 +241,7 @@ hisaab/
   common/         shared by both sides: money, IDs, reason codes, the verdict contract
   generator/      synthetic payments → settlements → bank statement, plus truth.json
   scoring/        reads truth + a matcher's verdicts, prints the metric block
-  matcher/        Phase 3 — the isolation guard is already armed for it
+  matcher/        load → normalize → block → tier1 → engine; reads data/, never truth/
 tools/
   acceptance.py       every gate, one command
   fixtures.py         four known-answer matchers (none of them a real matcher)

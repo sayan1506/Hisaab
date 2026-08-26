@@ -10,7 +10,7 @@ failure is silent and total: a matcher that reads the answer key still produces 
 match rate, an exception list and a confident-looking report. Nothing crashes. The
 submission is simply void, and the only way to know is to have checked.
 
-Five checks, all static -- no imports are executed, so this cannot be defeated by
+Six checks, all static -- no imports are executed, so this cannot be defeated by
 a module that behaves differently when imported:
 
   1. Nothing on the matching path imports ``hisaab.scoring`` or ``truth_io``.
@@ -18,10 +18,27 @@ a module that behaves differently when imported:
   3. Only allowlisted modules read the truth file; only the generator writes it.
   4. ``data/`` holds no truth file, and ``truth/`` holds no CSV.
   5. No CSV under ``data/`` contains a path reference into ``truth/``.
+  6. Nothing on the matching path imports ``hisaab.generator``.
 
 In Phase 1 the matching path does not exist yet, so checks 1 and 2 scan an empty
 set. That is the point of writing this now: the moment ``hisaab/matcher/`` appears
 in Phase 3, it is already covered, with no one having to remember to add it.
+
+**Check 6 closes a hole the first five left open.** Checks 1-5 are all about
+``truth.json``, and they would pass a matcher that imported ``hisaab.generator`` --
+which is a different leak with the same effect. That package knows the fee rates, the
+T+n settlement cycle and the narration templates, so importing it is reading the
+answer with extra steps: a matcher that asked the generator for the fee schedule
+would "reconcile" perfectly in Phase 4 while modelling nothing.
+
+The rule cuts both ways, and the direction that is *allowed* matters too. Shared
+vocabulary lives in ``hisaab/common/`` precisely so neither side has to import the
+other -- ``money.py`` moved there in Phase 2 and ``bizdays.py`` in Phase 3, both
+because the generator and the matcher genuinely need the same logic. What the matcher
+must duplicate instead is *schema*: the CSV header tuples in ``matcher/load.py``, like
+``SUPPORTED_SCHEMA_VERSION`` in ``scoring/truth_io.py``, are copied so that drift
+fails loudly. Logic is shared, schemas are duplicated, and the answer key is
+unreachable.
 
 **Why this inspects the AST rather than grepping for a string.** The first version
 of this tool did a raw text search for ``truth.json``, and it failed on its own
@@ -106,6 +123,11 @@ TRUTH_TOKENS: tuple[str, ...] = ("truth.json", "load_truth", "truth_io")
 #: Import targets that reach the scoring package however they are spelled.
 SCORING_IMPORT_PREFIXES: tuple[str, ...] = ("hisaab.scoring", "scoring.truth_io")
 
+#: Import targets that reach the generator (check 6). The generator knows the fee
+#: rates, the T+n cycle and the narration templates -- everything the matcher is
+#: supposed to *infer*. Relative spellings resolve to these too; see ``imports_of``.
+GENERATOR_IMPORT_PREFIXES: tuple[str, ...] = ("hisaab.generator", "generator.model")
+
 
 class IsolationError(Exception):
     """The matching path can reach the answer key."""
@@ -180,6 +202,21 @@ def reads_truth(path: Path) -> list[str]:
     return evidence
 
 
+def imports_generator(path: Path) -> list[str]:
+    """Evidence that ``path`` imports the generator -- check 6.
+
+    Structurally identical to ``reads_truth``'s import half, and separate from it
+    because the two failures need different explanations: reading truth is reading the
+    answers, while importing the generator is reading *how the answers were made*.
+    Both void the submission; only one of them is about a file.
+    """
+    return [
+        f"imports {mod}"
+        for mod in sorted(imports_of(path))
+        if mod.startswith(GENERATOR_IMPORT_PREFIXES)
+    ]
+
+
 def imports_of(path: Path) -> set[str]:
     """Every module named by an import in ``path``, resolved as dotted strings."""
     try:
@@ -227,6 +264,20 @@ def check(verbose: bool = True) -> dict[str, object]:
                 f"({'; '.join(refs[:3])}). The matching path must not reference it, "
                 f"even by string literal. (A docstring saying it never reads truth is "
                 f"fine -- this check ignores prose.)"
+            )
+
+        # --- 6: the matching path cannot import the generator ---------------
+        if evidence := imports_generator(path):
+            raise IsolationError(
+                f"{rel(path)} imports the generator ({'; '.join(evidence)}). The "
+                f"generator knows the fee rates, the T+n settlement cycle and the "
+                f"narration templates -- everything the matcher is supposed to infer -- "
+                f"so importing it is reading the answer with extra steps.\n"
+                f"  If the two genuinely need the same logic, move it to "
+                f"hisaab/common/ (as money.py and bizdays.py were). If it is a schema, "
+                f"duplicate it with a comment saying why, the way matcher/load.py does "
+                f"with the CSV headers, so drift fails loudly instead of hiding behind "
+                f"a shared symbol."
             )
 
     # --- 3: only allowlisted modules READ truth; only owners NAME its path ---
@@ -292,7 +343,10 @@ def check(verbose: bool = True) -> dict[str, object]:
     if verbose:
         print(f"isolation: scanned {len(all_py)} python files")
         if matcher_files:
-            print(f"  matching path: {len(matcher_files)} files, none can reach truth")
+            print(
+                f"  matching path: {len(matcher_files)} files, none can reach truth "
+                f"and none imports the generator"
+            )
         else:
             print(
                 f"  matching path: no files yet (Phase 3 creates hisaab/matcher/) -- "
@@ -305,6 +359,11 @@ def check(verbose: bool = True) -> dict[str, object]:
             print(f"    {name}")
         if data_dir.exists() and truth_dir.exists():
             print("  data/ and truth/ are separate, and neither leaks into the other")
+        if matcher_files:
+            print(
+                "  check 6: the matcher may not import hisaab.generator -- shared logic "
+                "goes to hisaab/common/, schemas get duplicated on purpose"
+            )
         print("\ngate 5 passes -- the answer key is unreachable from the matching path")
     return report
 

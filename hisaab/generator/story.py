@@ -32,7 +32,7 @@ import random
 from datetime import date, datetime
 
 from ..common import ids
-from .bizdays import BusinessCalendar
+from ..common.bizdays import BusinessCalendar
 from .config import (
     AMOUNT_BANDS,
     BANK_CHANNELS,

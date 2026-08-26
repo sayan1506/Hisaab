@@ -89,7 +89,8 @@ asks how you picked it.
 
 | # | Assumption | Status |
 |---|---|---|
-| 23 | **Tier 3 tolerance: ±50 paise and ±2 business days**, with a scoring margin over the runner-up of at least 2×. Both conditions required — "unique best" without a margin means choosing between two near-identical candidates on noise. | 🟡 pending Phase 3 |
+| 23 | **Tier 3 tolerance: ±50 paise and ±2 business days**, with a scoring margin over the runner-up of at least 2×. Both conditions required — "unique best" without a margin means choosing between two near-identical candidates on noise. | 🟡 pending Tier 3 |
+| 23a | **Tier 1 runs at ±0 paise and ±0 business days** — an exact join, not a tolerance. Phase 3 shipped the *interface* for #23 (`--window`, `--max-adjustment`, both defaulting to 0) and plumbed it to the CLI, so widening either is a parameter change rather than a rewrite. The #23 values themselves are still unused: no code reads them, and Tier 3 does not exist yet. Measured across seeds 1/2/3/42 × n=60/200/1000: every credit's `value_date` equals its settlement's `settled_on`, so ±0 costs nothing on clean mode. | 🟢 |
 | 24 | **Clean mode must be 100% resolvable** from date + amount. Invariant I3 asserts no two credits share a `(date, amount)` pair, because such a pair is genuinely indistinguishable and the honest verdict would be an abstention. That case is real and `--dup-amounts` plants it deliberately in Phase 8. | 🟢 |
 | 25 | A match counts only if its **decomposition closes to zero paise**. Matched-but-unproven is an exception (`UNEXPLAINED_RESIDUAL`), not a match. | 🟡 pending Phase 4 |
 
@@ -161,7 +162,11 @@ about the fee rates.
 
 - [ ] Verify fee rates #5–#9 against Razorpay's current published pricing (Phase 4)
 - [ ] Confirm the T+n cycle in #15/#16 is a defensible default and state that it varies (Phase 4)
-- [ ] Freeze #23's tolerances in code and stop touching them (Phase 3)
+- [ ] Freeze #23's tolerances in code and stop touching them — **deferred to the phase
+      that builds Tier 3**, not Phase 3. Phase 3 shipped the interface at ±0/±0 (#23a);
+      the tolerance values still have no reader, so there is nothing yet to freeze. The
+      discipline the original line was protecting still stands: pick them before seeing
+      what they do to the number.
 - [ ] Decide whether a real holiday calendar is worth adding to #10 (Phase 4)
 - [ ] Replace #34's per-code minutes with per-group estimates once exceptions are
       ranked (Phase 9), and decide whether #35's baseline is worth timing for real
