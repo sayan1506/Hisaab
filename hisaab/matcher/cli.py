@@ -35,6 +35,7 @@ from pathlib import Path
 
 from ..common.money import fmt
 from ..common.verdict import write_verdicts
+from .adjustments import AdjustmentReport, compare
 from .blocking import DEFAULT_MAX_ADJUSTMENT_PAISE, DEFAULT_WINDOW_DAYS
 from .engine import MATCHER_NAME, RunSummary, run
 from .fees import DEFAULT_FEE_BPS, DEFAULT_GST_BPS, FeeSchedule
@@ -217,7 +218,12 @@ def resolved_config(args: argparse.Namespace, month: str, schedule: FeeSchedule)
     }
 
 
-def _print_summary(summary: RunSummary, dataset: Dataset, written: Path) -> None:
+def _print_summary(
+    summary: RunSummary,
+    dataset: Dataset,
+    written: Path,
+    adjustments: AdjustmentReport,
+) -> None:
     counts = dataset.counts()
     print(
         f"\n{summary.bank_rows} bank rows matched in "
@@ -258,6 +264,18 @@ def _print_summary(summary: RunSummary, dataset: Dataset, written: Path) -> None
             f"  {summary.residual_nonzero} resolved rows carry a non-zero residual -- "
             f"expected once --fees is on, a finding before that"
         )
+    # Phase 6 step 2: the assumed rates, checked against what the settlement file itself
+    # declares. It sits here rather than in the engine on purpose -- ``run()`` has already
+    # committed every verdict above by the time this is computed, so the comparison cannot
+    # reach a decision even by accident. ``check_isolation.py`` check 7 enforces that
+    # direction; ``adjustments.py``'s docstring says why it is the whole design.
+    #
+    # Printed on every run, including the many where every term agrees, because the value of
+    # this line is that a reader can tell "the rates were checked" from "the rates were
+    # assumed" -- and a check that only speaks up when it fails is indistinguishable from one
+    # that was never wired in. The same argument as stating the rates at all.
+    for line in adjustments.lines():
+        print(line)
     # The measurement behind keying on the pair rather than the bare amount.
     print(
         f"  {summary.settlements_indexed} settlements indexed, "
@@ -307,8 +325,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     written = write_verdicts(args.out, run_file)
 
+    # **Computed after the verdicts are written, and that order is the point.** This is the
+    # only read of settlements.csv's declared fee/gst/tds columns in the whole matcher; every
+    # verdict above was produced from independently declared rates instead. Running the
+    # comparison here means there is no execution path by which a declared figure could reach
+    # a resolution -- the answers are on disk before the columns are opened.
+    adjustments = compare(dataset, schedule)
+
     if not args.quiet:
-        _print_summary(summary, dataset, written)
+        _print_summary(summary, dataset, written, adjustments)
     return EXIT_OK
 
 

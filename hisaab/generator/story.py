@@ -171,6 +171,41 @@ def _deductions(cfg: GenConfig, gross_paise: int, method: str) -> tuple[int, int
     return fee, mul_bps(fee, cfg.fees.gst_bps)
 
 
+def _tds(cfg: GenConfig, gross_paise: int) -> int:
+    """TDS withheld on one payment's **gross**. ``0`` unless ``--tds`` is on.
+
+    Three properties, each a deliberate difference from ``_deductions`` above.
+
+    **The base is the gross, not the fee.** §194-O withholds on the gross amount of the
+    sale, so this is not "another rate on the fee" like GST -- it is a second rate on the
+    same base the fee uses. ASSUMPTIONS.md #9/#9a carry the rate (10 bps) and the scope
+    caveat; the rate is verified and the claim that an aggregator withholds it is not.
+
+    **No method argument, and that is the whole character of the term.** Every rate in
+    ``_deductions`` depends on the rail; this one does not, because a tax rate is not a
+    price. The consequence is worth stating because it removes a property the codebase has
+    relied on since Phase 4: ``pos_upi`` is zero-*rated*, so a POS settlement pays out at
+    its gross under ``--fees`` -- but it still has TDS withheld. So ``--tds`` is the flag
+    that ends the zero-deduction row. Under ``--fees --tds`` **no** settlement settles at
+    its gross, which is measured in the self-check below rather than assumed.
+
+    **This function draws no randomness, and no stream exists for it to draw from.**
+    ``rng.py`` reserves a ``tds`` stream and ``.plan/phase6.md`` step 2 says to withhold on
+    it; both are wrong, and the plan's own reasoning is what refutes them. A withholding at
+    a declared rate on a declared gross is *fully derived* -- there is nothing to draw. A
+    draw would have to mean "TDS applies to a random subset of settlements", which is a
+    modelling claim nobody made and which no invariant could then check, since truth would
+    be the only record of which rows were chosen. So ``--tds`` is the first mess flag that
+    adds a deduction **without touching the RNG**, and it therefore cannot shift any other
+    stream: a clean-vs-tds diff at one seed moves the money columns and nothing else. That
+    is a stronger reproducibility property than any other flag has, and spending a draw to
+    look consistent with the others would destroy it.
+    """
+    if not cfg.flags.tds:
+        return 0
+    return mul_bps(gross_paise, cfg.fees.tds_bps)
+
+
 def _unique_amount(taken: set[tuple[date, int]], day: date, amount: int) -> int:
     """Nudge ``amount`` up by whole paise until ``(day, amount)`` is unused.
 
@@ -206,7 +241,11 @@ def _batch_net(
     total = 0
     for i in members:
         fee, gst = _deductions(cfg, grosses[i], methods[i])
-        total += grosses[i] - fee - gst
+        # TDS is inside the net (I4, ``invariants.py:352``), so it has to be inside the value
+        # this function protects. Leaving it out would nudge for uniqueness on a number the
+        # emitted data never carries -- I3 would then check a key nothing guarded, and the
+        # margin measured in ASSUMPTIONS #24a would be describing the wrong quantity.
+        total += grosses[i] - fee - gst - _tds(cfg, grosses[i])
     return total
 
 
@@ -581,6 +620,14 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         deductions = [_deductions(cfg, p.gross_paise, p.method) for p in batch]
         fee = sum(f for f, _ in deductions)
         gst = sum(g for _, g in deductions)
+        # Per member, then summed -- the same discipline as the fee, and at 10 bps it is not
+        # a smaller version of the same trap. Measured over 20,000 synthetic batches drawn
+        # from the modal band: per-member and batch-total rounding differ on **32.7%** of
+        # batches by at most 2 paise. (.plan/phase6.md correction (a) predicted 0p per member
+        # against 1-2p on the total -- "one of them is zero" -- which followed from reading
+        # AMOUNT_BANDS as paise. They are rupees, so the smallest gross is 10,000p and its
+        # TDS is 10p. See .plan/phase6.md section 9(a).)
+        tds = sum(_tds(cfg, p.gross_paise) for p in batch)
         gross_total = sum(p.gross_paise for p in batch)
         # Every member of a batch shares a settlement date by construction
         # (``_group_into_batches`` partitions within one date), so the settlement's date is
@@ -597,15 +644,23 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
                 settlement_id=ids.settlement_id(seq),
                 settled_on=when,
                 payment_ids=[p.payment_id for p in batch],
-                # net = gross - fee - GST, summed over the members. Both deductions are 0
-                # without --fees, so this is ``net == sum of grosses`` in clean mode and the
-                # expression stops being trivial exactly when the flag turns on. tds_paise
-                # stays 0: TDS is dial row 7, Phase 6 (decision D7) -- two gross/net wedges
-                # at once means two hypotheses per failing row.
-                net_paise=gross_total - fee - gst,
+                # net = gross - fee - GST - TDS, summed over the members. All three are 0
+                # without their flags, so this is ``net == sum of grosses`` in clean mode and
+                # the expression stops being trivial exactly when a flag turns on.
+                #
+                # **TDS is inside the net, and that is not this phase's choice to make.** I4
+                # (``invariants.py:352``) has asserted ``net == gross - fee - gst - tds``
+                # since Phase 4, and ``settlements.csv`` has carried the column since Phase 1
+                # -- so the schema settled which side of the net TDS falls on long before
+                # ``--tds`` existed. The consequence is the one worth stating: the credit
+                # still equals the net, so ``--tds`` moves **no join at all**. The exact
+                # amount band survives, blocking is untouched, and the whole flag lands as a
+                # change of *value* in a column the matcher already reads. Refunds get the
+                # same treatment in step 6; the reserve cannot, which is why it is last.
+                net_paise=gross_total - fee - gst - tds,
                 fee_paise=fee,
                 gst_paise=gst,
-                tds_paise=0,
+                tds_paise=tds,
                 utr=f"XXXX{tails[seq - 1]}",
             )
         )
@@ -743,6 +798,14 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
                     gross_paise=gross_total,
                     fee_paise=s.fee_paise,
                     gst_paise=s.gst_paise,
+                    # Phase 6 step 2. Omitting this while ``build`` subtracted TDS from the
+                    # net was caught by I4 on the first ``--tds`` run, before any file was
+                    # written: ``expected_credit_paise`` came out 85p above the credit on
+                    # C0001, which is exactly that settlement's TDS. Worth recording as the
+                    # decomposition doing its job -- truth's arithmetic is re-derived from
+                    # the terms rather than copied from the amount, so a term the answer key
+                    # forgets cannot silently agree with the CSVs.
+                    tds_paise=s.tds_paise,
                 ),
                 refunds_netted=[],
                 reserve_held_paise=0,

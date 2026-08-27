@@ -31,6 +31,31 @@ class Reason(str, Enum):
     #: appear only if the search is unavailable -- so a run reporting it is reporting a gap.
     MEMBERSHIP_UNDECLARED = "MEMBERSHIP_UNDECLARED"
     AMBIGUOUS_DUPLICATE_AMOUNT = "AMBIGUOUS_DUPLICATE_AMOUNT"
+    #: **Two declared rules close one gap with different component splits.** Phase 6
+    #: decision 8, and it exists because ``explain_gap`` went from two rules to four: with
+    #: two, both matching implied the derived fee was zero and the two were then the same
+    #: number, so first-hit was safe. With four it is not, and the honest answer when two
+    #: *different* decompositions both close a gap is that the inputs do not say which.
+    #:
+    #: Deliberately **not** ``AMBIGUOUS_MULTI_SUBSET``, which is Phase 5's code for a
+    #: *subset search* that found two answers. Sharing one code would let a rule collision
+    #: score as a search refusal and vice versa -- and both are inside
+    #: ``ABSTENTION_REASONS``, so the mistake would be invisible in every rate.
+    #:
+    #: **Unreachable at the declared rates, and that is measured rather than hoped.** Of the
+    #: six pairs the four rules admit, five collapse to identical components (a duplicate,
+    #: not an ambiguity). The only pair that can genuinely disagree is "TDS alone" against
+    #: "fee + GST alone", which needs ``fee + gst == tds`` with both non-zero -- and at the
+    #: declared rates fee-and-GST is 236 bps effective against TDS's 10, so they cannot
+    #: agree for any gross. It becomes reachable through a ``--fee-bps`` **override**, at
+    #: fee_bps 8 or 9 around a ₹105 gross, which is how ``fees.py`` tests it.
+    #:
+    #: So this code has no legitimate *planted* case: the generator cannot produce the
+    #: collision without a matcher-side rate override, and truth may not claim
+    #: unresolvability that an exhaustive matcher would refute (Phase 4b's standard). It is
+    #: still not dead -- a re-pointed rate schedule reaches it, which is exactly the
+    #: real-world case ``--fee-bps`` exists for.
+    AMBIGUOUS_ADJUSTMENT = "AMBIGUOUS_ADJUSTMENT"
     UNEXPLAINED_RESIDUAL = "UNEXPLAINED_RESIDUAL"
     PARTIAL_SETTLEMENT_PENDING = "PARTIAL_SETTLEMENT_PENDING"
     REFUND_UNLINKED = "REFUND_UNLINKED"
@@ -61,10 +86,15 @@ class Reason(str, Enum):
 if __name__ == "__main__":
     assert Reason("NO_CANDIDATE") is Reason.NO_CANDIDATE
     assert f"{Reason.FX_RATE_GAP}" == "FX_RATE_GAP"
-    # 12 with Phase 5's MEMBERSHIP_UNDECLARED. Asserted so that adding a code is a
+    # 13 with Phase 6's AMBIGUOUS_ADJUSTMENT. Asserted so that adding a code is a
     # deliberate act: the vocabulary is shared with the generator, and a code the two sides
     # do not both know about makes "did it abstain for the reason we planted?" unanswerable.
-    assert len(Reason) == 12
+    assert len(Reason) == 13
+    assert Reason.AMBIGUOUS_ADJUSTMENT is not Reason.AMBIGUOUS_MULTI_SUBSET, (
+        "decision 8: 'two rules close this gap differently' and 'the search found two "
+        "subsets' are different facts, and both sit inside ABSTENTION_REASONS -- so "
+        "sharing a code would hide the confusion in every rate"
+    )
     assert Reason.MEMBERSHIP_UNDECLARED is not Reason.AMBIGUOUS_MULTI_SUBSET, (
         "decision 8: 'nothing declares the members' and 'the search found two' are "
         "different facts and must not share a code"

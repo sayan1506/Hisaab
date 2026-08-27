@@ -264,17 +264,47 @@ def check_totals(
     net_total: int,
     credit_total: int,
     fee_cells: list[int],
+    tds_cells: list[int],
     *,
     fees_on: bool = False,
+    tds_on: bool = False,
 ) -> None:
     """I4 — the money adds up in aggregate, and deductions exist only when asked for.
 
-    Three assertions, and only the last is conditional:
+    Four assertions, and only the last two are conditional:
 
       * ``net_total == credit_total`` -- every settled paisa reached the bank.
       * ``gross_total - (every fee/gst/tds cell) == net_total`` -- the wedge between
         gross and net is *exactly* the declared deductions and nothing else.
-      * with ``--fees`` off, every deduction cell is zero.
+      * with ``--fees`` off, every fee and GST cell is zero.
+      * with ``--tds`` off, every TDS cell is zero.
+
+    **The last two were one assertion until Phase 6, and splitting them fixed a false
+    refusal and a hole at the same time.** The old form gated all three columns on
+    ``fees_on``, which was right while ``--fees`` was the only flag that could put a number
+    in any of them. Phase 6 adds a second, and one flag gating three columns then fails in
+    both directions -- measured, not reasoned:
+
+      * ``--tds`` **without** ``--fees`` was **refused**: the TDS cells are non-zero,
+        ``fees_on`` is false, and the check reported "1 non-zero fee/gst/tds cells while
+        --fees is off". A legal run, rejected.
+      * ``--fees`` **with** a stray TDS cell **passed silently**: with ``fees_on`` true the
+        assertion stood down for all three columns at once, so a TDS number appearing on a
+        run that never asked for one was invisible. That is the more dangerous half, and it
+        is the mess-flag footgun this file refuses everywhere else -- a check standing down
+        at the moment the arithmetic it guards starts moving.
+
+    This docstring previously argued the opposite, and the argument is worth keeping rather
+    than quietly deleting: *"Splitting them per column would be no stronger here and would
+    only give the two callers a chance to disagree about the order of three ints."* True
+    while one flag owned all three columns; false the moment a second flag arrives. The
+    caller-disagreement risk it worried about also goes **down**, not up, because each list
+    is now homogeneous -- there is no order of three ints left to disagree about. A stated
+    reason that expires is why the reason gets stated.
+
+    ``tds_cells`` is required rather than defaulted, deliberately. A default would let a
+    caller omit TDS from the wedge and still pass the *first* two assertions on clean data,
+    which is a silent under-count of the very quantity this function exists to bound.
 
     The second one is Phase 4's strengthening. Until now this asserted
     ``gross == net == credited``, which ``--fees`` necessarily violates, so the tempting
@@ -290,16 +320,15 @@ def check_totals(
     ``cfg.clean_mode``. Any flag at all makes ``clean_mode`` false; only ``--fees`` is
     allowed to put a number in these columns.
 
-    ``fee_cells`` is every fee, GST and TDS cell of every settlement, so their sum is the
-    whole wedge. Splitting them per column would be no stronger here and would only give
-    the two callers a chance to disagree about the order of three ints.
+    ``fee_cells`` is every fee and GST cell and ``tds_cells`` every TDS cell, so the two
+    sums together are the whole wedge.
 
     Precondition, and Phase 7 is where it breaks: every payment sits in exactly one
     settlement, so summing gross over payments and net over settlements counts the same
     money. ``--unsettled`` and ``--reserve`` void that and belong in ``SUSPENDED_BY``
     when they land; neither is implemented yet, so neither is listed there today.
     """
-    deducted = sum(fee_cells)
+    deducted = sum(fee_cells) + sum(tds_cells)
     _require(
         net_total == credit_total,
         "I4",
@@ -313,12 +342,18 @@ def check_totals(
         f"- deductions={deducted} = {gross_total - deducted}, but net={net_total} "
         f"({gross_total - deducted - net_total:+d} paise unaccounted for)",
     )
-    if not fees_on:
-        nonzero = [c for c in fee_cells if c != 0]
+    for label, cells, on in (
+        ("fee/gst", fee_cells, fees_on),
+        ("tds", tds_cells, tds_on),
+    ):
+        if on:
+            continue
+        nonzero = [c for c in cells if c != 0]
         _require(
             not nonzero,
             "I4",
-            f"{len(nonzero)} non-zero fee/gst/tds cells while --fees is off: {nonzero[:5]}",
+            f"{len(nonzero)} non-zero {label} cells while the flag that fills them is "
+            f"off: {nonzero[:5]}",
         )
 
 
@@ -532,8 +567,10 @@ def check_story(
         story.total_gross_paise(),
         story.total_net_paise(),
         story.total_credited_paise(),
-        [x for s in settlements for x in (s.fee_paise, s.gst_paise, s.tds_paise)],
+        [x for s in settlements for x in (s.fee_paise, s.gst_paise)],
+        [s.tds_paise for s in settlements],
         fees_on=cfg.flags.fees,
+        tds_on=cfg.flags.tds,
     )
     check_settlement_arithmetic(
         [
@@ -996,15 +1033,48 @@ if __name__ == "__main__":
     must_raise(
         "I4",
         "wedge is not the deductions",
-        lambda: check_totals(1_000_000, 976_400, 976_400, [20_000, 3_500, 0], fees_on=True),
+        lambda: check_totals(
+            1_000_000, 976_400, 976_400, [20_000, 3_500], [0], fees_on=True
+        ),
     )
     must_raise(
         "I4",
         "settled but never credited",
-        lambda: check_totals(1_000_000, 976_400, 976_399, [20_000, 3_600, 0], fees_on=True),
+        lambda: check_totals(
+            1_000_000, 976_400, 976_399, [20_000, 3_600], [0], fees_on=True
+        ),
     )
-    check_totals(1_000_000, 976_400, 976_400, [20_000, 3_600, 0], fees_on=True)
-    check_totals(1_000_000, 1_000_000, 1_000_000, [0, 0, 0])
+    check_totals(1_000_000, 976_400, 976_400, [20_000, 3_600], [0], fees_on=True)
+    check_totals(1_000_000, 1_000_000, 1_000_000, [0, 0], [0])
+
+    # Phase 6: the per-column zero gate, probed in **both** directions. Until this phase all
+    # three columns were gated on ``fees_on``, and both of these were measured against the old
+    # code before it was changed -- the first was refused and the second passed silently.
+    #
+    # A legal ``--tds`` run without ``--fees``: TDS cells are non-zero, fee and GST are not.
+    # The old single gate reported "1 non-zero fee/gst/tds cells while --fees is off" and
+    # refused a run this generator is required to support.
+    check_totals(10_000, 9_990, 9_990, [0, 0], [10], fees_on=False, tds_on=True)
+    # ...and the hole, which is the half that mattered. A TDS cell on a run that never asked
+    # for one: with ``fees_on`` true the old gate stood down for all three columns at once, so
+    # this passed. A deduction appearing from nowhere is exactly what I4's zero clause exists
+    # to catch, and for one phase it could only catch two thirds of it.
+    must_raise(
+        "I4",
+        "a TDS cell while --tds is off",
+        lambda: check_totals(
+            10_000, 9_990, 9_990, [0, 0], [10], fees_on=True, tds_on=False
+        ),
+    )
+    # The converse, for symmetry: a fee cell while --fees is off, with --tds legitimately on.
+    # Without this the pair above would still pass if the two labels were wired backwards.
+    must_raise(
+        "I4",
+        "a fee cell while --fees is off",
+        lambda: check_totals(
+            10_000, 9_800, 9_800, [200, 0], [0], fees_on=False, tds_on=True
+        ),
+    )
 
     # I3: a duplicate (date, amount) pair.
     # Cloning only the credit's amount would change the credited total and trip I4

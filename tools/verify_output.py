@@ -219,7 +219,11 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     # check_settlement_arithmetic needs each row's own three deductions to catch two
     # compensating errors that cancel in the total.
     deductions: dict[str, tuple[int, int, int]] = {}
+    # Split per column for I4's zero clause, while ``deductions`` keeps all three per row for
+    # ``check_settlement_arithmetic``. Two different granularities of the same numbers: the
+    # aggregate needs to know *which* flag owns each column, the per-row check needs the row.
     fee_cells: list[int] = []
+    tds_cells: list[int] = []
     for r in settlements:
         sid = r["settlement_id"]
         net_by_settlement[sid] = parse_int(r["net_paise"], f"{sid}.net_paise")
@@ -227,7 +231,8 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         cells = tuple(parse_int(r[col], f"{sid}.{col}")
                       for col in ("fee_paise", "gst_paise", "tds_paise"))
         deductions[sid] = cells  # type: ignore[assignment]
-        fee_cells.extend(cells)
+        fee_cells.extend(cells[:2])
+        tds_cells.append(cells[2])
         for col, value in zip(("fee_paise", "gst_paise", "tds_paise"), cells):
             money[f"{sid}.{col}"] = value
     amount_by_credit: dict[str, int] = {}
@@ -245,6 +250,10 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     truth = load_truth(truth_dir)
     flags: dict[str, bool] = {k: bool(v) for k, v in truth.flags.items()}
     fees_on = flags.get("fees", False)
+    # Phase 6: read per column, because I4's zero clause is now per column. One flag gating
+    # three columns both refused a legal ``--tds`` run and hid a stray TDS cell on a
+    # ``--fees`` run -- see ``invariants.check_totals``.
+    tds_on = flags.get("tds", False)
     late_on = flags.get("settlement_report_late", False)
     #: settlement -> payments, as the *answer key* declares it. Used only to stand in for the
     #: rows ``--settlement-report-late`` withholds from settlement_items.csv, so that the
@@ -267,7 +276,9 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         sum(net_by_settlement.values()),
         sum(amount_by_credit.values()),
         fee_cells,
+        tds_cells,
         fees_on=fees_on,
+        tds_on=tds_on,
     )
 
     # --- I3: cardinality, per flag rather than per clean_mode ----------------

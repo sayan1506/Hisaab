@@ -44,15 +44,41 @@ the corrections are recorded in place rather than quietly overwritten.
 | 7b | Corporate / business credit cards: **215 bps** (2.15%) | 🟢 verified |
 | 7c | International cards: **300 bps** (up to 3%), by card **origin**, still settled in INR. Currency conversion is a separate concern — `--fx` is Phase 6. | 🟢 verified |
 | 8 | GST: **1800 bps** (18%), charged **on the fee**, not on the gross | 🟢 verified |
-| 9 | TDS: **100 bps** (1%), only where `--tds` is on | 🔴 |
+| 9 | TDS: **10 bps** (0.1%) under §194-O, only where `--tds` is on — **corrected from 100.** The section ran at 1% from its introduction on 2020-10-01, and the **Finance (No. 2) Act 2024 cut it to 0.1% effective 2024-10-01**; the old value was the pre-amendment position, carried since Phase 1 because nothing read it until Phase 6. Verified 2026-08-27. | 🟢 verified |
+| 9a | **That a payment aggregator withholds §194-O on a merchant settlement at all is a separate claim from the rate, and it is *not* verified.** §194-O binds the *e-commerce operator* whose platform facilitates the sale, which is the merchant's storefront rather than the payment rail underneath it, and CBDT has issued guidance specifically on payment gateways that this project has not read. So the doubt is recorded **in the direction it actually points**: a pure payment aggregator most likely does **not** withhold this, and `--tds` should be read as modelling *a* rate-derived withholding wedge rather than as a claim about Razorpay's tax position. What the flag tests does not depend on the statute being the right one — it is a third gross/net wedge whose magnitude is **derivable from a declared rate**, which is what exercises multi-rule decomposition (#25) and the abstention when two rules both close a gap. §194-O supplies the citation for the *number*; the number is what the matcher re-derives. | 🟡 declared |
 
 **Which of these is a "verified fact" and which is still an assumption.** The rates
 are sourced and dated, not permanently true: these are **list prices**, real rates are
 negotiated at volume, and Indian MDR structures move with NPCI/RBI policy. That is why
 every rate is overridable from the matcher's command line (`--fee-bps METHOD=BPS`)
-rather than compiled in. #9 stays 🔴 on purpose — TDS is tax withholding under §194-O,
-not gateway pricing, so the pricing page does not cover it and nothing about it was
-confirmed. It is unused until Phase 6 turns `--tds` on (D7), so nothing depends on it yet.
+rather than compiled in. #9 was the last 🔴 in this block and Phase 6 closed it, but the
+correction is worth reading twice, because it is the one place where **the same publisher was
+right on one page and stale on another**: Razorpay's pricing page carries the fee rates and is
+current, while Razorpay's own §194-O explainer still states 1% and does not mention the 2024
+amendment. Citing a source is therefore not enough — the citation has to be **dated**, which
+is why every row here carries a verification date rather than only a URL. And #9a keeps the
+part that a rate alone cannot settle: the number is verified, the claim that this deduction
+belongs on a payment aggregator's settlement is not.
+
+**What the corrected TDS rate does and does not shrink.** At 10 bps TDS is now the
+**smallest** of the deductions — against 200 bps for the fee and 36 bps *effective* for
+GST-on-fee (18% of 200) — where at 100 bps it outweighed GST. It does **not** become
+invisible, and the reason is worth stating because the Phase 6 plan got it wrong by a factor
+of 100: `AMOUNT_BANDS` is denominated in **rupees**, not paise (`config.py:56`), so the
+smallest gross this generator can draw is ₹100 = 10,000 paise and its TDS is **10 paise**.
+Measured on the committed run: **0 of 60 settlements** carry a zero TDS term, min 12p, max
+9,506p. The plan had predicted `mul_bps(100, 10) == 0` across the 45%-weighted modal band and
+called the term "mistakable for rounding"; that arithmetic read the band edges as paise. The
+consequence is a **stronger** assertion available to the gate, not a weaker one — no
+settlement carries a zero term, so the flag cannot be a no-op on any row.
+
+**Per-member rounding stays a real discipline at 10 bps, and stays the same size as at 200.**
+Measured over 20,000 synthetic batches of 2–4 members drawn from the modal band: the
+per-member sum and the batch-total rate differ on **32.7%** of batches, by at most **2
+paise** — the same character as the fee's own divergence, not a rounding artefact that
+swallows the whole term. (The plan expected 0 paise per member against 1–2 on the total,
+which followed from the same 100× slip; a fixture where per-member rounds to zero would need
+a gross under 50 paise and is unreachable above the ₹100 floor.)
 
 **Why #7 was the expensive one, and what it was costing the evidence.** A wrong rate
 that makes a fee *smaller* is not a bookkeeping slip; it removes rows from the test.

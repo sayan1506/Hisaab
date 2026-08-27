@@ -88,8 +88,22 @@ SELF_CHECK_MODULES: tuple[str, ...] = (
     "hisaab.matcher.load",
     "hisaab.matcher.normalize",
     "hisaab.matcher.blocking",
+    # ``fees`` (Phase 4) and ``tier2`` (Phase 5) were **absent from this list until Phase
+    # 6**, and both have had real self-checks the whole time -- the fee arithmetic and the
+    # subset search, two of the least forgiving modules here, verified only when someone
+    # ran them by hand. Nothing failed as a result, which is the uncomfortable part: gate 0
+    # printed a clean sweep while skipping them, so the omission was invisible in exactly
+    # the output that exists to make omissions visible. Both are leaves, so they sit ahead
+    # of ``tier1``, which imports them: a broken fee model should be reported as a broken
+    # fee model and not as whatever failed downstream of it.
+    "hisaab.matcher.fees",
+    "hisaab.matcher.tier2",
     "hisaab.matcher.tier1",
     "hisaab.matcher.engine",
+    # --- Phase 6. Last on purpose, and not because it is newest: this one is off the
+    # resolution path by design (``check_isolation.py`` check 7), so a failure here means
+    # the declared-vs-derived *report* is wrong, never that a verdict is.
+    "hisaab.matcher.adjustments",
 )
 
 #: Gate 3's seed matrix. Seed 99 is absent on purpose: it is the holdout, and it is
@@ -477,7 +491,18 @@ MESS_WINDOW_DAYS = 1
 #: when every shortfall carries one of these, because "did not resolve" and "resolved
 #: wrongly" are the two outcomes this project refuses to average together.
 ABSTENTION_REASONS: frozenset[str] = frozenset(
-    {"AMBIGUOUS_DUPLICATE_AMOUNT", "AMBIGUOUS_MULTI_SUBSET", "UNEXPLAINED_RESIDUAL"}
+    {
+        "AMBIGUOUS_DUPLICATE_AMOUNT",
+        "AMBIGUOUS_MULTI_SUBSET",
+        "UNEXPLAINED_RESIDUAL",
+        # Phase 6. An honest refusal in the same sense as the two above: two declared rules
+        # close the gap with *different* component splits, so committing to one would be a
+        # coin flip on the decomposition -- which the scorer grades term by term, not on the
+        # total. Admitted here knowing it cannot fire at the declared rates (see
+        # ``Reason.AMBIGUOUS_ADJUSTMENT``); a code that is unreachable today and *not*
+        # listed would turn into a spurious gate failure the first time a rate is re-pointed.
+        "AMBIGUOUS_ADJUSTMENT",
+    }
 )
 
 

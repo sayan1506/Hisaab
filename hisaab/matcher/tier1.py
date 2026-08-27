@@ -119,7 +119,8 @@ def _note_for_match(
         # this matcher did.
         accounted = (
             f"{explanation.rule} accounts for {explanation.total_paise}p "
-            f"(fee {explanation.fee_paise}p + GST {explanation.gst_paise}p)"
+            f"(fee {explanation.fee_paise}p + GST {explanation.gst_paise}p "
+            f"+ TDS {explanation.tds_paise}p)"
         )
     else:
         accounted = f"{explanation.rule}, credit equals gross"
@@ -230,20 +231,50 @@ def _search_membership(
     settlement_id = candidate.settlement_id
     pool = _tier2_pool(candidate.settlement.settled_on, dataset)
 
-    # One list per hypothesis: the credit read as a gross total, and as a net of the rates.
-    by_gross = [Member(p.payment_id, p.gross_paise) for p in pool]
-    nets: list[Member] = []
-    for payment in pool:
-        deduction = derive([(payment.gross_paise, payment.method)], schedule)
-        if not deduction.is_complete:
-            # No declared rate for this method, so its net cannot be computed. Dropping it
-            # from the netted hypothesis is right -- the gross hypothesis still carries it,
-            # and a member priced at its gross under a schedule that does charge it would be
-            # a wrong amount silently entering the search.
-            continue
-        net = payment.gross_paise - deduction.fee_paise - deduction.gst_paise
-        if net > 0:
-            nets.append(Member(payment.payment_id, net))
+    # One list per hypothesis, and Phase 6 takes the count from two to **four** -- the same
+    # four combinations ``explain_gap`` enumerates, for the same reason. The credit may have
+    # been paid at the gross, net of the gateway's cut, net of the tax, or net of both, and
+    # nothing in the inputs says which. This is not optional bookkeeping: under ``--tds`` the
+    # settlement's net is ``gross - fee - gst - tds``, so a search offering only the first two
+    # readings would find **nothing at all** on the deliverable's own flag set, while the rate
+    # table sat there looking correct. That is the failure the gross hypothesis was added to
+    # prevent one phase earlier, arriving from the other side.
+    #
+    # The cost is real and is measured rather than waved at: every extra reading is another
+    # chance for a coincidental subset to hit the target, which raises the ambiguity rate
+    # Phase 5 recorded at 6.59% (n=1000). Identical readings are collapsed below so a run
+    # without a tax or without a fee does not pay for hypotheses that duplicate each other.
+    subtractions: list[tuple[bool, bool]] = [
+        (False, False),  # gross            -- NO_DEDUCTION
+        (False, True),   # gross - tds      -- TDS_ONLY
+        (True, False),   # gross - fee - gst -- FEE_AND_GST
+        (True, True),    # gross - all       -- FEE_GST_TDS
+    ]
+    hypotheses: list[list[Member]] = []
+    for take_fee, take_tds in subtractions:
+        reading: list[Member] = []
+        for payment in pool:
+            deduction = derive([(payment.gross_paise, payment.method)], schedule)
+            if take_fee and not deduction.is_complete:
+                # No declared rate for this method, so its net cannot be computed. Dropping it
+                # from a fee-bearing hypothesis is right -- the gross readings still carry it,
+                # and a member priced at its gross under a schedule that does charge it would
+                # be a wrong amount silently entering the search.
+                continue
+            amount = payment.gross_paise
+            if take_fee:
+                amount -= deduction.fee_and_gst_paise
+            if take_tds:
+                amount -= deduction.tds_paise
+            if amount > 0:
+                reading.append(Member(payment.payment_id, amount))
+        # Collapse duplicates: with no fee charged, "gross" and "net of fee" are the same
+        # list, and with the tax rate at zero so are the two TDS readings. Searching an
+        # identical list twice cannot find a new set -- it can only spend the work bound --
+        # and it must not read as an ambiguity either, which the set-level dedup below
+        # already guarantees.
+        if reading and reading not in hypotheses:
+            hypotheses.append(reading)
 
     # Count the distinct sets across **both** hypotheses together, because the question is
     # not "does this reading resolve?" but "can anything I know explain this credit in more
@@ -262,7 +293,7 @@ def _search_membership(
     found: list[frozenset[str]] = []
     split = False
     over_cap: PoolTooLarge | None = None
-    for members in (by_gross, nets):
+    for members in hypotheses:
         result = tier2_resolve(members, credit.amount_paise)
         if isinstance(result, PoolTooLarge):
             over_cap = result
@@ -472,8 +503,40 @@ def resolve_credit(
     # The self-check below pins this with a settlement whose ``fee_paise`` would close the
     # gap if anything here read it.
     gap = gross_total - credit.amount_paise
-    explanation, derived = explain_gap(gap, members, schedule)
+    closing, derived = explain_gap(gap, members, schedule)
 
+    if len(closing) > 1:
+        # **Two declared rules close this gap with different component splits.** Phase 6
+        # decision 7, and it lands here rather than inside ``explain_gap`` because the module
+        # that knows the rules should report all of them and the caller should decide -- the
+        # same division Phase 5 settled for the subset search.
+        #
+        # Committing to one would be a coin flip on the *decomposition*, which the scorer
+        # grades term by term rather than on the total (ASSUMPTIONS.md #25). So a row that
+        # balances under two different splits is genuinely undetermined even though its
+        # settlement, its payment set and its total are all known -- which is why this is an
+        # honest abstention and not a missing capability.
+        #
+        # Unreachable at the declared rates: see ``Reason.AMBIGUOUS_ADJUSTMENT`` for the
+        # measurement. It is reachable under a ``--fee-bps`` override, which is exactly the
+        # case that flag exists for, so the branch is live rather than defensive.
+        rules = " / ".join(
+            f"{e.rule} (fee {e.fee_paise}p + GST {e.gst_paise}p + TDS {e.tds_paise}p)"
+            for e in closing
+        )
+        return Verdict(
+            credit.credit_id,
+            Outcome.EXCEPTION,
+            reason=Reason.AMBIGUOUS_ADJUSTMENT,
+            note=(
+                f"{settlement_id} agrees on date and amount and the {gap}p gap closes "
+                f"exactly under {len(closing)} different declared rules -- {rules} -- so "
+                f"the components are undetermined even though the total is not, and a "
+                f"human decides which schedule applied"
+            ),
+        )
+
+    explanation = closing[0] if closing else None
     if explanation is None:
         # ASSUMPTIONS.md #25: matched-but-unproven is an exception, not a match. A
         # decomposition that does not close to zero paise means money is unaccounted
@@ -540,6 +603,14 @@ def resolve_credit(
         gross_paise=gross_total,
         fee_paise=explanation.fee_paise,
         gst_paise=explanation.gst_paise,
+        # Phase 6 step 2. Non-zero only under a rule that includes it, and **derived from the
+        # declared rate rather than read from ``winner.tds_paise``** -- decision 2. The column
+        # is parsed and one field away, and reading it would score 100% while modelling
+        # nothing: unlike the Tier 1/Tier 2 split there is no distribution downstream that
+        # would look wrong if it were copied, so the discipline has no backstop here beyond
+        # being stated. The derived-versus-declared comparison is *reported* by the CLI for
+        # exactly that reason (step 2).
+        tds_paise=explanation.tds_paise,
         rule=explanation.rule,
     )
 
@@ -662,11 +733,16 @@ if __name__ == "__main__":
     assert "500p short" in (v.note or ""), v.note
     assert "setl_0005" in (v.note or ""), "the note must name the settlement it matched"
     # Step 4: the note must say how the model *failed*, not merely that it did. A 2% card
-    # fee on 85,358p is 1,707p plus 307p GST = 2,014p, which is far more than the 500p
-    # actually withheld -- so this row is the rate table being wrong for it, and the note
-    # has to say that rather than report a negative remainder.
-    assert "predict a larger deduction of 2014p" in (v.note or ""), v.note
-    assert "-1514p" not in (v.note or ""), (
+    # fee on 85,358p is 1,707p plus 307p GST, and Phase 6 adds 85p of TDS at 10bps -- 2,099p
+    # in all, far more than the 500p actually withheld. So this row is the rate table being
+    # wrong for it, and the note has to say that rather than report a negative remainder.
+    #
+    # The number moved from 2,014p to 2,099p when ``--tds`` arrived, and the diagnostic quotes
+    # ``derived.total_paise`` -- *everything* the declared rates say was withheld. That is the
+    # right quantity for this sentence: the reader is being told the model over-predicts, so
+    # the model has to be reported in full rather than net of the term that grew it.
+    assert "predict a larger deduction of 2099p" in (v.note or ""), v.note
+    assert "-1599p" not in (v.note or ""), (
         f"a negative remainder leaked into the diagnostic instead of the over-prediction "
         f"wording: {v.note}"
     )
@@ -683,8 +759,8 @@ if __name__ == "__main__":
     v = verdict_of(under, "C0001")
     assert v.outcome is Outcome.EXCEPTION and v.reason is Reason.UNEXPLAINED_RESIDUAL
     assert "3000p short" in (v.note or ""), v.note
-    assert "account for 2014p" in (v.note or ""), v.note
-    assert "leaving 986p unexplained" in (v.note or ""), v.note
+    assert "account for 2099p" in (v.note or ""), v.note
+    assert "leaving 901p unexplained" in (v.note or ""), v.note
 
     # And in the other direction: an over-credit is equally unproven, not a bonus.
     over = dataset(
@@ -704,7 +780,7 @@ if __name__ == "__main__":
     # trusting the counterparty's arithmetic.
     #
     # The declared 500p here matches the gap exactly, so reading the column would resolve
-    # this row. The derived rate says 2,014p, so nothing closes and the row abstains.
+    # this row. The derived rates say 2,099p, so nothing closes and the row abstains.
     declared = dataset(
         [payment("pay_0001", 85358)],
         [settlement("setl_0005", mon, 84858, "8104", fee_paise=500)],
@@ -721,6 +797,13 @@ if __name__ == "__main__":
     # A credit of 83,344p is exactly 2,014p short, so the declared rule accounts for all of
     # it. These are the numbers ASSUMPTIONS.md #5-#9 commit to; the arithmetic is
     # money.mul_bps, shared with the generator so the two cannot disagree by a paisa.
+    #
+    # **This fixture withholds no tax, and it still resolves under exactly one rule** -- which
+    # is what makes the four-rule set safe rather than merely bigger. The gap is fee-and-GST,
+    # so ``FEE_AND_GST`` closes it while ``FEE_GST_TDS`` over-predicts by the 85p of tax and
+    # ``TDS_ONLY`` under-predicts by everything else. A rule set that closed this gap two ways
+    # would have made every ``--fees``-without-``--tds`` row ambiguous, and the assertion below
+    # that ``dec.tds_paise == 0`` is what pins the term to the rule that claimed it.
     CARD_FEE, CARD_GST = 1707, 307
     priced = dataset(
         [payment("pay_0001", 85358)],
@@ -766,6 +849,47 @@ if __name__ == "__main__":
     # The declared columns took no part in it: this settlement states a 0p fee while the
     # decomposition publishes 1,707p. The proof is the rule, not the counterparty's number.
     assert dec.fee_paise != 0 and priced.settlements[0].fee_paise == 0
+
+    # --- Phase 6 step 3: two rules, one gap, and the old code resolved it ---
+    # **A reproduction, not a description.** This fixture is the reason the arity change landed
+    # before any new rule: under the old single-optional ``explain_gap`` it RESOLVED, because
+    # first-hit returned whichever rule was tried first and silently discarded the other. It
+    # now abstains, and the reason code distinguishes it from a subset-search ambiguity.
+    #
+    # The rates are overridden to reach it, and that is a property of the arithmetic rather
+    # than a contrivance: a genuine collision needs ``fee + gst == tds`` with both non-zero,
+    # and at the declared rates fee-and-GST is 236bps effective against TDS's 10, so they can
+    # never meet. 9bps on a Rs 105 gross gives a 9p fee plus 2p GST against 11p of tax --
+    # two different splits of one 11p gap. ``--fee-bps`` exists precisely so a run can be
+    # re-pointed at a negotiated rate, so this is a live branch rather than a defensive one.
+    cheap = FeeSchedule(fee_bps_by_method={"card": 9})
+    collide = dataset(
+        [payment("pay_0001", 10_500)],
+        [settlement("setl_0005", mon, 10_489, "8104")],
+        [credit("C0001", mon, 10_489)],
+        {"setl_0005": ("pay_0001",)},
+    )
+    v = verdict_of(collide, "C0001", schedule=cheap)
+    assert v.outcome is Outcome.EXCEPTION, (
+        f"two rules close this 11p gap with different splits, so committing to one is a coin "
+        f"flip on the decomposition -- got {v.outcome} with {v.decomposition}"
+    )
+    assert v.reason is Reason.AMBIGUOUS_ADJUSTMENT, (
+        f"a rule collision must not borrow the subset-search code: {v.reason}"
+    )
+    # The note has to name *both* readings and their components, or a reader cannot tell which
+    # two rules disagreed -- and with the settlement, the payment set and the total all known,
+    # the components are the only thing left in question.
+    assert "TDS at the declared rate" in (v.note or ""), v.note
+    assert "gateway fee + GST at declared rates" in (v.note or ""), v.note
+    assert "TDS 11p" in (v.note or "") and "fee 9p" in (v.note or ""), v.note
+    # An abstention is not a match, and the contract forbids it carrying either.
+    assert v.settlement_ids == () and v.payment_ids == () and v.residual_paise is None
+    # ...and the same fixture at the *declared* rates resolves, which is what proves the
+    # abstention above is caused by the collision rather than by the amounts.
+    v = verdict_of(collide, "C0001")
+    assert v.outcome is Outcome.RESOLVED and v.decomposition is not None, v.reason
+    assert v.decomposition.tds_paise == 11 and v.decomposition.rule == "TDS at the declared rate"
 
     # One paisa either side of the derived fee must not resolve. There is no tolerance band
     # to widen -- that is the whole point of the gate being exact.

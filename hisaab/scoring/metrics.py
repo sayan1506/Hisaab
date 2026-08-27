@@ -61,6 +61,12 @@ MINUTES_PER_EXCEPTION: dict[Reason, int] = {
     # reporting that the search was unavailable, not that the data was hard.
     Reason.MEMBERSHIP_UNDECLARED: 20,
     Reason.AMBIGUOUS_DUPLICATE_AMOUNT: 8,
+    # Cheaper than either ambiguity above, because less is unknown: the settlement and the
+    # payment set are both already matched, and the only open question is *which declared
+    # rate schedule applied*. That is looked up in a contract rather than reconstructed from
+    # the data -- unlike AMBIGUOUS_MULTI_SUBSET (15), where the human still has to choose
+    # between candidate payment sets, or MEMBERSHIP_UNDECLARED (20), where they build one.
+    Reason.AMBIGUOUS_ADJUSTMENT: 10,
     Reason.UNEXPLAINED_RESIDUAL: 12,
     Reason.PARTIAL_SETTLEMENT_PENDING: 5,
     Reason.REFUND_UNLINKED: 10,

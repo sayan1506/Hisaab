@@ -189,8 +189,16 @@ class MessFlags:
     #: ``story._withhold_membership`` picks the settlements whose rows ``emit`` leaves out of
     #: ``settlement_items.csv``. Truth keeps the full membership -- the withholding is a
     #: property of the *files the matcher reads*, not of what happened.
+    #: Phase 6 step 2 added ``tds``: ``story._tds`` withholds ``cfg.fees.tds_bps`` on each
+    #: member's gross, ``build`` sums it per member into ``tds_paise`` and subtracts it from
+    #: ``net_paise``, and ``_batch_net`` counts it so the net-uniqueness nudge protects the
+    #: value the file actually carries. Added *after* that code existed, per the paragraph
+    #: above. It is the first implemented flag that **draws no randomness at all** -- a
+    #: withholding at a declared rate on a declared gross is fully derived, so there is
+    #: nothing to draw and the reserved ``tds`` stream stays unused (see ``story._tds``).
     IMPLEMENTED: ClassVar[frozenset[str]] = frozenset(
-        {"settlement_delay", "fees", "dup_amounts", "batching", "settlement_report_late"}
+        {"settlement_delay", "fees", "dup_amounts", "batching", "settlement_report_late",
+         "tds"}
     )
 
     @classmethod
@@ -264,10 +272,27 @@ class FeeConfig:
         }
     )
     gst_bps: int = 1800   # 18% GST, charged on the fee, not on the gross -- verified
-    #: **Not verified.** TDS is a tax-withholding matter under §194-O rather than gateway
-    #: pricing, so it is absent from the pricing page and stays an assumption. Unused until
-    #: Phase 6 turns ``--tds`` on (D7), so nothing depends on it being right yet.
-    tds_bps: int = 100
+    #: TDS withheld under **§194-O**, at **10 bps (0.1%)**. Verified 2026-08-27, and the
+    #: value it replaces was a full order of magnitude too large: the section ran at 1% from
+    #: its introduction on 2020-10-01 (0.75% under the FY 2020-21 relief), and the **Finance
+    #: (No. 2) Act 2024 cut it to 0.1% effective 2024-10-01**. The 100 here was simply the
+    #: pre-amendment position, carried since Phase 1 because nothing read it until now.
+    #:
+    #: Worth recording *where* the stale number came from, since this codebase cites
+    #: Razorpay's own pages for every fee rate: Razorpay's §194-O explainer still states 1%
+    #: and does not mention the amendment. Same publisher, one page verified and one stale --
+    #: which is the argument for **dating** a citation rather than merely naming a source.
+    #:
+    #: **This is a rate, not a scope claim.** Whether a payment aggregator withholds §194-O
+    #: on a merchant settlement at all is a separate question from what the rate is, and it
+    #: stays a declared modelling assumption rather than a verified fact -- ASSUMPTIONS.md
+    #: #9a, which is the entry a reader should be pointed at before this number is defended.
+    #:
+    #: At 10 bps this is the **smallest** of the deductions (against 36 bps effective for
+    #: GST-on-fee and 200 bps for the fee), where at 100 bps it outweighed GST. It does not
+    #: vanish: ``AMOUNT_BANDS`` is denominated in **rupees**, so the smallest gross drawable
+    #: is ₹100 = 10,000 paise and its TDS is 10 paise. No settlement carries a zero term.
+    tds_bps: int = 10
 
     def fee_bps(self, method: str) -> int:
         return self.fee_bps_by_method[method]

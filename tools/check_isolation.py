@@ -128,6 +128,31 @@ SCORING_IMPORT_PREFIXES: tuple[str, ...] = ("hisaab.scoring", "scoring.truth_io"
 #: supposed to *infer*. Relative spellings resolve to these too; see ``imports_of``.
 GENERATOR_IMPORT_PREFIXES: tuple[str, ...] = ("hisaab.generator", "generator.model")
 
+#: The one matcher module allowed to read ``settlements.csv``'s declared ``fee_paise``,
+#: ``gst_paise`` and ``tds_paise`` columns (check 7). It compares them against an
+#: independently derived figure and **reports**; it returns no ``Verdict`` and decides
+#: nothing. See its module docstring.
+ADJUSTMENT_REPORT_MODULE = "hisaab/matcher/adjustments.py"
+
+#: Modules allowed to import it. Only the CLI, which prints the report next to the
+#: coverage number. Listed individually rather than by prefix so widening this stays a
+#: decision -- the same reasoning as ``TRUTH_READERS``.
+#:
+#: **``engine.py`` is deliberately absent.** The engine produces verdicts, so handing it
+#: the declared columns is exactly the move this check exists to refuse: subtracting a
+#: declared fee closes every residual the instant ``--fees`` is on, and coverage reads
+#: 100% with no fee model ever written. The comparison therefore happens in the CLI,
+#: after ``run()`` has already committed to its answers and cannot be influenced.
+ADJUSTMENT_REPORT_READERS: tuple[str, ...] = (
+    "hisaab/matcher/cli.py",
+)
+
+#: Import targets that reach the adjustment report however they are spelled.
+ADJUSTMENT_IMPORT_PREFIXES: tuple[str, ...] = (
+    "hisaab.matcher.adjustments",
+    "matcher.adjustments",
+)
+
 
 class IsolationError(Exception):
     """The matching path can reach the answer key."""
@@ -217,6 +242,21 @@ def imports_generator(path: Path) -> list[str]:
     ]
 
 
+def imports_adjustments(path: Path) -> list[str]:
+    """Evidence that ``path`` imports the declared-vs-derived report -- check 7.
+
+    Third of the same shape, after ``reads_truth`` and ``imports_generator``, and separate
+    for the same reason: this one is not about the answer key at all. It is about the
+    matcher declining to *consume* a number the counterparty declared, so that its residual
+    stays a test rather than a restatement.
+    """
+    return [
+        f"imports {mod}"
+        for mod in sorted(imports_of(path))
+        if mod.startswith(ADJUSTMENT_IMPORT_PREFIXES)
+    ]
+
+
 def imports_of(path: Path) -> set[str]:
     """Every module named by an import in ``path``, resolved as dotted strings."""
     try:
@@ -278,6 +318,28 @@ def check(verbose: bool = True) -> dict[str, object]:
                 f"duplicate it with a comment saying why, the way matcher/load.py does "
                 f"with the CSV headers, so drift fails loudly instead of hiding behind "
                 f"a shared symbol."
+            )
+
+        # --- 7: the resolution path cannot import the adjustment report -----
+        mod_name = rel(path)
+        if (
+            mod_name != ADJUSTMENT_REPORT_MODULE
+            and mod_name not in ADJUSTMENT_REPORT_READERS
+            and (evidence := imports_adjustments(path))
+        ):
+            raise IsolationError(
+                f"{mod_name} imports the declared-vs-derived report "
+                f"({'; '.join(evidence)}). That module reads settlements.csv's declared "
+                f"fee_paise, gst_paise and tds_paise columns, and every other module on "
+                f"the matching path re-derives those figures from an independently "
+                f"declared rate table instead.\n"
+                f"  The difference is the whole test: subtracting a declared fee closes "
+                f"the residual the moment --fees populates it, so coverage would read "
+                f"100% with no fee model ever written and no number moving to say one "
+                f"was missing. The report is for a human to read next to the coverage "
+                f"figure, never for the matcher to resolve with.\n"
+                f"  If a verdict genuinely needs this, it does not -- it needs a rate. "
+                f"Add one to fees.py, where being wrong about it shows up as a residual."
             )
 
     # --- 3: only allowlisted modules READ truth; only owners NAME its path ---
@@ -363,6 +425,10 @@ def check(verbose: bool = True) -> dict[str, object]:
             print(
                 "  check 6: the matcher may not import hisaab.generator -- shared logic "
                 "goes to hisaab/common/, schemas get duplicated on purpose"
+            )
+            print(
+                f"  check 7: the declared fee/gst/tds columns are read only by "
+                f"{ADJUSTMENT_REPORT_MODULE}, which reports and never resolves"
             )
         print("\ngate 5 passes -- the answer key is unreachable from the matching path")
     return report
