@@ -122,6 +122,15 @@ def metric_block(m: Metrics) -> str:
         _line("Correctness",
               f"{ratio(m.cells[Cell.CORRECT], m.committed):<9}({pct(m.correctness)})",
               "how often it was right"),
+        # The third axis, on its own line and with its denominator visible. Printed even at
+        # ``n/a`` for the reason the whole block prints zeros: a rate omitted because it had
+        # no denominator is indistinguishable from a rate nobody computes. The denominator
+        # matters more here than anywhere else in the block -- 100% over 54 rows and 100%
+        # over nothing render identically without it, and only one of them is a result.
+        _line("Arithmetic proved",
+              f"{ratio(m.decomposition_checked - m.decomposition_mismatches, m.decomposition_checked):<9}"
+              f"({pct(m.decomposition_agreement)})",
+              "linked right and priced right"),
         _line("Wrong matches", str(m.wrong_matches),
               f"({invented} of them on planted-unresolvable rows)"),
         _line("Wrong ignores", str(m.cells[Cell.WRONG_IGNORE]),
@@ -205,7 +214,7 @@ def full_report(m: Metrics) -> str:
 
 if __name__ == "__main__":
     from ..common.reasons import Reason
-    from ..common.verdict import Outcome, Verdict, VerdictFile
+    from ..common.verdict import Decomposition, Outcome, Verdict, VerdictFile
     from .metrics import score
     from .truth_io import Truth, TruthCredit, TruthDecomposition
 
@@ -229,6 +238,23 @@ if __name__ == "__main__":
         return VerdictFile(42, "2026-08", "fixture:selfcheck@1", verdicts,
                            wall_clock_seconds=0.02)
 
+    def _resolved(cid: str, pids: tuple[str, ...], *, gross: int = 100_000,
+                  fee: int = 0, gst: int = 0, residual: int = 0) -> Verdict:
+        """A resolved verdict whose proof balances, so the contract accepts it.
+
+        ``residual`` shifts the credit amount rather than being stated independently: the
+        verdict contract requires ``residual == credit - expected``, so a caller asking for
+        a 500p residual gets a credit 500p above what the decomposition accounts for. That
+        is the only way to build one now, and it is the point of v2 -- a residual is a
+        checksum over published arithmetic, not a number a fixture can simply assert.
+        """
+        return Verdict(
+            cid, Outcome.RESOLVED, (f"setl_{cid[1:]}",), pids, tier=1,
+            residual_paise=residual,
+            credit_amount_paise=gross - fee - gst + residual,
+            decomposition=Decomposition(gross, fee_paise=fee, gst_paise=gst),
+        )
+
     # --- formatters ---------------------------------------------------------
     assert pct(None) == "n/a" and pct(1.0) == "100.0%" and pct(0.0) == "0.0%"
     assert pct(0.9) == "90.0%" and pct(21 / 60) == "35.0%"
@@ -240,15 +266,15 @@ if __name__ == "__main__":
 
     # --- the oracle shape: 100% and every n/a rendered as n/a --------------
     oracle = score(
-        _run(tuple(
-            Verdict(c.credit_id, Outcome.RESOLVED, c.settlement_ids, c.payment_ids,
-                    tier=1, residual_paise=0)
-            for c in three
-        )),
+        _run(tuple(_resolved(c.credit_id, c.payment_ids) for c in three)),
         _truth(three),
     )
     block = metric_block(oracle)
     assert "Coverage" in block and "3/3" in block and "(100.0%)" in block
+    # The third axis, with its denominator on the page. A rate without it reads the same
+    # over 3 rows as over none, and only one of those is a result.
+    assert "Arithmetic proved          3/3      (100.0%)" in block, block
+    assert "linked right and priced right" in block
     assert "Correct abstentions        n/a" in block, block
     assert "0 planted unresolvable in clean mode" in block
     assert "seed 42, 2026-08, clean mode, flags: none" in block
@@ -266,6 +292,10 @@ if __name__ == "__main__":
     block = metric_block(stub)
     assert "Coverage                   0/3      (0.0%)" in block, block
     assert "Correctness                0/0      (n/a)" in block, block
+    # Nothing committed means nothing to price-check. The line still appears, and it shows
+    # ``0/0 (n/a)`` rather than a flattering ``100%`` over an empty denominator -- a matcher
+    # that abstained on everything has proved no arithmetic, not all of it.
+    assert "Arithmetic proved          0/0      (n/a)" in block, block
     assert "Missed                     3" in block
     assert "Est. human time to clear   30 min" in block, block  # 3 x 10 min
     queue = exception_queue(stub)
@@ -275,8 +305,7 @@ if __name__ == "__main__":
 
     # --- the answer key must not reach the page ----------------------------
     wrong = score(
-        _run((Verdict("C0001", Outcome.RESOLVED, ("setl_0001",), ("pay_0009",),
-                      tier=1, residual_paise=500),)),
+        _run((_resolved("C0001", ("pay_0009",), residual=500),)),
         _truth((_credit("C0001", ("pay_0001",)),)),
     )
     text = full_report(wrong)
@@ -286,6 +315,11 @@ if __name__ == "__main__":
         "starts fitting the answer key instead of matching"
     )
     assert "pay_" not in text, "no payment id belongs in the report at all"
+    # A wrong match's arithmetic is never compared -- it describes a different payment set --
+    # so the denominator here is 0 while coverage is 1/1. Asserted on the rendered page as
+    # well as in metrics, because this is the line a reader would misread as "the arithmetic
+    # checked out" if it silently showed 100%.
+    assert "Arithmetic proved          0/0      (n/a)" in text, text
 
     # --- planted unresolvables make the abstention line real ---------------
     planted = score(
@@ -301,8 +335,7 @@ if __name__ == "__main__":
     # --- noise gets its own pair, apart from the headline ------------------
     mixed = score(
         _run((
-            Verdict("C0001", Outcome.RESOLVED, ("setl_0001",), ("pay_0001",),
-                    tier=1, residual_paise=0),
+            _resolved("C0001", ("pay_0001",)),
             Verdict("C0002", Outcome.IGNORED, reason=Reason.NON_GATEWAY_CREDIT),
         )),
         _truth((_credit("C0001", ("pay_0001",)),), noise=("C0002",)),

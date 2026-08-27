@@ -7,8 +7,11 @@ either one without touching the other:
   * **the amount band** -- ``[credit - max_adjustment, credit + max_adjustment]``.
     Exact in Phase 3 (``max_adjustment=0``), because clean mode has zero fees and a
     tolerance would be a parameter fitted to data nobody has generated yet.
-  * **the date window** -- ``abs(business_days_between(settled_on, value_date)) <= W``,
-    with ``W = 0`` in Phase 3.
+  * **the date window** -- ``0 <= business_days_between(settled_on, value_date) <= W``,
+    with ``W = 0`` in Phase 3 and ``W = 1`` once Phase 4's posting lag exists. One-sided,
+    because money moves forward: a credit cannot precede the settlement that paid it.
+    See ``FORWARD_ONLY``, and note that at ``W = 0`` the one-sided and symmetric forms are
+    identical, so no Phase 3 number moved when this changed.
 
 **One window predicate, in one place.** ``bizdays.business_days_between`` counts the
 half-open interval ``[start, end)`` and returns 0 for equal dates, so ``W = 0`` means
@@ -59,6 +62,22 @@ DEFAULT_WINDOW_DAYS = 0
 #: now would be a number fitted to data that does not exist yet.
 DEFAULT_MAX_ADJUSTMENT_PAISE = 0
 
+#: **A bank credit cannot precede the settlement that paid it.** Money moves forward, so
+#: the window is one-sided: ``0 <= business_days(settled_on -> value_date) <= W``, not
+#: ``|distance| <= W``.
+#:
+#: This is a physical constraint, not a fitted preference, and it is a *declared
+#: assumption* -- recorded in ASSUMPTIONS.md, because a real bank can in principle post a
+#: credit before the gateway's settlement report is dated, and if that ever happens this
+#: predicate is what would have to be relaxed.
+#:
+#: Measured on Phase 4's delayed data, seeds 1/2/3/42 x n=60/200/1000: every one of 5,040
+#: true (settlement, credit) pairs sits at distance **+1** and not one is negative. A
+#: symmetric window therefore admits only impossible candidates on the negative side --
+#: and those impostors were the entire source of the unresolvable ties measured at n=1000.
+#: At ``W = 0`` this changes nothing (``0 <= 0 <= 0``), so clean mode is unaffected.
+FORWARD_ONLY = True
+
 
 def amount_band(amount_paise: int, max_adjustment_paise: int = DEFAULT_MAX_ADJUSTMENT_PAISE
                 ) -> tuple[int, int]:
@@ -84,7 +103,12 @@ def date_distance(cal: BusinessCalendar, settled_on: object, value_date: object)
 
 
 def inside_window(distance_days: int, window_days: int = DEFAULT_WINDOW_DAYS) -> bool:
-    """Does a business-day ``distance_days`` fall inside ``window_days``?
+    """Is a settlement ``distance_days`` before its credit inside ``window_days``?
+
+    ``0 <= distance_days <= window_days``. **Forward-only, not symmetric** -- a bank credit
+    cannot precede the settlement that paid it, so a negative distance names a candidate
+    that could not physically be the answer. See ``FORWARD_ONLY``. At ``window_days = 0``
+    this is identical to the old symmetric form, so no Phase 3 number moves.
 
     **The one place the window comparison is written.** Both ``within_window`` (which
     computes the distance for you) and ``SettlementIndex.candidates_for`` (which already
@@ -103,7 +127,7 @@ def inside_window(distance_days: int, window_days: int = DEFAULT_WINDOW_DAYS) ->
             f"window_days must be >= 0, got {window_days} -- a negative window excludes "
             f"every candidate and would report 0% coverage rather than an error"
         )
-    return abs(distance_days) <= window_days
+    return 0 <= distance_days <= window_days
 
 
 def within_window(cal: BusinessCalendar, settled_on: object, value_date: object,
@@ -213,18 +237,39 @@ class SettlementIndex:
 def narrow_by_date_distance(candidates: list[Candidate]) -> list[Candidate]:
     """Keep only the candidates closest in business days to the credit.
 
-    The tie-break. **It cannot fire in any Phase 3 end-to-end run**: at ``W = 0`` every
-    candidate is already at distance 0, so this is the identity function on real data.
-    It is written and unit-tested here anyway, at an artificially wide window, because
-    Phase 4 widens the window and would otherwise be the first thing to execute it --
-    and untested code that only runs in Phase 4 is a Phase 4 bug with a Phase 3
-    postmark.
+    **RETIRED FROM THE MATCH PATH IN PHASE 4. Do not reintroduce it without reading this.**
 
-    A still-tied result is returned **whole, not resolved**. Two settlements equally
-    close with the same amount are genuinely indistinguishable from the inputs, and the
-    honest verdict is ``AMBIGUOUS_DUPLICATE_AMOUNT`` rather than whichever one sorted
-    first. Narrowing to a single element here would silently convert an abstention into
-    a coin flip.
+    Phase 3 shipped this unit-tested at an artificially wide window and noted it could not
+    fire on real data. Phase 4's posting lag made it fire for the first time, and it was
+    not merely untested -- it was **wrong**, in the direction that costs the most:
+
+      * Every true (settlement, credit) pair sits at distance **+1**, measured across
+        5,040 pairs, seeds 1/2/3/42 x n=60/200/1000. The lag is constant, so the true
+        candidate is *never* the closest one.
+      * This function keeps the **minimum** distance. When a same-day settlement (d=0)
+        happened to share an amount with the true one (d=+1), it therefore preferred the
+        impostor -- every time. Measured at n=1000: 10 wrong matches at seed 1, 9 at
+        seed 2, 5 at seed 3, 7 at seed 42.
+      * Coverage stayed at ~99.5% throughout. **Only correctness moved.** A tie-break that
+        guesses confidently is indistinguishable from one that works, unless you score it.
+
+    The lesson generalises past this function: proximity in time is not evidence of
+    identity when the lag is unknown and constant. The closest candidate is the *least*
+    likely one at any constant non-zero lag.
+
+    ``tier1`` now abstains on a multi-candidate pool instead
+    (``AMBIGUOUS_DUPLICATE_AMOUNT``), which is what the inputs actually support: two
+    settlements sharing an amount inside the window cannot be separated without knowing
+    the lag, and the honest verdict is that a human decides. That trades ~0.5% coverage at
+    n=1000 for zero wrong matches, which is the trade this whole submission argues for.
+
+    A legitimate non-leaking successor exists and is deliberately **not** built here:
+    infer the modal lag from the rows that resolved unambiguously, then prefer that
+    distance. That reads the lag off the *inputs* rather than importing the generator's
+    T+n, so it would not be a leak -- but it is a fitted parameter, and Phase 4 is exact
+    arithmetic. It is recorded as a Phase 5 candidate, not smuggled in as a tie-break.
+
+    Kept, not deleted, because the self-check below is the evidence for all of the above.
     """
     if len(candidates) <= 1:
         return list(candidates)
@@ -274,8 +319,19 @@ if __name__ == "__main__":
     )
     assert date_distance(cal, sun, next_mon) == 0
     # The comparison itself, independent of any calendar.
-    assert inside_window(0, 0) and inside_window(-2, 2) and inside_window(2, 2)
+    assert inside_window(0, 0) and inside_window(2, 2) and inside_window(1, 2)
     assert not inside_window(3, 2)
+    # Forward-only: a credit cannot precede the settlement that paid it, so a negative
+    # distance is out at every width. This is the assertion that would have caught the
+    # symmetric window admitting impossible candidates -- see FORWARD_ONLY for the
+    # measurement (5,040 true pairs, every one at +1, none negative).
+    assert not inside_window(-1, 5), "a settlement dated after its own credit is impossible"
+    assert not inside_window(-2, 2)
+    assert not within_window(cal, tue, mon, 5), "backward in time, however wide the window"
+    # ...and at W=0 forward-only and symmetric agree exactly, which is why no Phase 3
+    # number moved when this changed.
+    for d in (-2, -1, 0, 1, 2):
+        assert inside_window(d, 0) == (d == 0)
     for guard, label in (
         (lambda: within_window(cal, mon, mon, -1), "within_window"),
         (lambda: inside_window(0, -1), "inside_window"),
@@ -307,11 +363,22 @@ if __name__ == "__main__":
     assert [c.settlement_id for c in got] == ["setl_0002"]
     # Widen the window and the collision becomes a genuine ambiguity -- which is why
     # a wider window is actively harmful rather than merely unnecessary.
-    both = index.candidates_for(credit("C0003", mon, 85358), window_days=1)
+    #
+    # The credit is Tuesday's, so both colliding settlements are *behind* it: setl_0005
+    # (Monday) at +1 and setl_0002 (Tuesday) at 0. Phase 3 asked this with Monday's credit,
+    # which under the forward-only window now yields one candidate rather than two -- the
+    # Tuesday settlement would have had to pay a Monday credit. The property being tested
+    # is unchanged; the fixture just no longer relies on an impossible candidate to show it.
+    both = index.candidates_for(credit("C0003", tue, 85358), window_days=1)
     assert [c.settlement_id for c in both] == ["setl_0002", "setl_0005"], (
         [c.settlement_id for c in both]
     )
     assert len(both) == 2, "counted, not silently first-wins"
+    assert sorted(c.date_distance_days for c in both) == [0, 1], "both behind the credit"
+    # Monday's credit sees only Monday's settlement: the forward-only window drops the
+    # Tuesday one instead of handing tier1 a coin flip between them.
+    assert [c.settlement_id for c in index.candidates_for(
+        credit("C0003", mon, 85358), window_days=1)] == ["setl_0005"]
 
     # No candidate at all, in each direction.
     assert index.candidates_for(credit("C0004", mon, 999_999)) == []
@@ -352,34 +419,67 @@ if __name__ == "__main__":
         c.settlement_id for c in backward.candidates_for(key)
     ], "candidate order must not depend on input order"
 
-    # --- the tie-break, at a width no Phase 3 run reaches ------------------
-    wide = SettlementIndex([
-        settlement("setl_0001", mon, 500),        # 2 business days before Wednesday
-        settlement("setl_0002", date(2026, 8, 12), 500),   # the same day
-        settlement("setl_0003", date(2026, 8, 13), 500),   # 1 business day after
-    ])
+    # --- the tie-break: retired from the match path, kept as evidence -------
+    # ``narrow_by_date_distance`` is no longer called by ``tier1``. What follows is the
+    # measurement that retired it, written as assertions so the reasoning cannot be lost
+    # and so the function cannot be quietly reinstated as the "obvious fix" for the
+    # ambiguity its removal creates.
+    #
+    # The geometry is Phase 4's real one: a constant +1 business-day posting lag, so the
+    # TRUE settlement is always one day behind its credit and any same-day settlement
+    # sharing the amount is an impostor.
     wed = credit("C0009", date(2026, 8, 12), 500)
-    pool = wide.candidates_for(wed, window_days=5)
-    assert len(pool) == 3, "all three are inside a 5-day window"
-    best = narrow_by_date_distance(pool)
-    assert [c.settlement_id for c in best] == ["setl_0002"], [c.settlement_id for c in best]
-    assert best[0].date_distance_days == 0
-
-    # A genuine tie stays a tie -- it must not be resolved to whichever sorted first.
-    tied = SettlementIndex([
-        settlement("setl_0001", date(2026, 8, 11), 500),   # 1 day before
-        settlement("setl_0002", date(2026, 8, 13), 500),   # 1 day after
+    lagged = SettlementIndex([
+        settlement("setl_0002", date(2026, 8, 12), 500),   # same day     -> d=0, impostor
+        settlement("setl_0007", date(2026, 8, 11), 500),   # 1 day before -> d=+1, TRUE
     ])
-    pool = tied.candidates_for(wed, window_days=5)
-    still_tied = narrow_by_date_distance(pool)
-    assert len(still_tied) == 2, "equidistant candidates must remain ambiguous"
-    assert {c.date_distance_days for c in still_tied} == {1, -1}
+    pool = lagged.candidates_for(wed, window_days=1)
+    assert len(pool) == 2, "both sit behind the credit, so both are physically possible"
+    assert sorted(c.date_distance_days for c in pool) == [0, 1]
+    best = narrow_by_date_distance(pool)
+    assert [c.settlement_id for c in best] == ["setl_0002"], (
+        "the tie-break keeps the MINIMUM distance, which at a constant +1 lag is always "
+        "the impostor -- the bug, asserted rather than described"
+    )
+    assert len(best) == 1, (
+        "...and it narrows to one, so tier1 would have committed to the wrong settlement "
+        "at full confidence. Coverage would still read ~100%; only correctness moved, "
+        "which is why this survived Phase 3 and every coverage-only check in Phase 4."
+    )
+    # On real delayed data at n=1000 this shape cost 10 wrong matches at seed 1, 9 at
+    # seed 2, 5 at seed 3 and 7 at seed 42.
 
-    # Degenerate inputs to the tie-break.
+    # The forward-only window makes the *symmetric* tie unreachable: a candidate one day
+    # AFTER the credit is excluded outright rather than left tied with the one before it.
+    tied = SettlementIndex([
+        settlement("setl_0001", date(2026, 8, 11), 500),   # 1 day before -> +1
+        settlement("setl_0002", date(2026, 8, 13), 500),   # 1 day after  -> -1, impossible
+    ])
+    survivors = tied.candidates_for(wed, window_days=5)
+    assert [c.settlement_id for c in survivors] == ["setl_0001"], (
+        "Phase 3 asserted these two stayed ambiguous at {+1, -1}. Under the forward-only "
+        "window the -1 candidate is gone, so this is a clean single match -- the "
+        "impossible half was the entire ambiguity."
+    )
+
+    # Degenerate inputs, unchanged: the function still behaves, it is simply not called.
     assert narrow_by_date_distance([]) == []
-    assert len(narrow_by_date_distance(pool[:1])) == 1
+    assert len(narrow_by_date_distance(survivors)) == 1
+    # A genuine tie is still returned WHOLE rather than resolved -- the property that
+    # mattered while it was on the path. Asserted on a hand-built pool, because the
+    # forward-only window can no longer produce an equidistant one.
+    equidistant = [
+        Candidate(settlement=S("setl_0011", mon, 500, 0, 0, 0, "XXXX0011"),
+                  date_distance_days=1, amount_delta_paise=0),
+        Candidate(settlement=S("setl_0012", tue, 500, 0, 0, 0, "XXXX0012"),
+                  date_distance_days=1, amount_delta_paise=0),
+    ]
+    assert len(narrow_by_date_distance(equidistant)) == 2, (
+        "equidistant candidates must remain ambiguous, never resolved to whichever "
+        "sorted first"
+    )
 
-    # At W=0 the tie-break is provably the identity -- correction (a), asserted.
+    # At W=0 it is provably the identity, which is why Phase 3 could not see any of this.
     for cid, when, amount in (("C0001", mon, 85358), ("C0002", tue, 85358)):
         pool = index.candidates_for(credit(cid, when, amount))
         assert narrow_by_date_distance(pool) == pool, (
@@ -387,4 +487,7 @@ if __name__ == "__main__":
             "predicate is admitting candidates it should have excluded"
         )
 
-    print("blocking.py self-check ok  (window predicate, band, index, tie-break)")
+    print(
+        "blocking.py self-check ok  (forward-only window, band, index; tie-break "
+        "refuted and retired)"
+    )

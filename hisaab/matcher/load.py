@@ -128,6 +128,15 @@ class Dataset:
     def gross_by_payment(self) -> dict[str, int]:
         return {p.payment_id: p.gross_paise for p in self.payments}
 
+    def payments_by_id(self) -> dict[str, Payment]:
+        """Every payment by id -- gross **and** method.
+
+        Phase 4's fee model needs both: the rate depends on the method, so a residual
+        cannot be explained from the amount alone. ``gross_by_payment`` stays because the
+        callers that only need money should not have to know that.
+        """
+        return {p.payment_id: p for p in self.payments}
+
     def counts(self) -> dict[str, int]:
         return {
             "payments": len(self.payments),

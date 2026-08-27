@@ -16,11 +16,20 @@ done" is a claim with a check behind it rather than a feeling.
   7. ASSUMPTIONS.md exists and covers what the write-up has to state
   8. the scorer reports the known answer on four known-answer fixtures  [Phase 2]
   9. the matcher scores 100/100/0 across seeds and sizes, without the UTR shortcut  [Phase 3]
+ 10. --fees and --settlement-delay: correctness holds, the arithmetic is proved per row
+     against truth term by term, and the window is shown to be load-bearing  [Phase 4]
 
 **This file grows a gate per phase; it never turns over.** Gates 0-7 are Phase 1's and
 still run, because row 1 of the mess dial is the regression check -- "if clean mode is
 not 100%, the code is broken" only works if clean mode keeps being measured. Gate 8
-arrived with Phase 2's scoring harness, gate 9 with Phase 3's matcher.
+arrived with Phase 2's scoring harness, gate 9 with Phase 3's matcher, gate 10 with
+Phase 4's fee model and date wedge.
+
+Note what gate 10 does **not** assert: a flat 100% coverage. The plan asked for it, and
+measurement said the plan was wrong -- one credit on one seed is genuinely ambiguous, and
+abstaining there is the correct answer. Coverage may fall only onto an honest abstention
+(``ABSTENTION_REASONS``); correctness and the wrong-match count never bend. That asymmetry
+is the project's central claim expressed as a test.
 
 Gates 1, 2 and 6 live in ``repro_check.py``; gates 4 and part of 3 in
 ``verify_output.py``; gate 5 in ``check_isolation.py``; gate 8 in ``fixtures.py``. This
@@ -451,6 +460,281 @@ def gate_9_matcher(sizes: tuple[int, ...] = (60, 200)) -> None:
         print("    provenance: the scorer refuses a verdict file naming the wrong seed")
 
 
+#: Gate 10's window, in **business days**. The posting lag is 1 business day
+#: (ASSUMPTIONS.md #15a) and the bank credit is derived from the settlement, so a
+#: credit-to-settlement join needs exactly that much room -- **not** the T+2 settlement
+#: cycle, which shifts ``settled_on`` and ``value_date`` together and is therefore invisible
+#: to this join (#15b). Measured rather than reasoned: under the delay, ``--window 0`` scores
+#: 0.0 coverage and ``--window 1`` scores 1.0, while ``--fees`` alone passes at window 0.
+MESS_WINDOW_DAYS = 1
+
+#: Reasons that are an **honest abstention**: the matcher looked, could not separate the
+#: candidates from the inputs alone, and said so. Gate 10 permits coverage below 100% only
+#: when every shortfall carries one of these, because "did not resolve" and "resolved
+#: wrongly" are the two outcomes this project refuses to average together.
+ABSTENTION_REASONS: frozenset[str] = frozenset(
+    {"AMBIGUOUS_DUPLICATE_AMOUNT", "AMBIGUOUS_MULTI_SUBSET", "UNEXPLAINED_RESIDUAL"}
+)
+
+
+def _corrupt_one_net(src: Path, dst: Path, delta: int = 307) -> tuple[str, int]:
+    """Copy a run, shifting one settlement's ``net_paise`` **and its bank credit** by ``delta``.
+
+    **Corrupting ``fee_paise`` would prove nothing**, and that is worth stating because it is
+    the obvious thing to reach for. The matcher never reads that column -- re-deriving the fee
+    from an independently declared rate is the whole point of ``matcher/fees.py`` -- so a
+    poisoned ``fee_paise`` would sail through unnoticed and the gate would pass while testing
+    nothing.
+
+    So the corruption is to the **money**, and it moves the credit too. That keeps the join
+    intact (Tier 1 keys on net == credit amount, and both moved together) while making the
+    arithmetic impossible: the gross is unchanged, so no declared rule can account for a gap
+    that is now 307p wrong. Matched-but-unproven is exactly the case #25 refuses, and this is
+    the analogue of Phase 2's saboteur fixture -- it corrupts one number and expects the
+    damage to land on one row, not to smear across the batch.
+    """
+    import shutil
+
+    shutil.copytree(src, dst)
+
+    def read(p: Path) -> tuple[list[str], list[list[str]]]:
+        import csv as _csv
+
+        with p.open(newline="", encoding="utf-8") as f:
+            rd = _csv.reader(f)
+            return next(rd), [r for r in rd if r]
+
+    def write(p: Path, header: list[str], rows: list[list[str]]) -> None:
+        import csv as _csv
+
+        with p.open("w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f, lineterminator="\n")
+            w.writerow(header)
+            w.writerows(rows)
+
+    sh, srows = read(dst / "settlements.csv")
+    bh, brows = read(dst / "bank_statement.csv")
+    net_at, sid_at, amt_at = sh.index("net_paise"), sh.index("settlement_id"), bh.index("amount_paise")
+
+    was = int(srows[0][net_at])
+    victim = srows[0][sid_at]
+    srows[0][net_at] = str(was + delta)
+    moved = 0
+    for row in brows:
+        if int(row[amt_at]) == was:
+            row[amt_at] = str(was + delta)
+            moved += 1
+    if moved != 1:
+        raise GateFailure(
+            f"expected exactly one bank row at {was}p to move with settlement {victim}, "
+            f"found {moved}. The corruption would then test batching rather than arithmetic."
+        )
+    write(dst / "settlements.csv", sh, srows)
+    write(dst / "bank_statement.csv", bh, brows)
+    return victim, was + delta
+
+
+def gate_10_mess(sizes: tuple[int, ...] = (60, 200)) -> None:
+    """Phase 4: the fee model and the date wedge, with the arithmetic proved per row.
+
+    Gate 9 keeps clean mode honest; this one turns on the first two rows of the mess dial.
+    What it asserts, and one thing it deliberately does **not**:
+
+      * **Correctness 100% and 0 wrong matches, unconditionally.** This is the line that
+        never bends.
+      * **Coverage 100%, or a shortfall that is entirely honest abstention.** The plan asked
+        for a flat 100/100/0 across seeds 1/2/3 x n=60/200. Measured, seed 3 at n=200 gives
+        199/200 -- and the missing row is *correct behaviour*, so the expectation was wrong
+        rather than the matcher. Two settlements genuinely share the net 417,899p (2 of 198
+        nets are non-unique at that size), and once the window opens far enough to admit the
+        posting lag, both are candidates for one credit. The inputs cannot separate them.
+      * **The arithmetic agrees with truth term by term**, over a denominator the gate also
+        checks. ``decomposition_agreement`` is compared against truth's own six-term block,
+        never against the total: a fee 307p high and a GST 307p low close the identical gap,
+        so a total-only comparison would score that CORRECT.
+      * **A corrupted row abstains with ``UNEXPLAINED_RESIDUAL``**, and only that row.
+      * **``--window 0`` fails under the posting lag**, proving the window is load-bearing,
+        while ``--fees`` alone passes at window 0 -- which locates the requirement in the lag
+        rather than in the fees.
+
+    **Why it does not assert a tie-break**, which is the fix that suggests itself the moment
+    a row abstains. Truth's answer for that credit is the settlement at **+1bd** -- the
+    posting lag -- while the decoy sits at **+0bd**, same-day. ``prefer_closest`` keeps the
+    **minimum** distance, so "nearest date wins" picks the decoy and reports a confident wrong
+    match. That is not a near-miss heuristic: at a constant non-zero lag the closest candidate
+    is the *least* likely one, so it is wrong every time it fires rather than occasionally.
+    ``blocking.py``'s self-check carries the full measurement (5,040 pairs, all at +1; 5-10
+    wrong matches per seed at n=1000 when it was live) and this gate is the end-to-end
+    consequence of it. Trading a confident guess for an honest abstention is the trade this
+    whole submission argues for, so the gate encodes the abstention as *acceptable* and a
+    wrong match as *never*.
+
+    Sign convention, since it is the easy thing to get backwards: distances here are
+    ``date_distance`` -- ``business_days_between(settled_on, value_date)``, **positive when
+    the credit lands after the settlement**. The verdict note on the abstaining row prints
+    the same way, so the two cannot drift.
+    """
+    print(f"\ngate 10 -- the mess dial: --fees and --settlement-delay, seeds {list(DEV_SEEDS)}")
+    with tempfile.TemporaryDirectory(prefix="hisaab-mess-") as tmp:
+        root = Path(tmp)
+        abstentions = 0
+        for seed in DEV_SEEDS:
+            for n in sizes:
+                base = root / f"s{seed}n{n}"
+                data, truth = base / "data", base / "truth"
+                _run(
+                    [
+                        sys.executable, "-m", "hisaab.generator",
+                        "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                        "--out", str(data), "--truth", str(truth), "--quiet",
+                        "--fees", "--settlement-delay",
+                    ],
+                    f"generator with --fees --settlement-delay at seed {seed}, n={n}",
+                )
+                out = base / "matches.json"
+                doc = _matcher_and_score(
+                    data, truth, out, seed,
+                    extra=["--window", str(MESS_WINDOW_DAYS)],
+                )
+                rates, cells = doc["rates"], doc["cells"]  # type: ignore[index]
+                wrong = (
+                    cells["wrong_match"] + cells["wrong_match_invented"]  # type: ignore[index]
+                    + cells["lucky_guess"]  # type: ignore[index]
+                )
+                if wrong or rates["correctness"] != 1.0:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: correctness {rates['correctness']}, "  # type: ignore[index]
+                        f"{wrong} wrong matches. A wedge that costs *correctness* is a broken "
+                        f"fee model or a broken window, not a harder dataset.\n  cells: {cells}"
+                    )
+
+                # A coverage shortfall is permitted only as honest abstention -- and the
+                # verdicts are inspected rather than inferred from the count, because
+                # "one missed row" and "one guessed row" produce the same coverage number.
+                verdicts = json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+                unresolved = [v for v in verdicts if v["outcome"] != "RESOLVED"]
+                bad = [v for v in unresolved if v.get("reason") not in ABSTENTION_REASONS]
+                if bad:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(bad)} row(s) failed for a reason that is "
+                        f"not an honest abstention: "
+                        f"{sorted({str(v.get('reason')) for v in bad})}. Expected one of "
+                        f"{sorted(ABSTENTION_REASONS)}."
+                    )
+                abstentions += len(unresolved)
+
+                # The arithmetic, and its denominator. A rate that agrees on 3 of 200 rows
+                # also reports 100% agreement, so the count is the half that matters.
+                agreement = rates["decomposition_agreement"]  # type: ignore[index]
+                checked = doc["decomposition"]["checked"]  # type: ignore[index]
+                if agreement != 1.0:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: decomposition_agreement {agreement} over "
+                        f"{checked} rows -- the matcher's independently derived fee and GST "
+                        f"disagree with truth's own arithmetic on at least one term. "
+                        f"Mismatches: {doc['decomposition'].get('mismatches')}"  # type: ignore[index]
+                    )
+                if checked != cells["correct"]:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {checked} rows had their arithmetic checked but "
+                        f"{cells['correct']} resolved correctly. A resolved row whose "  # type: ignore[index]
+                        f"decomposition went unscored is a check that has gone inert, which "
+                        f"is worse than one never written -- the report still prints a rate."
+                    )
+                print(
+                    f"    seed {seed}, n={n:<4} coverage {rates['coverage']:>7.2%}  "  # type: ignore[index]
+                    f"correctness 100.0%  wrong 0  arithmetic {checked}/{checked}"
+                    + (f"  ({len(unresolved)} honest abstention)" if unresolved else "")
+                )
+        print(
+            f"    {abstentions} abstention(s) across the matrix, 0 wrong matches -- the "
+            f"shortfall is refusal, not error"
+        )
+
+        # --- the window is load-bearing, and the lag is why -----------------
+        base = root / f"s{DEV_SEEDS[0]}n{sizes[0]}"
+        data, truth = base / "data", base / "truth"
+        zero = _matcher_and_score(data, truth, base / "w0.json", DEV_SEEDS[0],
+                                  extra=["--window", "0"])
+        if zero["rates"]["coverage"] != 0.0:  # type: ignore[index]
+            raise GateFailure(
+                f"--window 0 scored {zero['rates']['coverage']} coverage under a "  # type: ignore[index]
+                f"non-zero posting lag. It must score 0.0: the credit posts a business day "
+                f"after the settlement, so a +/-0 join cannot reach it. Anything else means "
+                f"the window is not being applied and D3's claim is untested."
+            )
+        fees_only = base / "fees_only"
+        _run(
+            [
+                sys.executable, "-m", "hisaab.generator",
+                "--seed", str(DEV_SEEDS[0]), "--n", str(sizes[0]), "--month", "2026-08",
+                "--out", str(fees_only / "data"), "--truth", str(fees_only / "truth"),
+                "--quiet", "--fees",
+            ],
+            "generator with --fees alone",
+        )
+        alone = _matcher_and_score(
+            fees_only / "data", fees_only / "truth", fees_only / "m.json", DEV_SEEDS[0],
+            extra=["--window", "0"],
+        )
+        if alone["rates"]["coverage"] != 1.0:  # type: ignore[index]
+            raise GateFailure(
+                f"--fees alone scored {alone['rates']['coverage']} at --window 0, "  # type: ignore[index]
+                f"expected 1.0. Fees wedge gross against net and move no date, so they must "
+                f"cost nothing at +/-0 -- otherwise the two wedges are entangled and the "
+                f"window result above cannot be attributed to the posting lag."
+            )
+        print(
+            "    the window is load-bearing: --window 0 scores 0% under the posting lag, "
+            "while --fees alone still scores 100% there"
+        )
+
+        # --- one corrupted number, one refused row -------------------------
+        bad_dir = base / "corrupt"
+        victim, now = _corrupt_one_net(data, bad_dir, delta=307)
+        broken = _matcher_and_score(bad_dir, truth, base / "corrupt.json", DEV_SEEDS[0],
+                                    extra=["--window", str(MESS_WINDOW_DAYS)])
+        verdicts = json.loads((base / "corrupt.json").read_text(encoding="utf-8"))["verdicts"]
+        residual = [v for v in verdicts if v.get("reason") == "UNEXPLAINED_RESIDUAL"]
+        if len(residual) != 1:
+            raise GateFailure(
+                f"shifting settlement {victim}'s net to {now}p (and its credit with it) "
+                f"produced {len(residual)} UNEXPLAINED_RESIDUAL rows, expected exactly 1. "
+                f"The gap is 307p that no declared rule can name, so the row must be matched "
+                f"but refused -- and the damage must not spread to rows that are still "
+                f"arithmetically sound.\n  reasons: "
+                f"{sorted({str(v.get('reason')) for v in verdicts if v.get('reason')})}"
+            )
+        broken_wrong = (
+            broken["cells"]["wrong_match"] + broken["cells"]["wrong_match_invented"]  # type: ignore[index]
+            + broken["cells"]["lucky_guess"]  # type: ignore[index]
+        )
+        if broken_wrong or broken["rates"]["correctness"] != 1.0:  # type: ignore[index]
+            raise GateFailure(
+                f"the corrupted run reported {broken_wrong} wrong matches at correctness "
+                f"{broken['rates']['correctness']} -- a bad number must cost coverage, "  # type: ignore[index]
+                f"never correctness"
+            )
+        print(
+            f"    a 307p corruption to {victim} is refused as UNEXPLAINED_RESIDUAL: "
+            f"1 row abstains, the other {broken['cells']['correct']} still prove their "  # type: ignore[index]
+            f"arithmetic"
+        )
+
+        # --- determinism, with both wedges on ------------------------------
+        first, second = base / "det_a.json", base / "det_b.json"
+        for out in (first, second):
+            _matcher_and_score(data, truth, out, DEV_SEEDS[0],
+                               extra=["--window", str(MESS_WINDOW_DAYS)])
+        if _without_timing(first) != _without_timing(second):
+            raise GateFailure(
+                "two runs over the same --fees --settlement-delay data disagree outside "
+                "their timing block. The fee model added arithmetic to the match path, and "
+                "a derived number is a new place for iteration order to leak in."
+            )
+        print("    determinism holds with both wedges on, outside timing/")
+
+
 def gate_7_assumptions() -> None:
     """ASSUMPTIONS.md must exist and cover every topic the write-up has to state."""
     print("\ngate 7 -- ASSUMPTIONS.md")
@@ -491,6 +775,7 @@ def main(argv: list[str] | None = None) -> int:
         gate_7_assumptions,
         gate_8_fixtures,
         lambda: gate_9_matcher((60,) if args.skip_slow else (60, 200)),
+        lambda: gate_10_mess((60,) if args.skip_slow else (60, 200)),
     ]
     try:
         for gate in gates:
@@ -500,20 +785,38 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all nine gates pass -- Phases 1, 2 and 3 are complete")
-    print("\nTier 1 resolves clean mode at 100% coverage and 100% correctness with 0 wrong")
-    print("matches, on an exact (value_date, net_paise) join inside a +/-0 business-day")
-    print("window. What that does NOT prove, and the write-up says so: the date window is")
-    print("untested (+/-1000 days still scores the same), the business-day calendar is")
-    print("exercised only by its own unit test, and the narration parser is not on the")
-    print("match path at all -- which is deliberate, and gated.")
-    print("\nPhase 4 turns on the first two mess flags. Expect coverage to collapse:")
-    print("\n    python -m hisaab.generator --seed 42 --n 60 --fees")
-    print("    python -m hisaab.matcher --data data/ --out out/matches.json")
-    print("    python -m hisaab.scoring --matches out/matches.json --truth truth/")
-    print("\nNearly every row should come back NO_CANDIDATE. That is the honest signal that")
-    print("the amount join was doing the work, and that a fee model -- not anything")
-    print("cleverer -- is the capability actually missing next.")
+    print("all ten gates pass -- Phases 1 through 4 are complete")
+    print("\nClean mode still resolves at 100/100/0 (gate 9), and the first two rows of the")
+    print("mess dial are on: --fees wedges gross against net, --settlement-delay moves the")
+    print("dates, and the matcher holds 100% correctness with 0 wrong matches while proving")
+    print("its arithmetic per row against truth's own six-term decomposition -- term by term,")
+    print("never on the total, since a fee too high and a GST too low close the same gap.")
+    print("\nTwo things Phase 4 settled that had been open, and both were surprises:")
+    print("\n  The window is no longer untested. Gate 9's summary used to say +/-1000 days")
+    print("  scored the same; gate 10 now pins --window 0 at 0% coverage under the posting")
+    print("  lag while --fees alone still scores 100% there. So the requirement lives in the")
+    print("  1-business-day posting lag, NOT in the T+2 settlement cycle -- T+2 shifts")
+    print("  settled_on and value_date together and is invisible to this join.")
+    print("\n  Coverage is 199/200 on seed 3 at n=200, and that is the right answer. Two")
+    print("  settlements genuinely share a net; once the window admits the posting lag both")
+    print("  are candidates for one credit, and the inputs cannot separate them. The true")
+    print("  one sits at +1bd (the posting lag) and the decoy at +0bd (same-day), so")
+    print("  `nearest date wins` would pick the decoy -- and since the lag is constant, it")
+    print("  would be wrong every time it fired, not occasionally. The abstention is kept")
+    print("  and the tie-break stays retired.")
+    print("\nAlso corrected in Phase 4: two published fee rates. Netbanking is not cheaper")
+    print("than cards (190 -> 200 bps), and UPI is not free -- zero MDR is not zero fee, as")
+    print("Razorpay's 2% platform fee still applies on the standard PG rail (0 -> 200 bps).")
+    print("The zero-rated rail moved to POS UPI, which the pricing page actually verifies.")
+    print("That cut the share of rows settling at their gross from 36% to ~6%, so --fees is")
+    print("a materially sharper test than the flag alone suggests.")
+    print("\nWhat this still does NOT prove: the business-day calendar is exercised only by")
+    print("its own unit test, the narration parser is not on the match path at all (gated,")
+    print("deliberately), and every settlement is still one payment -- subset-sum is Phase 5.")
+    print("\nNext (.plan/phase4.md as amended): Phase 4b, --dup-amounts. It plants a genuinely")
+    print("indistinguishable (date, amount) pair on purpose, which is the case seed 3 just")
+    print("produced by accident -- so the abstention path above gets tested deliberately")
+    print("rather than by luck, and I3 must be suspended for that flag alone.")
     return 0
 
 

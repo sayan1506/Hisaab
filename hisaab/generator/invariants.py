@@ -40,7 +40,8 @@ from collections import Counter, defaultdict
 from datetime import date
 
 from ..common import ids
-from .config import GenConfig
+from ..common.bizdays import BusinessCalendar
+from .config import GenConfig, MessFlags
 from .model import (
     BANK_HEADER,
     PAYMENTS_HEADER,
@@ -51,6 +52,85 @@ from .model import (
     Story,
 )
 from ..common.money import RUPEE
+
+#: Which mess flags legitimately invalidate each conditional invariant.
+#:
+#: A check runs unless one of *its own* flags is on, so a flag suspends exactly the
+#: checks it actually breaks. This replaces a single ``cfg.clean_mode`` gate, which was
+#: a footgun rather than a policy: ``clean_mode`` is "all thirteen flags off", so
+#: ``--fees`` -- which changes no cardinality and no date -- switched off the cardinality,
+#: membership and uniqueness checks along with everything else. The mislabelled run then
+#: lost the very checks that would have noticed it was mislabelled.
+#:
+#: Keys are ``<invariant id>.<what it asserts>``; a typo raises ``KeyError`` at the call
+#: site rather than silently never suspending. Every flag named here is validated against
+#: ``MessFlags`` in the self-check, for the same reason.
+#:
+#: Note what is deliberately **absent**: ``fees`` and ``settlement_delay``. Phase 4 measured
+#: whether either can force a natural ``(value_date, amount_paise)`` collision, and the answer
+#: decided that both stay off this list. See ``ASSUMPTIONS.md`` #24a/#24b. Measured twice --
+#: once in step 6, then again in step 7 after the rate table was corrected, because the first
+#: measurement's *stated mechanism* named a rate that no longer exists. Re-running it changed
+#: the explanation while leaving the decision intact, which is the useful kind of surprise:
+#:
+#:   * ``--settlement-delay`` cannot collide **by construction**, and this is the one claim
+#:     here that is structural rather than empirical. The capture-to-value date map is
+#:     injective, so the delay only *relabels* days: every within-day amount set carries over
+#:     intact, and delay-alone reproduces clean mode's collision count exactly at every size
+#:     tested. Note that injectivity, not equality, is the property that matters -- an earlier
+#:     probe wrongly concluded the delay was unguaranteed from the fact that
+#:     ``capture_date != value_date`` on every row, which tests the wrong thing.
+#:   * ``--fees`` does both, and the balance shifted when the rates did. It *disperses* when
+#:     equal-gross payments sit on different rates (they net apart) and *concentrates* when a
+#:     priced row's net lands on some other row's amount. Under the old table, with UPI at 0
+#:     bps against card at 200, dispersal dominated: 60-75% of equal-gross groups broke apart.
+#:     With four methods now sharing 200 bps that falls to 20-30%, so fees is a weaker
+#:     disperser -- and every collision that survives at n>=4000 is one **fees created**,
+#:     since clean and delay stay at 0 throughout.
+#:
+#: The concentration channel has a specific shape worth recording, because it says which rail
+#: to watch rather than just that a number exists. ``_unique_amount`` guarantees distinct
+#: *gross* within a capture date; a zero-rated row settles **at** its gross, so its credit
+#: inherits that protection, while a priced row's net is a derived value no invariant compares
+#: to anything. So the free rail acts as a **magnet**: 47-58% of collisions at n>=8000 involve
+#: a ``pos_upi`` row, against 11% if method were irrelevant, and the priced member's gross sits
+#: 2.42%-2.60% above the collision value -- which is exactly the net-to-gross ratio at 200 and
+#: 215 bps, not a fitted range. Phase 5's batching and Phase 6's TDS both add derived nets, so
+#: this is the channel that will widen.
+#:
+#: **336 runs** (12 seeds x 4 flag settings x 7 sizes to the UTR ceiling) put the first
+#: collision at n=4000, with 0 at every size at or below 2000. The largest size this project
+#: runs is n=1000, so the margin is 4x and clean mode holds everywhere. That margin is why the
+#: check stays **strict** rather than being relaxed to D6's "every colliding pair is marked
+#: unresolvable": at n<=1000 a collision would be a generator bug or a changed amount
+#: distribution, not an honest indistinguishable pair, and a check that silently absorbed it
+#: would remove the tripwire exactly where it is load-bearing. The genuinely indistinguishable
+#: case has its own home -- ``--dup-amounts`` plants it deliberately and does suspend this
+#: check. If it ever does fire unexpectedly, the failure message below carries D6's instruction
+#: rather than leaving a reader to invent the wrong fix.
+SUSPENDED_BY: dict[str, tuple[str, ...]] = {
+    "I3.cardinality":                ("batching", "noise_rows", "unsettled"),
+    "I3.no_refunds":                 ("netted_refunds",),
+    "I3.no_orphans":                 ("unsettled", "reserve", "noise_rows"),
+    "I2.every_payment_settled":      ("unsettled",),
+    "I2.every_settlement_credited":  ("reserve", "unsettled"),
+    "I6.all_payments_cited":         ("unsettled", "noise_rows"),
+    "I3.unique_date_amount":         ("dup_amounts",),
+}
+
+
+def _suspended(cfg: GenConfig, check: str, record: dict[str, list[str]]) -> bool:
+    """True if ``check`` must be skipped because a flag it cannot survive is on.
+
+    Records *why* into ``record``, so the run can announce the skip instead of quietly
+    performing fewer checks than it appears to. Silence is what made the old gate
+    dangerous: the checks vanished and the output looked identical.
+    """
+    on = [f for f in SUSPENDED_BY[check] if getattr(cfg.flags, f)]
+    if on:
+        record[check] = on
+    return bool(on)
+
 
 #: I8a: expected fixed points of a true random permutation is 1, independent of n.
 #: Five is a generous ceiling that still fails loudly on identity ordering.
@@ -145,25 +225,106 @@ def check_no_leak(bank_rows: list[tuple[str, int, str]]) -> None:
 
 
 def check_totals(
-    gross_total: int, net_total: int, credit_total: int, fee_cells: list[int]
+    gross_total: int,
+    net_total: int,
+    credit_total: int,
+    fee_cells: list[int],
+    *,
+    fees_on: bool = False,
 ) -> None:
-    """I4 — the three totals agree, and every fee/gst/tds cell is zero.
+    """I4 — the money adds up in aggregate, and deductions exist only when asked for.
 
-    Clean mode has *zero* fees, not "fees applied consistently" (trap 7). That is
-    what makes the first amount mismatch in Phase 3 a one-suspect debug instead of
-    a two-suspect one.
+    Three assertions, and only the last is conditional:
+
+      * ``net_total == credit_total`` -- every settled paisa reached the bank.
+      * ``gross_total - (every fee/gst/tds cell) == net_total`` -- the wedge between
+        gross and net is *exactly* the declared deductions and nothing else.
+      * with ``--fees`` off, every deduction cell is zero.
+
+    The second one is Phase 4's strengthening. Until now this asserted
+    ``gross == net == credited``, which ``--fees`` necessarily violates, so the tempting
+    move was to suspend it under the flag. That is precisely the footgun the
+    ``SUSPENDED_BY`` docstring describes: the check would stand down at the moment the
+    arithmetic it guards started moving. Subtracting the cells instead makes it
+    *stronger*, and at zero deductions it is character-for-character the old assertion --
+    so clean mode is still checked exactly the way Phase 1 checked it.
+
+    Clean mode has *zero* fees, not "fees applied consistently" (trap 7): that is what
+    makes the first amount mismatch in Phase 3 a one-suspect debug rather than a
+    two-suspect one, and it is why ``fees_on`` gates the third assertion instead of
+    ``cfg.clean_mode``. Any flag at all makes ``clean_mode`` false; only ``--fees`` is
+    allowed to put a number in these columns.
+
+    ``fee_cells`` is every fee, GST and TDS cell of every settlement, so their sum is the
+    whole wedge. Splitting them per column would be no stronger here and would only give
+    the two callers a chance to disagree about the order of three ints.
+
+    Precondition, and Phase 7 is where it breaks: every payment sits in exactly one
+    settlement, so summing gross over payments and net over settlements counts the same
+    money. ``--unsettled`` and ``--reserve`` void that and belong in ``SUSPENDED_BY``
+    when they land; neither is implemented yet, so neither is listed there today.
     """
+    deducted = sum(fee_cells)
     _require(
-        gross_total == net_total == credit_total,
+        net_total == credit_total,
         "I4",
-        f"totals disagree: gross={gross_total} net={net_total} credited={credit_total}",
+        f"settled and credited disagree: net={net_total} credited={credit_total} "
+        f"({net_total - credit_total:+d} paise never reached the bank)",
     )
-    nonzero = [c for c in fee_cells if c != 0]
     _require(
-        not nonzero,
+        gross_total - deducted == net_total,
         "I4",
-        f"{len(nonzero)} non-zero fee/gst/tds cells while --fees is off: {nonzero[:5]}",
+        f"the gross/net wedge is not the declared deductions: gross={gross_total} "
+        f"- deductions={deducted} = {gross_total - deducted}, but net={net_total} "
+        f"({gross_total - deducted - net_total:+d} paise unaccounted for)",
     )
+    if not fees_on:
+        nonzero = [c for c in fee_cells if c != 0]
+        _require(
+            not nonzero,
+            "I4",
+            f"{len(nonzero)} non-zero fee/gst/tds cells while --fees is off: {nonzero[:5]}",
+        )
+
+
+def check_settlement_arithmetic(rows: list[tuple[str, int, int, int, int, int]]) -> None:
+    """I4 — per settlement: ``net == gross - fee - gst - tds``, and GST sits on the fee.
+
+    ``rows`` is ``(settlement_id, gross_of_members, net, fee, gst, tds)``.
+
+    The per-row companion to ``check_totals``, and it earns its keep for a reason the
+    aggregate cannot cover: totals that agree in sum can still be wrong row by row, and
+    two compensating errors in opposite directions cancel exactly. Under ``--fees`` every
+    settlement carries its own rounding, so this is where a half-up slip in one direction
+    would show.
+
+    Both callers previously had this as an inline "net equals the member gross **while
+    ``--fees`` is off**" check. Same treatment as I11 and ``check_totals``: strengthened
+    to the full subtraction rather than suspended, which at zero deductions is the old
+    equality unchanged.
+
+    The second assertion is not arithmetic bookkeeping but a check on the *composition*:
+    GST is a share of the fee, never of the gross. Since the GST rate is well under 100%,
+    ``gst <= fee`` holds for any fee -- and it fails immediately if the two rates are ever
+    applied to the same base, which inflates GST by roughly fifty times and is the single
+    easiest error available in this model (see ``story._deductions``). Deliberately
+    rate-free: re-deriving the fee from ``cfg.fees`` here would only assert that the
+    generator agrees with itself. The independent re-derivation is the *matcher's* job,
+    and the residual closing to zero is what proves the two sides agree.
+    """
+    for sid, gross, net, fee, gst, tds in rows:
+        _require(
+            net == gross - fee - gst - tds,
+            "I4",
+            f"{sid}: net {net} != gross {gross} - fee {fee} - gst {gst} - tds {tds} "
+            f"= {gross - fee - gst - tds}",
+        )
+        _require(
+            gst <= fee,
+            "I4",
+            f"{sid}: gst {gst} exceeds fee {fee} -- GST is charged on the fee, not on "
+            f"the gross, so this is the two rates applied to the same base",
+        )
 
 
 def check_int_money(values: dict[str, object]) -> None:
@@ -188,6 +349,15 @@ def check_within_block_alignment(
 
     Returns (aligned, population) for reporting. See the module docstring for why
     this is a rate check against identity rather than a fixed-point ceiling.
+
+    **Both dicts must be keyed by the same date and hold the same payments per key.**
+    The caller keys both on the credit's ``value_date``, which is not a detail: keying the
+    payment side on ``business_date`` instead was correct only while the two dates were
+    equal. Under Phase 4's posting lag the keys offset by n business days, so each block
+    compared a credit list against the payments of a *different* day -- the rate collapsed
+    from 19/58 to 0/58 and the check could no longer fail at all. An invariant that goes
+    quietly inert the moment the thing it guards starts moving is worse than one that was
+    never written, because the report still prints a number for it.
     """
     aligned = population = 0
     for d, pl in payment_ids_by_date.items():
@@ -213,12 +383,21 @@ def check_within_block_alignment(
 # Story-level checks
 # ---------------------------------------------------------------------------
 
-def check_story(story: Story, cfg: GenConfig) -> dict[str, object]:
+def check_story(
+    story: Story, cfg: GenConfig, calendar: BusinessCalendar | None = None
+) -> dict[str, object]:
     """Run every invariant on the in-memory story. Raises ``InvariantError``.
 
     Returns a small report dict for the CLI to echo, so a passing run still shows
     the numbers behind the pass rather than only the word "ok".
+
+    ``calendar`` is injectable for the same reason ``story.build`` takes one: I11 recomputes
+    the two delays and must do it over the *same* calendar the generator used. Pass the
+    same object to both, or a holiday set on one side and not the other turns a correct
+    story into an invariant failure -- and a shared default would hide that a caller
+    forgot to pass it.
     """
+    cal = calendar or BusinessCalendar()
     payments, settlements, credits = story.payments, story.settlements, story.credits
 
     # I1 — unique ids within each file
@@ -228,20 +407,28 @@ def check_story(story: Story, cfg: GenConfig) -> dict[str, object]:
     check_unique_ids("I1", "credit", [c.credit_id for c in credits])
     check_unique_ids("I1", "refund", [r.refund_id for r in story.refunds])
 
-    # I3 — clean mode has no noise and no orphans
-    if cfg.clean_mode:
+    #: Conditional checks that did not run, and the flag that excused each. Echoed by
+    #: the CLI and carried into the report: a skipped check must be *visible*, because
+    #: an invisible skip is exactly what made the old ``clean_mode`` gate dangerous.
+    skipped: dict[str, list[str]] = {}
+
+    # I3 — cardinality, refunds and orphans. Three checks, three different flag sets:
+    # --fees breaks none of them, which is the whole point of splitting the old gate.
+    if not _suspended(cfg, "I3.cardinality", skipped):
         _require(
             len(payments) == len(settlements) == len(credits) == cfg.n,
             "I3",
-            f"clean mode must be 1:1:1 at n={cfg.n}, got "
+            f"expected 1:1:1 cardinality at n={cfg.n}, got "
             f"{len(payments)}/{len(settlements)}/{len(credits)}",
         )
-        _require(not story.refunds, "I3", "clean mode emits no refunds")
+    if not _suspended(cfg, "I3.no_refunds", skipped):
+        _require(not story.refunds, "I3", "refunds emitted without --netted-refunds")
+    if not _suspended(cfg, "I3.no_orphans", skipped):
         _require(
             not (story.unsettled_payment_ids or story.settlements_without_credit
                  or story.non_gateway_credit_ids),
             "I3",
-            "clean mode has no orphans and no noise rows",
+            "orphans or noise rows present while every flag that creates them is off",
         )
 
     # I2 — every payment in exactly one settlement; every settlement in one credit
@@ -252,7 +439,7 @@ def check_story(story: Story, cfg: GenConfig) -> dict[str, object]:
     payment_ids = {p.payment_id for p in payments}
     unknown = sorted(set(settled_count) - payment_ids)
     _require(not unknown, "I2", f"settlements reference unknown payments: {unknown[:5]}")
-    if cfg.clean_mode:
+    if not _suspended(cfg, "I2.every_payment_settled", skipped):
         missing = sorted(payment_ids - set(settled_count))
         _require(not missing, "I2", f"payments never settled: {missing[:5]}")
     multi = sorted(pid for pid, k in settled_count.items() if k > 1)
@@ -265,18 +452,33 @@ def check_story(story: Story, cfg: GenConfig) -> dict[str, object]:
     settlement_ids = {s.settlement_id for s in settlements}
     unknown_s = sorted(set(credited_count) - settlement_ids)
     _require(not unknown_s, "I2", f"credits reference unknown settlements: {unknown_s[:5]}")
-    if cfg.clean_mode:
+    if not _suspended(cfg, "I2.every_settlement_credited", skipped):
         uncredited = sorted(settlement_ids - set(credited_count))
         _require(not uncredited, "I2", f"settlements never credited: {uncredited[:5]}")
     multi_s = sorted(sid for sid, k in credited_count.items() if k > 1)
     _require(not multi_s, "I2", f"settlements in more than one credit: {multi_s[:5]}")
 
-    # I4 — totals agree, fee columns are zero
+    # I4 — the money adds up, in aggregate and then per settlement
+    gross_of = {p.payment_id: p.gross_paise for p in payments}
     check_totals(
         story.total_gross_paise(),
         story.total_net_paise(),
         story.total_credited_paise(),
         [x for s in settlements for x in (s.fee_paise, s.gst_paise, s.tds_paise)],
+        fees_on=cfg.flags.fees,
+    )
+    check_settlement_arithmetic(
+        [
+            (
+                s.settlement_id,
+                sum(gross_of[pid] for pid in s.payment_ids),
+                s.net_paise,
+                s.fee_paise,
+                s.gst_paise,
+                s.tds_paise,
+            )
+            for s in settlements
+        ]
     )
 
     # I5 — every monetary value is an int
@@ -308,7 +510,7 @@ def check_story(story: Story, cfg: GenConfig) -> dict[str, object]:
             _require(sid in settlement_ids, "I6", f"{c.credit_id} cites unknown {sid}")
         for pid in c.payment_ids:
             _require(pid in payment_ids, "I6", f"{c.credit_id} cites unknown {pid}")
-    if cfg.clean_mode:
+    if not _suspended(cfg, "I6.all_payments_cited", skipped):
         cited = {pid for c in credits for pid in c.payment_ids}
         _require(
             cited == payment_ids,
@@ -316,39 +518,88 @@ def check_story(story: Story, cfg: GenConfig) -> dict[str, object]:
             f"{len(payment_ids - cited)} payments are in no credit's truth entry",
         )
 
-    # Dates line up, because --settlement-delay is off.
+    # I11 — both dates are exactly where the declared delays put them.
+    #
+    # These two checks used to assert plain equality "while --settlement-delay is off".
+    # Phase 4 makes them *stronger* rather than suspending them, for the reason the
+    # SUSPENDED_BY docstring gives: a check that stands down exactly when the thing it
+    # guards starts moving is the footgun, not the policy. At delay 0 and lag 0 the
+    # assertion below is character-for-character the old one; under the flag it is a real
+    # test of the delay model, and it is the only thing that would catch a silent
+    # off-by-one in either direction.
+    #
+    # Note which of the two the matcher can see. The capture->settlement delay is
+    # invisible to it (the join never reads captured_at); the settlement->credit lag is
+    # the one the date window is measured against. Getting the first wrong is a
+    # generator-only bug that nothing downstream would ever reveal, which is precisely
+    # why it is asserted here.
     by_pay = {p.payment_id: p for p in payments}
     by_setl = {s.settlement_id: s for s in settlements}
     for s in settlements:
         for pid in s.payment_ids:
+            want = cal.add_business_days(by_pay[pid].business_date, cfg.delay_days)
             _require(
-                s.settled_on == by_pay[pid].business_date,
-                "I4",
+                s.settled_on == want,
+                "I11",
                 f"{s.settlement_id} settled {s.settled_on} but {pid} captured "
-                f"{by_pay[pid].business_date} while --settlement-delay is off",
+                f"{by_pay[pid].business_date}, which is {want} at a "
+                f"{cfg.delay_days}-business-day settlement delay",
             )
     for c in credits:
         for sid in c.settlement_ids:
+            want = cal.add_business_days(by_setl[sid].settled_on, cfg.lag_days)
             _require(
-                c.value_date == by_setl[sid].settled_on,
-                "I4",
+                c.value_date == want,
+                "I11",
                 f"{c.credit_id} dated {c.value_date} but {sid} settled "
-                f"{by_setl[sid].settled_on} while --settlement-delay is off",
+                f"{by_setl[sid].settled_on}, which is {want} at a "
+                f"{cfg.lag_days}-business-day bank posting lag",
             )
 
-    # Clean mode must be resolvable at 100% -- row 1 of the mess dial. A duplicate
-    # (date, amount) would be genuinely indistinguishable from the two legitimate
-    # signals, so the honest verdict would be an abstention. That case is real and
-    # --dup-amounts plants it deliberately in Phase 8; it must not appear here by
-    # accident.
-    if cfg.clean_mode:
+    # The data must be resolvable from (date, amount) -- row 1 of the mess dial. A
+    # duplicate pair is genuinely indistinguishable from the two legitimate signals, so
+    # the honest verdict would be an abstention. That case is real and --dup-amounts
+    # plants it deliberately in Phase 4b; it must not appear here by accident.
+    #
+    # Suspended only by --dup-amounts. Step 6 measured whether --fees or
+    # --settlement-delay can force a collision, because the plan predicted both would and
+    # a suspension was on the table if they did. Neither does: the delay's date map is
+    # injective so it only relabels days, and fees *disperse* amounts (the per-method
+    # rates push equal-gross payments onto different nets) rather than compressing them.
+    # Zero collisions in 48 runs, first appearing at n=4000 -- see SUSPENDED_BY's docstring
+    # and ASSUMPTIONS.md #24a/#24b for the numbers.
+    #
+    # That margin is why this check stays strict. At the sizes this project runs, a
+    # collision is a generator bug or a changed amount distribution, not an honest
+    # indistinguishable pair -- so the failure message below sorts the two cases by size
+    # rather than leaving a reader to guess which one they have.
+    if not _suspended(cfg, "I3.unique_date_amount", skipped):
         key_counts = Counter((c.value_date, c.amount_paise) for c in credits)
         dupes = {k for k, count in key_counts.items() if count > 1}
+        # Named so the two halves of the guidance below cannot drift apart from the
+        # measurement that justifies them.
+        measured_clean_to = 2000
         _require(
             not dupes,
             "I3",
-            f"{len(dupes)} duplicate (date, amount) credits make clean mode "
-            f"unresolvable: {sorted(dupes)[:3]}",
+            f"{len(dupes)} duplicate (date, amount) credits are unresolvable from the "
+            f"inputs: {sorted(dupes)[:3]}\n"
+            f"  Do NOT resample it away: that would delete the most honest row in the "
+            f"file to protect an invariant.\n"
+            f"  This run is n={cfg.n}. Measured (ASSUMPTIONS.md #24a): the pair is "
+            f"collision-free to n={measured_clean_to} on seeds 1/2/3/42 under any "
+            f"combination of --fees and --settlement-delay, with the first natural "
+            f"collision at n=4000.\n"
+            + (
+                f"  At n={cfg.n} a collision is therefore NOT expected pressure -- suspect "
+                f"a generator change (the amount distribution, the fee rates, or "
+                f"_unique_amount's key) before concluding the data is honestly ambiguous."
+                if cfg.n <= measured_clean_to
+                else f"  At n={cfg.n} this is past the measured range and may be a genuine "
+                f"indistinguishable pair. Then decision D6 applies: mark it "
+                f"resolvable=false in truth (ASSUMPTIONS.md #24) so the matcher is scored "
+                f"on abstaining rather than on guessing."
+            ),
         )
 
     # I8a — the ID numbering carries no information
@@ -365,10 +616,26 @@ def check_story(story: Story, cfg: GenConfig) -> dict[str, object]:
         f"assigned in payment order, which makes the numbering itself the answer key",
     )
 
-    # I8b — within-block position carries no information
+    # I8b — within-block position carries no information.
+    #
+    # Both sides are keyed on the **credit's** value_date, so a block holds one day of
+    # bank rows and exactly the payments those rows paid out. Keying the payment side on
+    # ``business_date`` was equivalent only while the two dates agreed; under a posting
+    # lag it compared each credit block against a different day's payments and the check
+    # went inert (see check_within_block_alignment's docstring).
+    #
+    # Payments keep capture order within a block because ``payments`` is capture-sorted
+    # and this loop appends in that order -- which is the ordering the check is *about*:
+    # bank rows are sorted by amount, and if position still tracked capture time a zip
+    # matcher would score without doing any work.
+    value_date_of: dict[str, date] = {
+        pid: c.value_date for c in credits for pid in c.payment_ids
+    }
     p_by_date: dict[date, list[str]] = defaultdict(list)
     for p in payments:
-        p_by_date[p.business_date].append(p.payment_id)
+        # A payment in no credit is Phase 7's --unsettled; it belongs to no bank block.
+        if (when := value_date_of.get(p.payment_id)) is not None:
+            p_by_date[when].append(p.payment_id)
     c_by_date: dict[date, list[str]] = defaultdict(list)
     for c in credits:
         c_by_date[c.value_date].append(c.payment_ids[0])
@@ -380,6 +647,12 @@ def check_story(story: Story, cfg: GenConfig) -> dict[str, object]:
         "numbering_fixed_points": numbering_fixed,
         "within_block_aligned": f"{aligned}/{population}",
         "gross_paise_total": story.total_gross_paise(),
+        # Which conditional checks did not run, and the flag that excused each. Empty in
+        # clean mode. This travels into run_manifest.json beside "status": "pass", which
+        # is the honest pairing: everything that ran, passed -- and here is what did not
+        # run. A pass count that quietly shrinks with each new flag is how a generator
+        # ends up certifying data nothing checked.
+        "checks_skipped": {k: list(v) for k, v in sorted(skipped.items())},
     }
 
 
@@ -402,11 +675,14 @@ if __name__ == "__main__":
     print("invariants.py: 20 story configurations pass")
 
     # --- the checks must FAIL on broken stories, or they are decoration --------
+    fired: list[str] = []
+
     def must_fail(code: str, broken: Story, cfg_: GenConfig = cfg) -> None:
         try:
             check_story(broken, cfg_)
         except InvariantError as e:
             assert str(e).startswith(code), f"expected {code}, got: {e}"
+            fired.append(code)
         else:
             raise AssertionError(f"{code} did not fire")
 
@@ -430,6 +706,88 @@ if __name__ == "__main__":
         ),
     )
 
+    # --- step 4: the fee arithmetic ------------------------------------------
+    # ``fees`` is in MessFlags.IMPLEMENTED as of step 4, so this config needs no patching
+    # seam -- the flag now genuinely changes the data.
+    fees_cfg = GenConfig(seed=42, n=60, flags=MessFlags(fees=True))
+    fees_story = build(fees_cfg)
+    assert check_story(fees_story, fees_cfg)["checks_skipped"] == {}, (
+        "--fees must suspend nothing at all"
+    )
+
+    # I4, the per-settlement check, on the case the aggregate provably cannot see: move a
+    # paisa of fee from one settlement to another. Both totals still agree to the paisa --
+    # the deduction sum is unchanged and no net or credit moved -- so every aggregate
+    # assertion passes and only the per-row subtraction fails. Two compensating errors
+    # cancelling is not a hypothetical; it is what a sign slip in a batching loop looks
+    # like, and it is the whole reason check_settlement_arithmetic exists.
+    # Chosen by carrying a fee, not by index: ``pos_upi`` is zero-rated, so a settlement in
+    # shuffled order may have nothing to move. That was near-certain when the zero-rated
+    # share was ~36% of rows and is merely possible now that it is ~6% -- which is exactly
+    # why the selection stays written this way. A probe that passes because the sample got
+    # lucky is a probe that fails on a seed nobody ran. And the
+    # replacement is positional -- reordering the list would change what I8a measures, so
+    # the probe would risk failing for the wrong reason.
+    a_s, b_s = [s for s in fees_story.settlements if s.fee_paise][:2]
+    nudged = {a_s.settlement_id: 1, b_s.settlement_id: -1}
+    shifted = dataclasses.replace(
+        fees_story,
+        settlements=[
+            dataclasses.replace(s, fee_paise=s.fee_paise + nudged[s.settlement_id])
+            if s.settlement_id in nudged
+            else s
+            for s in fees_story.settlements
+        ],
+    )
+    _cells = [x for s in shifted.settlements for x in (s.fee_paise, s.gst_paise, s.tds_paise)]
+    assert sum(_cells) == sum(
+        x for s in fees_story.settlements for x in (s.fee_paise, s.gst_paise, s.tds_paise)
+    ), "the probe must leave the aggregate untouched, or it tests the wrong assertion"
+    must_fail("I4", shifted, fees_cfg)
+
+    # The two arithmetic checks, probed directly. Some failures cannot be reached through
+    # a whole story without tripping an earlier assertion first -- a GST error large
+    # enough to exceed its fee also breaks the subtraction and the totals -- so the unit
+    # probe is the only way to know the specific assertion fires rather than a neighbour.
+    def must_raise(what: str, fn) -> None:
+        try:
+            fn()
+        except InvariantError as e:
+            assert str(e).startswith("I4"), f"{what}: expected I4, got: {e}"
+            fired.append("I4")
+        else:
+            raise AssertionError(f"{what} did not fire")
+
+    # GST charged on the gross instead of on the fee: 18% of a ₹10,000 gross is nine times
+    # a 2% fee, so it lands above the fee it is supposed to sit on.
+    must_raise(
+        "gst on the gross",
+        lambda: check_settlement_arithmetic(
+            [("setl_x", 1_000_000, 1_000_000 - 20_000 - 180_000, 20_000, 180_000, 0)]
+        ),
+    )
+    must_raise(
+        "net off by a paisa",
+        lambda: check_settlement_arithmetic(
+            [("setl_x", 1_000_000, 976_401, 20_000, 3_600, 0)]
+        ),
+    )
+    # ... and the correct row passes, or the probe above proves nothing.
+    check_settlement_arithmetic([("setl_x", 1_000_000, 976_400, 20_000, 3_600, 0)])
+    # Zero deductions: the assertion is the pre-Phase-4 equality, unchanged.
+    check_settlement_arithmetic([("setl_x", 1_000_000, 1_000_000, 0, 0, 0)])
+
+    must_raise(
+        "wedge is not the deductions",
+        lambda: check_totals(1_000_000, 976_400, 976_400, [20_000, 3_500, 0], fees_on=True),
+    )
+    must_raise(
+        "settled but never credited",
+        lambda: check_totals(1_000_000, 976_400, 976_399, [20_000, 3_600, 0], fees_on=True),
+    )
+    check_totals(1_000_000, 976_400, 976_400, [20_000, 3_600, 0], fees_on=True)
+    check_totals(1_000_000, 1_000_000, 1_000_000, [0, 0, 0])
+
     # I3: a duplicate (date, amount) pair.
     # Cloning only the credit's amount would change the credited total and trip I4
     # first, so the whole chain behind it is rewritten -- payment gross, settlement
@@ -439,40 +797,68 @@ if __name__ == "__main__":
     a_pid, b_pid = a.payment_ids[0], b.payment_ids[0]
     a_sid, b_sid = a.settlement_ids[0], b.settlement_ids[0]
     a_pay = next(p for p in story.payments if p.payment_id == a_pid)
-    must_fail(
-        "I3",
-        dataclasses.replace(
-            story,
-            payments=[
-                dataclasses.replace(
-                    p,
-                    gross_paise=a.amount_paise,
-                    captured_at=a_pay.captured_at.replace(minute=0, second=0),
-                )
-                if p.payment_id == b_pid
-                else p
-                for p in story.payments
-            ],
-            settlements=[
-                dataclasses.replace(s, net_paise=a.amount_paise, settled_on=a.value_date)
-                if s.settlement_id == b_sid
-                else s
-                for s in story.settlements
-            ],
-            credits=[
-                dataclasses.replace(
-                    c,
-                    value_date=a.value_date,
-                    amount_paise=a.amount_paise,
-                    narration=f"IMPS-RZRPAY-{a_sid[-4:]}X",
-                    decomposition=Decomposition(gross_paise=a.amount_paise),
-                )
-                if c.credit_id == b.credit_id
-                else c
-                for c in story.credits
-            ],
-        ),
+    dup_story = dataclasses.replace(
+        story,
+        payments=[
+            dataclasses.replace(
+                p,
+                gross_paise=a.amount_paise,
+                captured_at=a_pay.captured_at.replace(minute=0, second=0),
+            )
+            if p.payment_id == b_pid
+            else p
+            for p in story.payments
+        ],
+        settlements=[
+            dataclasses.replace(s, net_paise=a.amount_paise, settled_on=a.value_date)
+            if s.settlement_id == b_sid
+            else s
+            for s in story.settlements
+        ],
+        credits=[
+            dataclasses.replace(
+                c,
+                value_date=a.value_date,
+                amount_paise=a.amount_paise,
+                narration=f"IMPS-RZRPAY-{a_sid[-4:]}X",
+                decomposition=Decomposition(gross_paise=a.amount_paise),
+            )
+            if c.credit_id == b.credit_id
+            else c
+            for c in story.credits
+        ],
     )
+    must_fail("I3", dup_story)
+
+    # --- step 1: suspension works, and only the right flag does it ------------
+    # dup_story genuinely contains two credits sharing (date, amount), so it is the
+    # ideal probe: a check that stands down must stand down on data that really does
+    # violate it. Uses the same IMPLEMENTED seam a real phase will use.
+    _orig = MessFlags.IMPLEMENTED
+    try:
+        # Additive, not a replacement: assigning a bare literal here would *un*-implement
+        # whatever a landed phase had added (step 3's ``settlement_delay``), so the probe
+        # would silently test a configuration that cannot occur.
+        MessFlags.IMPLEMENTED = _orig | {"dup_amounts", "fees"}
+
+        # --dup-amounts: the duplicate is the *intent*, so the check is suspended --
+        # and the report says so, rather than quietly running one check fewer.
+        dup_cfg = GenConfig(seed=42, n=60, flags=MessFlags(dup_amounts=True))
+        rep = check_story(dup_story, dup_cfg)
+        assert rep["checks_skipped"] == {"I3.unique_date_amount": ["dup_amounts"]}, rep
+
+        # --fees must NOT excuse it. This is the exact conflation the old clean_mode
+        # gate made: fees change amounts, so they raise collision pressure, but a
+        # collision is a finding to record (ASSUMPTIONS.md #24) and not a check to
+        # switch off. Under the old gate this story passed silently.
+        fees_cfg = GenConfig(seed=42, n=60, flags=MessFlags(fees=True))
+        must_fail("I3", dup_story, fees_cfg)
+        assert check_story(story, fees_cfg)["checks_skipped"] == {}, (
+            "--fees must suspend nothing at all"
+        )
+    finally:
+        MessFlags.IMPLEMENTED = _orig
+    assert MessFlags.IMPLEMENTED == _orig, "the probe must not leak"
 
     # I8a: settlements ordered and numbered in payment order (what skipping the
     # shuffle in step 7 would produce). Renaming must propagate to the credits, or
@@ -494,6 +880,39 @@ if __name__ == "__main__":
         ),
     )
 
+    # I11: either date off by a day, in either direction. Four cases, because the two
+    # delays fail independently and only one of them is visible to the matcher -- a
+    # capture->settlement error would never surface downstream, so if it is not caught
+    # here it is not caught at all.
+    from datetime import timedelta
+
+    for label, mutate in (
+        ("settled_on late", lambda st: dataclasses.replace(
+            st, settlements=[dataclasses.replace(st.settlements[0],
+                                                 settled_on=st.settlements[0].settled_on
+                                                 + timedelta(days=7)),
+                             *st.settlements[1:]])),
+        ("settled_on early", lambda st: dataclasses.replace(
+            st, settlements=[dataclasses.replace(st.settlements[0],
+                                                 settled_on=st.settlements[0].settled_on
+                                                 - timedelta(days=7)),
+                             *st.settlements[1:]])),
+        ("value_date late", lambda st: dataclasses.replace(
+            st, credits=[dataclasses.replace(st.credits[0],
+                                             value_date=st.credits[0].value_date
+                                             + timedelta(days=7)),
+                         *st.credits[1:]])),
+        ("value_date early", lambda st: dataclasses.replace(
+            st, credits=[dataclasses.replace(st.credits[0],
+                                             value_date=st.credits[0].value_date
+                                             - timedelta(days=7)),
+                         *st.credits[1:]])),
+    ):
+        # Seven days, not one: a one-day nudge off a Friday lands on a weekend, and
+        # add_business_days rolls a weekend forward to the same Monday -- so the story
+        # would still satisfy I11 and the negative case would silently not fire.
+        must_fail("I11", mutate(story))
+
     # I8b: bank rows ordered by capture time instead of amount
     by_pay_ix = {p.payment_id: i for i, p in enumerate(story.payments)}
     time_ordered = [
@@ -505,4 +924,10 @@ if __name__ == "__main__":
     ]
     must_fail("I8b", dataclasses.replace(story, credits=time_ordered))
 
-    print("invariants.py self-check ok  (6 negative cases fire correctly)")
+    # Counted, not written down: the literal "6" here went stale the moment Phase 4
+    # added a seventh case, and a self-check that misreports its own coverage is a
+    # small version of exactly the problem this phase is fixing.
+    print(
+        f"invariants.py self-check ok  ({len(fired)} negative cases fire correctly: "
+        f"{', '.join(sorted(set(fired)))})"
+    )

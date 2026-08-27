@@ -104,6 +104,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--narration-styles", type=int, default=4, metavar="N",
         help="bank narration templates in play, 1-4; 1 is sterile (default: 4)",
     )
+    # The two delays, as two numbers. Only the second is visible to the matcher's date
+    # window -- see the field comments in config.py. Both are inert without
+    # --settlement-delay, and GenConfig refuses a magnitude set while the flag is off
+    # rather than accepting a number nothing reads.
+    delays = p.add_argument_group(
+        "settlement timing",
+        "Both take effect only with --settlement-delay, and both count *business* days.",
+    )
+    delays.add_argument(
+        "--settlement-delay-days", type=int, default=2, metavar="N",
+        help="business days from capture to settlement, T+n (default: 2). Invisible to "
+             "the matcher: the join never reads captured_at",
+    )
+    delays.add_argument(
+        "--posting-lag-days", type=int, default=1, metavar="N",
+        help="business days from settlement to the bank credit landing (default: 1). "
+             "This is the delay the matcher's --window has to cover",
+    )
     p.add_argument("--quiet", action="store_true",
                    help="print only the resolved-config JSON line")
 
@@ -120,6 +138,27 @@ def build_parser() -> argparse.ArgumentParser:
     mess.add_argument("--all-mess", action="store_true",
                      help="turn on every mess flag at once (not Phase 1)")
     return p
+
+
+def _utf8_stdout() -> None:
+    """Make the rupee sign survive a pipe on Windows.
+
+    The summary prints ``money.fmt`` output, and a redirected stdout on Windows defaults
+    to cp1252, where ``₹`` raises ``UnicodeEncodeError``. ``hisaab/matcher/cli.py`` and
+    ``hisaab/scoring/cli.py`` have carried this since Phase 3; the generator did not, so
+    ``python -m hisaab.generator > log.txt`` wrote all seven files and *then* died in the
+    summary print -- exiting 1, the code that means "an invariant failed and nothing was
+    written". The most misleading possible exit for a run that fully succeeded.
+
+    Acceptance never caught it because ``tools/acceptance.py`` sets ``PYTHONUTF8=1`` in
+    the subprocess environment, so the gates exercise the one configuration where the bug
+    is invisible.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
 
 
 def config_from_args(args: argparse.Namespace) -> GenConfig:
@@ -139,12 +178,15 @@ def config_from_args(args: argparse.Namespace) -> GenConfig:
         truth_dir=args.truth,
         narration_styles=args.narration_styles,
         flags=flags,
+        settlement_delay_days=args.settlement_delay_days,
+        posting_lag_days=args.posting_lag_days,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _utf8_stdout()
 
     try:
         cfg = config_from_args(args)

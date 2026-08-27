@@ -33,6 +33,7 @@ from pathlib import Path
 from ..common.verdict import (
     MATCHES_JSON,
     VERDICT_SCHEMA_VERSION,
+    Decomposition,
     Outcome,
     Verdict,
     VerdictFile,
@@ -51,6 +52,21 @@ MAX_IDS_SHOWN = 8
 REQUIRED_VERDICT_KEYS: tuple[str, ...] = (
     "credit_id", "outcome", "settlement_ids", "payment_ids",
     "tier", "confidence", "reason", "note", "residual_paise",
+    "credit_amount_paise", "decomposition",
+)
+
+#: Keys required inside a non-null ``decomposition`` (Phase 4 step 5). Same
+#: absent-versus-null rule, one level down.
+#:
+#: ``expected_credit_paise`` is required even though it is *derived* from the six terms
+#: above it, and this module recomputes it and refuses a disagreement. That is not
+#: belt-and-braces: a hand-edited file -- the case this whole module exists for -- is
+#: edited one field at a time, so a fee changed without its total is exactly the shape a
+#: tampered proof takes. Recomputing it costs a line and turns the stated total into a
+#: checksum over the terms rather than a ninth number nobody checks.
+REQUIRED_DECOMPOSITION_KEYS: tuple[str, ...] = (
+    "gross_paise", "fee_paise", "gst_paise", "tds_paise", "refunds_paise",
+    "reserve_paise", "expected_credit_paise", "rule",
 )
 
 REQUIRED_TOP_KEYS: tuple[str, ...] = ("schema_version", "seed", "month", "matcher", "verdicts")
@@ -117,6 +133,58 @@ def _optional_float(obj: dict[str, object], key: str, where: str) -> float | Non
     return float(v)
 
 
+def _parse_decomposition(raw: object, where: str) -> Decomposition | None:
+    """Parse a verdict's ``decomposition`` block, or ``None`` where there is none.
+
+    ``None`` is legitimate and means an abstention -- the dataclass is what decides
+    whether a *particular* outcome is allowed to omit it, and reproducing that judgement
+    here would be a second copy of the rule.
+
+    The one check this function owns that the dataclass cannot: the stated
+    ``expected_credit_paise`` must equal what the six terms actually imply. In memory it is
+    a computed property and cannot disagree; on disk it is a number somebody could have
+    edited, and a fee raised without its total re-derived is precisely how a tampered proof
+    reads. Recomputing it makes the written total a checksum over the terms.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise VerdictError(
+            f"{where}: decomposition must be an object or null, got {type(raw).__name__}"
+        )
+    missing = [k for k in REQUIRED_DECOMPOSITION_KEYS if k not in raw]
+    if missing:
+        raise VerdictError(
+            f"{where}: decomposition missing key(s) {missing} -- all six terms are "
+            f"required, at zero where the rule does not produce them, so that filling one "
+            f"in later is a change of value and not a change of shape"
+        )
+
+    at = f"{where}: decomposition"
+    stated = _require_int(raw, "expected_credit_paise", at)
+    try:
+        decomposition = Decomposition(
+            gross_paise=_require_int(raw, "gross_paise", at),
+            fee_paise=_require_int(raw, "fee_paise", at),
+            gst_paise=_require_int(raw, "gst_paise", at),
+            tds_paise=_require_int(raw, "tds_paise", at),
+            refunds_paise=_require_int(raw, "refunds_paise", at),
+            reserve_paise=_require_int(raw, "reserve_paise", at),
+            rule=_optional_str(raw, "rule", at),
+        )
+    except (ValueError, TypeError) as e:
+        raise VerdictError(f"{at}: {e}") from e
+
+    if decomposition.expected_credit_paise != stated:
+        raise VerdictError(
+            f"{at}: states expected_credit_paise {stated}p, but its own terms give "
+            f"{decomposition.gross_paise}p gross - {decomposition.deductions_paise}p "
+            f"deducted = {decomposition.expected_credit_paise}p. A total that disagrees "
+            f"with the terms it is a total of means the file was edited, not computed"
+        )
+    return decomposition
+
+
 def _parse_verdict(entry: object, where: str) -> Verdict:
     if not isinstance(entry, dict):
         raise VerdictError(f"{where}: expected an object, got {type(entry).__name__}")
@@ -164,6 +232,12 @@ def _parse_verdict(entry: object, where: str) -> Verdict:
             reason=reason,
             note=_optional_str(entry, "note", where),
             residual_paise=_optional_int(entry, "residual_paise", where),
+            credit_amount_paise=_optional_int(entry, "credit_amount_paise", where),
+            # Parsed before the Verdict is built so a malformed block fails on its own
+            # terms. The *balance* between it and the residual is the dataclass's rule and
+            # is re-run by this constructor -- a file whose proof does not add up is
+            # refused on read exactly as it would have been refused on write.
+            decomposition=_parse_decomposition(entry.get("decomposition"), where),
         )
     except (ValueError, TypeError) as e:
         # The per-verdict rules live on the dataclass so the writer and the reader
@@ -314,9 +388,18 @@ if __name__ == "__main__":
             return msg
         raise AssertionError(f"accepted {label}")
 
+    # The worked example from the track spec, so the round-trip below carries a real
+    # decomposition rather than an all-zero one: a Rs 1,111 card sale at 2% is a 2,222p fee
+    # and 18% GST on the fee is 400p, leaving 108,478p credited.
+    GROSS, FEE, GST, CREDIT = 111_100, 2_222, 400, 108_478
+
     def resolved(cid: str, pid: str) -> Verdict:
-        return Verdict(cid, Outcome.RESOLVED, (f"setl_{pid[4:]}",), (pid,),
-                       tier=1, residual_paise=0)
+        return Verdict(
+            cid, Outcome.RESOLVED, (f"setl_{pid[4:]}",), (pid,),
+            tier=1, residual_paise=0, credit_amount_paise=CREDIT,
+            decomposition=Decomposition(GROSS, fee_paise=FEE, gst_paise=GST,
+                                        rule="gateway fee + GST at declared rates"),
+        )
 
     good = VerdictFile(
         seed=42, month="2026-08", matcher="fixture:selfcheck@1",
@@ -384,6 +467,19 @@ if __name__ == "__main__":
         def one(**changes: object) -> dict[str, object]:
             return mutated(verdicts=[{**base["verdicts"][0], **changes}])
 
+        # Every field an abstention is forbidden to carry, cleared in one place. Written as
+        # a helper because a probe that forgets one of them fails on *that* guard instead of
+        # the one it is named for, and would still pass -- the ``expect_in`` argument to
+        # ``refuses`` is what makes such a slip visible rather than silently inert.
+        def abstention(**changes: object) -> dict[str, object]:
+            return one(outcome="EXCEPTION", settlement_ids=[], payment_ids=[], tier=None,
+                       residual_paise=None, decomposition=None, **changes)
+
+        def dec(**changes: object) -> dict[str, object]:
+            """The resolved verdict with its decomposition block altered."""
+            block = base["verdicts"][0]["decomposition"]  # type: ignore[index]
+            return one(decomposition={**block, **changes})  # type: ignore[dict-item]
+
         for key in REQUIRED_VERDICT_KEYS:
             entry = {k: v for k, v in base["verdicts"][0].items() if k != key}
             refuses(lambda e=entry, k=key: load_verdicts(write_raw(f"vk_{k}.json",
@@ -391,22 +487,60 @@ if __name__ == "__main__":
                     f"a verdict with no {key}", key)
         refuses(lambda: load_verdicts(write_raw("out.json", one(outcome="MAYBE"))),
                 "an unknown outcome", "MAYBE")
-        refuses(lambda: load_verdicts(write_raw("rsn.json",
-                                                one(outcome="EXCEPTION", reason="BECAUSE",
-                                                    settlement_ids=[], payment_ids=[],
-                                                    tier=None, residual_paise=None))),
+        refuses(lambda: load_verdicts(write_raw("rsn.json", abstention(reason="BECAUSE"))),
                 "an unknown reason code", "BECAUSE")
         refuses(lambda: load_verdicts(write_raw("empty.json", one(payment_ids=[]))),
                 "RESOLVED with no payments", "C0001")
         refuses(lambda: load_verdicts(write_raw("nores.json", one(residual_paise=None))),
                 "RESOLVED with no residual", "residual")
-        refuses(lambda: load_verdicts(write_raw("noreason.json",
-                                                one(outcome="EXCEPTION", settlement_ids=[],
-                                                    payment_ids=[], tier=None,
-                                                    residual_paise=None))),
+        refuses(lambda: load_verdicts(write_raw("noreason.json", abstention())),
                 "EXCEPTION with no reason", "reason")
         refuses(lambda: load_verdicts(write_raw("float.json", one(residual_paise=1.5))),
                 "a float residual", "residual_paise")
+
+        # --- the decomposition, on read-back (Phase 4 step 5) ---------------
+        # A v1 file is refused outright by the schema-version check above, which is the
+        # point of the bump: it asserted a residual nothing could verify, and reading it
+        # under v2 rules would score an unproven match as a proven one.
+        refuses(lambda: load_verdicts(write_raw("nodec.json", one(decomposition=None))),
+                "RESOLVED with a null decomposition", "decomposition")
+        refuses(lambda: load_verdicts(write_raw("nocred.json", one(credit_amount_paise=None))),
+                "RESOLVED with no credit amount", "credit_amount_paise")
+        refuses(lambda: load_verdicts(write_raw("decstr.json", one(decomposition="2622p"))),
+                "a decomposition that is a string", "must be an object")
+        for key in REQUIRED_DECOMPOSITION_KEYS:
+            block = {k: v for k, v in base["verdicts"][0]["decomposition"].items()  # type: ignore[index,union-attr]
+                     if k != key}
+            refuses(lambda b=block, k=key: load_verdicts(
+                        write_raw(f"dk_{k}.json", one(decomposition=b))),
+                    f"a decomposition with no {key}", key)
+        # A term edited without its total re-derived. This is the shape a tampered proof
+        # takes -- a file is edited one field at a time -- and it is why the stated total is
+        # recomputed rather than read.
+        refuses(lambda: load_verdicts(write_raw("decsum.json", dec(fee_paise=FEE + 100))),
+                "a decomposition whose total disagrees with its terms", "was edited")
+        refuses(lambda: load_verdicts(write_raw("decneg.json",
+                                                dec(fee_paise=-FEE,
+                                                    expected_credit_paise=CREDIT + 2 * FEE))),
+                "a negative fee", "negative")
+        # ...and the balance rule itself, which lives on the dataclass: a proof that does not
+        # reconcile to the credit it describes is refused on read exactly as on write.
+        refuses(lambda: load_verdicts(write_raw("decbal.json",
+                                                one(credit_amount_paise=CREDIT + 1))),
+                "a credit amount the decomposition contradicts", "does not balance")
+
+        # Positive control: the same block, unedited, still parses -- otherwise every probe
+        # above could be passing on a fixture that was already invalid.
+        good_back = load_verdicts(write_raw("decok.json", dec()))
+        parsed = good_back.verdicts[0].decomposition
+        assert parsed is not None
+        assert (parsed.fee_paise, parsed.gst_paise) == (FEE, GST)
+        assert parsed.expected_credit_paise == CREDIT
+        assert parsed.rule == "gateway fee + GST at declared rates"
+        # A rule of null is legitimate -- Phase 4 always names one, but the field is
+        # nullable in the contract and a reader must not require prose to accept arithmetic.
+        assert load_verdicts(write_raw("norule.json", dec(rule=None))
+                             ).verdicts[0].decomposition.rule is None  # type: ignore[union-attr]
         refuses(lambda: load_verdicts(write_raw("nested.json", one(payment_ids=[["pay_0001"]]))),
                 "a nested payment list", "payment_ids")
         refuses(lambda: load_verdicts(write_raw("blank.json", one(payment_ids=[""]))),

@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from ..common.verdict import Outcome, Verdict, VerdictFile
 from .blocking import DEFAULT_MAX_ADJUSTMENT_PAISE, DEFAULT_WINDOW_DAYS, SettlementIndex
+from .fees import FeeSchedule, unpriced_methods
 from .load import Dataset
 from .tier1 import TIER, resolve_credit
 
@@ -68,6 +69,14 @@ class RunSummary:
     window_days: int
     max_adjustment_paise: int
     wall_clock_seconds: float
+    #: The fee rates this run assumed, as one line. Printed by the CLI because the rates
+    #: are an *assumption* about a counterparty (ASSUMPTIONS.md #5-#9), and a reconciliation
+    #: result is only interpretable next to the rates that produced it.
+    fee_rates: str = ""
+    #: Payment methods present in the data that the schedule cannot price. Every row using
+    #: one is unexplainable, which is worth saying once at the top rather than leaving a
+    #: reader to infer it from a pile of identical exceptions.
+    unpriced: tuple[str, ...] = ()
 
     @property
     def coverage_claimed(self) -> float | None:
@@ -89,16 +98,19 @@ def run(
     month: str,
     window_days: int = DEFAULT_WINDOW_DAYS,
     max_adjustment_paise: int = DEFAULT_MAX_ADJUSTMENT_PAISE,
+    schedule: FeeSchedule | None = None,
 ) -> tuple[VerdictFile, RunSummary]:
     """Match every bank row. Returns the verdict file and a summary for the CLI."""
     started = time.perf_counter()
 
+    rates = schedule or FeeSchedule()
     index = SettlementIndex(dataset.settlements)
     verdicts = tuple(
         resolve_credit(
             credit, index, dataset,
             window_days=window_days,
             max_adjustment_paise=max_adjustment_paise,
+            schedule=rates,
         )
         for credit in dataset.credits
     )
@@ -134,6 +146,8 @@ def run(
         window_days=window_days,
         max_adjustment_paise=max_adjustment_paise,
         wall_clock_seconds=elapsed,
+        fee_rates=rates.describe(),
+        unpriced=tuple(unpriced_methods((p.method for p in dataset.payments), rates)),
     )
     return run_file, summary
 

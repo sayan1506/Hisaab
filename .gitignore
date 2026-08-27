@@ -2,6 +2,13 @@
 .response
 .plan
 
+# Scratch measurement harnesses. Throwaway by design: each one answers a question
+# once (a collision rate, a headroom limit, a window sweep) and the answer goes
+# into ASSUMPTIONS.md as a numbered finding. The harness is the working, not the
+# result -- keeping it would imply the numbers should be re-derived from it rather
+# than re-measured, which is backwards.
+.scratch/
+
 # Python
 __pycache__/
 *.py[cod]

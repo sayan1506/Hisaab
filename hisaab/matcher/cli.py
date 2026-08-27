@@ -37,6 +37,7 @@ from ..common.money import fmt
 from ..common.verdict import write_verdicts
 from .blocking import DEFAULT_MAX_ADJUSTMENT_PAISE, DEFAULT_WINDOW_DAYS
 from .engine import MATCHER_NAME, RunSummary, run
+from .fees import DEFAULT_FEE_BPS, DEFAULT_GST_BPS, FeeSchedule
 from .load import Dataset, LoadError, load
 
 EXIT_OK = 0
@@ -119,9 +120,64 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="PAISE",
                    help=f"amount tolerance in paise (default: "
                         f"{DEFAULT_MAX_ADJUSTMENT_PAISE}, exact). Phase 4 widens this")
+    # The rates are ASSUMPTIONS about a counterparty, not properties of the data
+    # (ASSUMPTIONS.md #5-#9, still unverified against Razorpay's published pricing). They
+    # are overridable from the command line so correcting one is a flag rather than a code
+    # edit -- which is what makes "assumption" an honest label instead of a hedge on a
+    # hardcoded number.
+    rates = p.add_argument_group(
+        "fee model",
+        "Integer basis points, never float percents. 2% = 200. GST is charged on the "
+        "fee, not on the gross. These rates are assumptions -- see ASSUMPTIONS.md.",
+    )
+    rates.add_argument(
+        "--fee-bps", action="append", default=[], metavar="METHOD=BPS",
+        help="override or add one method's fee rate, e.g. --fee-bps card=195. Repeatable. "
+             "A method with no rate cannot be reconciled at all -- it is never assumed free",
+    )
+    rates.add_argument(
+        "--gst-bps", type=int, default=None, metavar="BPS",
+        help=f"GST on the fee (default: {DEFAULT_GST_BPS} = 18%%)",
+    )
     p.add_argument("--quiet", action="store_true",
                    help="print only the resolved-config JSON line")
     return p
+
+
+def schedule_from_args(args: argparse.Namespace) -> FeeSchedule:
+    """Build the fee schedule, applying any ``--fee-bps`` overrides to the defaults.
+
+    Overrides rather than replaces: passing one rate should not silently unprice the other
+    three methods, which would turn a one-rate correction into a run where most rows cannot
+    be explained at all. A method absent from the defaults is *added*, so a rate can be
+    declared for something the table has never seen.
+
+    Raises ``ValueError`` on malformed input; the CLI turns that into exit 2.
+    """
+    table = dict(DEFAULT_FEE_BPS)
+    for spec in args.fee_bps:
+        method, sep, bps_s = spec.partition("=")
+        if not sep or not method.strip():
+            raise ValueError(f"--fee-bps expects METHOD=BPS, got {spec!r}")
+        try:
+            bps = int(bps_s)
+        except ValueError:
+            raise ValueError(
+                f"--fee-bps {spec!r}: {bps_s!r} is not an integer. Rates are basis "
+                f"points, so 2% is 200 -- a float percent here is a real bug"
+            ) from None
+        if bps < 0:
+            raise ValueError(f"--fee-bps {spec!r}: a negative fee rate would add money")
+        table[method.strip()] = bps
+    gst = DEFAULT_GST_BPS if args.gst_bps is None else args.gst_bps
+    if gst < 0:
+        raise ValueError(f"--gst-bps must be >= 0, got {gst}")
+    if gst >= 10_000:
+        raise ValueError(
+            f"--gst-bps {gst} is at or above 100%, so GST would exceed the fee it is "
+            f"charged on -- that is the two rates applied to the same base"
+        )
+    return FeeSchedule(table, gst)
 
 
 def _utf8_stdout() -> None:
@@ -138,8 +194,15 @@ def _utf8_stdout() -> None:
             pass
 
 
-def resolved_config(args: argparse.Namespace, month: str) -> dict[str, object]:
-    """Line 1 of stdout. Everything that changes the output, and nothing that does not."""
+def resolved_config(args: argparse.Namespace, month: str, schedule: FeeSchedule) -> dict[str, object]:
+    """Line 1 of stdout. Everything that changes the output, and nothing that does not.
+
+    The fee rates belong here for the same reason the window does: they change which rows
+    resolve. They are also an *assumption* about a counterparty rather than a property of
+    the data (ASSUMPTIONS.md #5-#9), so a run that does not state them leaves its
+    coverage number uninterpretable -- a reader cannot tell a fee model that worked from
+    rates that happened to match.
+    """
     return {
         "matcher": MATCHER_NAME,
         "seed": args.seed,
@@ -148,6 +211,8 @@ def resolved_config(args: argparse.Namespace, month: str) -> dict[str, object]:
         "out": str(args.out),
         "window_days": args.window,
         "max_adjustment_paise": args.max_adjustment,
+        "fee_bps_by_method": dict(sorted(schedule.fee_bps_by_method.items())),
+        "gst_bps": schedule.gst_bps,
         "tier": 1,
     }
 
@@ -167,6 +232,15 @@ def _print_summary(summary: RunSummary, dataset: Dataset, written: Path) -> None
         else f"  window +/-{summary.window_days} business days, "
              f"amount tolerance {fmt(summary.max_adjustment_paise)}"
     )
+    # The rates are stated next to the result, not buried in the code. A coverage number
+    # produced by assumed rates is only interpretable if the assumption is on the page.
+    print(f"  fee rates assumed: {summary.fee_rates}")
+    if summary.unpriced:
+        print(
+            f"  NO RATE DECLARED for {', '.join(summary.unpriced)} -- every row using "
+            f"one of those methods is unexplainable and will abstain. An unpriced method "
+            f"is never assumed free"
+        )
     print(
         f"  resolved {summary.resolved}, exceptions {summary.exceptions}, "
         f"ignored {summary.ignored}"
@@ -202,6 +276,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--window must be >= 0, got {args.window}")
     if args.max_adjustment < 0:
         parser.error(f"--max-adjustment must be >= 0, got {args.max_adjustment}")
+    # Bad usage, so exit 2 and before anything is read: a malformed rate is not a property
+    # of the data and there is no point loading five CSVs to reject it.
+    try:
+        schedule = schedule_from_args(args)
+    except ValueError as e:
+        parser.error(str(e))
+        return EXIT_USAGE  # unreachable; parser.error exits 2
 
     # Load before echoing the config: --month defaults to what the data says, and a
     # config line naming a month the file contradicts would be worse than none.
@@ -214,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"CANNOT READ INPUT\n  {e}", file=sys.stderr)
         return EXIT_LOAD_FAILED
 
-    print(json.dumps(resolved_config(args, month), ensure_ascii=False))
+    print(json.dumps(resolved_config(args, month, schedule), ensure_ascii=False))
 
     run_file, summary = run(
         dataset,
@@ -222,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         month=month,
         window_days=args.window,
         max_adjustment_paise=args.max_adjustment,
+        schedule=schedule,
     )
     written = write_verdicts(args.out, run_file)
 

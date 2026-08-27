@@ -51,6 +51,7 @@ from hisaab.generator.invariants import (  # noqa: E402
     check_headers,
     check_int_money,
     check_no_leak,
+    check_settlement_arithmetic,
     check_totals,
     check_unique_ids,
     check_within_block_alignment,
@@ -156,13 +157,21 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         gross_by_payment[pid] = parse_int(r["gross_paise"], f"{pid}.gross_paise")
         money[f"{pid}.gross_paise"] = gross_by_payment[pid]
     net_by_settlement: dict[str, int] = {}
+    # Kept per settlement, not just flattened: the aggregate check sums them, and
+    # check_settlement_arithmetic needs each row's own three deductions to catch two
+    # compensating errors that cancel in the total.
+    deductions: dict[str, tuple[int, int, int]] = {}
     fee_cells: list[int] = []
     for r in settlements:
         sid = r["settlement_id"]
         net_by_settlement[sid] = parse_int(r["net_paise"], f"{sid}.net_paise")
         money[f"{sid}.net_paise"] = net_by_settlement[sid]
-        for col in ("fee_paise", "gst_paise", "tds_paise"):
-            fee_cells.append(parse_int(r[col], f"{sid}.{col}"))
+        cells = tuple(parse_int(r[col], f"{sid}.{col}")
+                      for col in ("fee_paise", "gst_paise", "tds_paise"))
+        deductions[sid] = cells  # type: ignore[assignment]
+        fee_cells.extend(cells)
+        for col, value in zip(("fee_paise", "gst_paise", "tds_paise"), cells):
+            money[f"{sid}.{col}"] = value
     amount_by_credit: dict[str, int] = {}
     for r in bank:
         cid = r["row_id"]
@@ -170,16 +179,24 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         money[f"{cid}.amount_paise"] = amount_by_credit[cid]
     check_int_money(money)
 
-    # --- I4: the three totals agree; fee columns are zero -------------------
+    # Truth is loaded here rather than at I3 because I4 now needs to know whether
+    # ``--fees`` was on: the "every deduction cell is zero" assertion is gated on that one
+    # flag, not on ``clean_mode``. Taking it from the answer key's own flag block keeps
+    # this pass independent of the generator's config object -- it sees only what was
+    # written, which is the whole point of the second pass.
+    truth = load_truth(truth_dir)
+    fees_on = bool(truth.flags.get("fees", False))
+
+    # --- I4: the money adds up, in aggregate --------------------------------
     check_totals(
         sum(gross_by_payment.values()),
         sum(net_by_settlement.values()),
         sum(amount_by_credit.values()),
         fee_cells,
+        fees_on=fees_on,
     )
 
     # --- I3: 1:1:1 in clean mode -------------------------------------------
-    truth = load_truth(truth_dir)
     if truth.clean_mode:
         if not (len(payments) == len(settlements) == len(bank)):
             raise InvariantError(
@@ -207,13 +224,29 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         missing = sorted(set(gross_by_payment) - set(counts))
         if missing:
             raise InvariantError(f"I2: payments never settled: {missing[:5]}")
-        # Clean mode: net must equal the one member payment's gross.
-        for sid, pl in members.items():
-            if net_by_settlement[sid] != sum(gross_by_payment[p] for p in pl):
-                raise InvariantError(
-                    f"I4: {sid} net {net_by_settlement[sid]} != sum of members "
-                    f"{sum(gross_by_payment[p] for p in pl)} while --fees is off"
-                )
+
+    # --- I4: the money adds up, per settlement ------------------------------
+    # This used to be an inline "net equals the member gross, while --fees is off" check
+    # nested under clean mode. Phase 4 strengthens it to the full subtraction and runs it
+    # unconditionally, which at zero deductions is the old equality unchanged.
+    #
+    # Membership comes from settlement_items.csv, not from truth.json: this pass must reach
+    # its verdict from the files a judge gets. A settlement with no member rows is a
+    # failure today -- Phase 8's --settlement-report-late is what makes withholding them
+    # legitimate, and it will have to relax this deliberately rather than by accident.
+    orphan_settlements = sorted(set(net_by_settlement) - set(members))
+    if orphan_settlements:
+        raise InvariantError(
+            f"I2: settlements with no rows in settlement_items.csv: "
+            f"{orphan_settlements[:5]} -- their net cannot be checked against any gross"
+        )
+    check_settlement_arithmetic(
+        [
+            (sid, sum(gross_by_payment[p] for p in members[sid]),
+             net_by_settlement[sid], *deductions[sid])
+            for sid in sorted(net_by_settlement)
+        ]
+    )
 
     # --- I7: the leak check, on the bytes actually written ------------------
     check_no_leak([(r["row_id"], amount_by_credit[r["row_id"]], r["narration"]) for r in bank])

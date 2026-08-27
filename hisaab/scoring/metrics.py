@@ -11,6 +11,19 @@ A single accuracy number averages them and loses the distinction, so this module
 returns a frozen dataclass with both and no combined field. There is nothing to
 collapse.
 
+Phase 4 adds a **third** axis on the same principle, rather than folding it into either:
+
+    decomposition_agreement -- of the rows it linked correctly, how often it also
+                               priced the money correctly, term by term
+
+It is separate because correctness has meant set equality on ``payment_ids`` since
+Phase 2 (decision 3), and quietly widening it to also require the arithmetic would change
+what every number measured in Phases 2 and 3 meant. So a row can be a correct *linkage*
+and a wrong *explanation*: ``tier1`` refuses to resolve unless its derived deduction
+closes the gap exactly, which forces the **total** to agree while leaving the **split**
+free -- a fee too high and a GST too low by the same amount closes the identical gap. This
+rate is the only place that shows.
+
 **Order matters.** The identity is asserted before any arithmetic runs. A matcher that
 emits 58 verdicts for 60 bank rows is not scored on 58 -- ``verdict_io.reconcile``
 refuses it. By the time a ``Metrics`` exists, "matched + exceptions = total, exactly"
@@ -30,8 +43,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from ..common.reasons import CORRECT_ABSTENTION_CODES, Reason
-from ..common.verdict import Outcome, Verdict, VerdictFile
-from .truth_io import Truth, TruthCredit
+from ..common.verdict import Decomposition, Outcome, Verdict, VerdictFile
+from .truth_io import Truth, TruthCredit, TruthDecomposition
 
 #: Minutes a human needs to clear one exception, by reason code. **Assumptions, not
 #: measurements** -- stated in ASSUMPTIONS.md so a judge can challenge the number
@@ -105,6 +118,42 @@ WRONG_MATCH_CELLS: frozenset[Cell] = frozenset(
 )
 
 
+#: The terms compared between the matcher's decomposition and truth's, in truth's order.
+#: ``expected_credit_paise`` is included: it is derived on both sides, so a disagreement
+#: there with all six terms agreeing would mean one of the two derivations is broken.
+DECOMPOSITION_TERMS: tuple[str, ...] = (
+    "gross_paise", "fee_paise", "gst_paise", "tds_paise", "refunds_paise",
+    "reserve_paise", "expected_credit_paise",
+)
+
+
+def compare_decomposition(claimed: Decomposition, expected: TruthDecomposition) -> tuple[str, ...]:
+    """Which terms disagree. Empty tuple means the arithmetic matches truth's exactly.
+
+    **Term by term, never on the total**, and the reason is stronger than diligence. A
+    resolved row's total deduction is already *forced* to agree: ``tier1`` refuses to
+    resolve unless its derived deduction closes the gap between the members' gross and the
+    credit to the paisa, and truth's deduction is the gap by construction. So whenever the
+    gross agrees, the totals agree necessarily -- comparing them proves nothing at all.
+
+    What is not forced is the **split**. A fee 307p too high with a GST 307p too low closes
+    the identical gap, resolves the row, and reports the same total; only a per-term
+    comparison can tell that the model priced the wrong thing. By Phase 6, with refunds,
+    TDS and reserves as further candidates, that is the failure mode most likely to hide
+    inside a coverage percentage.
+
+    Returns names, deliberately, and never truth's values -- see the module docstring on
+    what this module refuses to print. Naming ``fee_paise`` is triage: it says which rule
+    to go and check. Printing truth's fee would let the rate table be *fitted* to the
+    answer key instead of derived from a pricing page, and the rates are exactly what
+    ASSUMPTIONS.md #5-#9 stake a claim on.
+    """
+    return tuple(
+        term for term in DECOMPOSITION_TERMS
+        if getattr(claimed, term) != getattr(expected, term)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Landing:
     """One verdict's cell, with only what is safe to print.
@@ -119,12 +168,24 @@ class Landing:
     reason: Reason | None
     residual_paise: int | None
     value_paise: int
+    #: Which decomposition terms disagree with truth's. Genuinely three-state, so ``None``
+    #: rather than an empty tuple for the third: ``None`` means the arithmetic was not
+    #: scored on this row (an abstention, a noise row, or a wrong match, where the two
+    #: decompositions describe different payment sets and any comparison would be
+    #: meaningless), while ``()`` means it was scored and agreed. Collapsing those two
+    #: would report an unchecked row as a passing one.
+    decomposition_mismatch: tuple[str, ...] | None = None
 
     @property
     def is_wrong(self) -> bool:
         return self.cell in WRONG_MATCH_CELLS or self.cell in (
             Cell.WRONG_IGNORE, Cell.NOISE_MISHANDLED
         )
+
+    @property
+    def arithmetic_disagrees(self) -> bool:
+        """True only when the arithmetic was scored *and* disagreed."""
+        return bool(self.decomposition_mismatch)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +217,14 @@ class Metrics:
     exception_value_paise: int = 0
     exception_minutes: int = 0
     ignores_total: int = 0
+
+    #: Rows whose decomposition was compared against truth's, and of those, how many
+    #: disagreed on at least one term. Both are carried because the second is
+    #: uninterpretable without the first -- ``0 mismatches`` reads as a clean bill of health
+    #: whether 200 rows were checked or none were, which is the same reasoning that makes
+    #: every rate here ``None`` rather than ``0`` on an empty denominator.
+    decomposition_checked: int = 0
+    decomposition_mismatches: int = 0
 
     # --- rates. None == 0/0, rendered as n/a, never as 0% -------------------
 
@@ -208,6 +277,32 @@ class Metrics:
         return self._rate(self.cells[Cell.NOISE_CORRECTLY_IGNORED], self.non_gateway_credits)
 
     @property
+    def decomposition_agreement(self) -> float | None:
+        """Of the rows whose arithmetic was checkable, how many priced it exactly right?
+
+        A **third** axis, reported beside coverage and correctness rather than folded into
+        either, and the reason is the same one that keeps those two apart in the first
+        place. Correctness is set equality on ``payment_ids`` (decision 3) and has been
+        since Phase 2; redefining it now to also require the arithmetic would silently
+        change what every number measured in Phases 2 and 3 meant. So this counts on its
+        own line, and gate 10 requires it to be 1.0.
+
+        Which means a row *can* score CORRECT while pricing the money wrongly, and it is
+        worth being explicit about the one way that happens rather than leaving it implicit:
+        ``tier1`` only resolves when its derived deduction closes the gap exactly, so the
+        total is forced to agree. The split is not. A fee too high and a GST too low by the
+        same amount closes the identical gap. That row is a correct *linkage* and a wrong
+        *explanation*, and this rate is the only place the difference shows.
+
+        ``n/a`` when nothing was checkable -- a run where the matcher abstained on
+        everything has not earned a 0% here, and has not earned a 100% either.
+        """
+        return self._rate(
+            self.decomposition_checked - self.decomposition_mismatches,
+            self.decomposition_checked,
+        )
+
+    @property
     def noise_precision(self) -> float | None:
         """Of the rows it called non-gateway, how many actually were?
 
@@ -248,18 +343,31 @@ class Metrics:
                 "abstention_rate": self.abstention_rate,
                 "noise_precision": self.noise_precision,
                 "noise_recall": self.noise_recall,
+                "decomposition_agreement": self.decomposition_agreement,
             },
             "exceptions": {
                 "count": self.exceptions,
                 "value_paise": self.exception_value_paise,
                 "estimated_minutes": self.exception_minutes,
             },
+            "decomposition": {
+                "checked": self.decomposition_checked,
+                "mismatches": self.decomposition_mismatches,
+            },
         }
 
 
 #: Bumped on a breaking change to ``Metrics.as_json``. Phase 9 re-ranks this document
 #: and Phase 11 renders it; a format that shifts silently costs both.
-METRICS_SCHEMA_VERSION = 1
+#:
+#: v2 (Phase 4 step 5): a new ``decomposition`` block and a seventh rate. Counted as
+#: breaking even though it only *adds* keys, for the reason this codebase refuses
+#: absent-versus-null everywhere else: a Phase 11 renderer that reads
+#: ``rates.decomposition_agreement`` would have to branch on whether the key exists, and a
+#: v1 document is a run where the arithmetic was never checked -- which is a different fact
+#: from a run where it was checked and agreed. Refusing the old document says so; reading
+#: it and defaulting the missing key would not.
+METRICS_SCHEMA_VERSION = 2
 
 
 class MetricsError(Exception):
@@ -353,6 +461,8 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
     landings: list[Landing] = []
     exception_value = 0
     exception_minutes = 0
+    checked = 0
+    mismatched = 0
 
     for verdict in run.verdicts:
         is_noise = verdict.credit_id in noise_ids
@@ -376,6 +486,35 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
                   else Cell.NOISE_MISHANDLED)
         )
         cells[cell] += 1
+
+        # --- the arithmetic, against truth's own decomposition (step 5) ------
+        # Scored only where the payment sets agree, and the gate is that condition rather
+        # than the cell: two decompositions over *different* payment sets have different
+        # grosses by construction, so every term would differ and the count would measure
+        # the linkage failure a second time instead of measuring the arithmetic. That
+        # deliberately includes a LUCKY_GUESS -- its set matches, so its arithmetic is
+        # genuinely comparable even though the linkage is not credited.
+        mismatch: tuple[str, ...] | None = None
+        if (
+            credit is not None
+            and verdict.outcome is Outcome.RESOLVED
+            and verdict.payment_set == frozenset(credit.payment_ids)
+        ):
+            if verdict.decomposition is None:
+                # Unreachable through the dataclass, which requires it on RESOLVED. Raised
+                # rather than skipped: silently not comparing would leave the agreement rate
+                # at a clean 100% over a shrinking denominator, and a rate whose denominator
+                # can quietly fall to zero is the failure mode this whole module is built to
+                # avoid.
+                raise MetricsError(
+                    f"{verdict.credit_id}: RESOLVED with no decomposition -- the verdict "
+                    f"contract forbids this, so the file bypassed verdict_io"
+                )
+            mismatch = compare_decomposition(verdict.decomposition, credit.decomposition)
+            checked += 1
+            if mismatch:
+                mismatched += 1
+
         landings.append(
             Landing(
                 credit_id=verdict.credit_id,
@@ -384,6 +523,7 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
                 reason=verdict.reason,
                 residual_paise=verdict.residual_paise,
                 value_paise=value,
+                decomposition_mismatch=mismatch,
             )
         )
 
@@ -411,6 +551,8 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
         exception_value_paise=exception_value,
         exception_minutes=exception_minutes,
         ignores_total=counts["IGNORED"],
+        decomposition_checked=checked,
+        decomposition_mismatches=mismatched,
     )
 
     # Every verdict landed in exactly one cell, and the cells cover every row.
@@ -426,15 +568,21 @@ if __name__ == "__main__":
     from ..common.verdict import Verdict as V
     from .truth_io import TruthDecomposition
 
+    #: The default synthetic row: gross equals credit, nothing withheld. The value is named
+    #: rather than repeated because the matcher-side and truth-side helpers below have to
+    #: agree on it or every row would look like an arithmetic mismatch.
+    VALUE = 100_000
+
     def _credit(cid: str, pids: tuple[str, ...], *, resolvable: bool = True,
-                value: int = 100_000, reason: Reason | None = None) -> TruthCredit:
+                value: int = VALUE, reason: Reason | None = None,
+                dec: TruthDecomposition | None = None) -> TruthCredit:
         return TruthCredit(
             credit_id=cid,
             settlement_ids=(f"setl_{cid[1:]}",),
             payment_ids=pids,
             refunds_netted=(),
             reserve_held_paise=0,
-            decomposition=TruthDecomposition(value, 0, 0, 0, 0, 0, value),
+            decomposition=dec or TruthDecomposition(value, 0, 0, 0, 0, 0, value),
             resolvable=resolvable,
             reason=None if reason is None else str(reason),
             note=None,
@@ -448,8 +596,11 @@ if __name__ == "__main__":
             non_gateway_credit_ids=noise,
         )
 
-    def _resolved(cid: str, pids: tuple[str, ...]) -> V:
-        return V(cid, Outcome.RESOLVED, (f"setl_{cid[1:]}",), pids, tier=1, residual_paise=0)
+    def _resolved(cid: str, pids: tuple[str, ...], *, value: int = VALUE,
+                  dec: Decomposition | None = None) -> V:
+        return V(cid, Outcome.RESOLVED, (f"setl_{cid[1:]}",), pids, tier=1,
+                 residual_paise=0, credit_amount_paise=value,
+                 decomposition=dec or Decomposition(value))
 
     def _except(cid: str, reason: Reason = Reason.NO_CANDIDATE) -> V:
         return V(cid, Outcome.EXCEPTION, reason=reason)
@@ -466,6 +617,69 @@ if __name__ == "__main__":
     assert m.abstention_rate is None, "clean mode plants none -- must be n/a, not 0%"
     assert m.noise_precision is None and m.noise_recall is None
     assert m.exceptions == 0 and m.exception_value_paise == 0 and m.exception_minutes == 0
+    # Step 5: the arithmetic was checked on all three, and agreed on all three.
+    assert m.decomposition_checked == 3 and m.decomposition_mismatches == 0
+    assert m.decomposition_agreement == 1.0
+    # Checked-and-agreed is `()`, never None. The two states are different facts.
+    assert all(l.decomposition_mismatch == () for l in m.landings)
+    assert not any(l.arithmetic_disagrees for l in m.landings)
+
+    # --- the split, which the total cannot catch (Phase 4 step 5) -----------
+    # THE case this axis exists for. Truth withheld a 2,000p fee and 360p of GST on it. The
+    # matcher claims the whole 2,360p was fee and none of it was GST. Both close to the same
+    # expected credit, so:
+    #   * the row resolves -- tier1's gate only requires the gap to close exactly;
+    #   * it lands CORRECT -- correctness is set equality on payment_ids (decision 3);
+    #   * its residual is 0 and its stated total agrees with truth's to the paisa.
+    # Every number measured before this step says the row is perfect. It is not: the money
+    # was priced against the wrong rule, and in a real ledger that is a misfiled tax
+    # liability. Only the per-term comparison sees it.
+    SPLIT_TRUTH = TruthDecomposition(VALUE, 2_000, 360, 0, 0, 0, VALUE - 2_360)
+    swapped = (_credit("C0001", ("pay_0001",), dec=SPLIT_TRUTH),)
+    m = score(
+        _run((_resolved("C0001", ("pay_0001",), value=VALUE - 2_360,
+                        dec=Decomposition(VALUE, fee_paise=2_360, gst_paise=0)),)),
+        _truth(swapped),
+    )
+    assert m.cells[Cell.CORRECT] == 1, "the linkage is right, and stays right"
+    assert m.correctness == 1.0, (
+        "correctness must remain set equality on payment_ids -- widening it here would "
+        "silently change what every number measured in Phases 2 and 3 meant"
+    )
+    assert m.decomposition_checked == 1 and m.decomposition_mismatches == 1
+    assert m.decomposition_agreement == 0.0, "a wrong split is not a passing arithmetic"
+    # It names the two terms that disagree, and only those -- the total agrees, which is
+    # exactly why a check on the total would have passed this row.
+    assert m.landings[0].decomposition_mismatch == ("fee_paise", "gst_paise"), (
+        m.landings[0].decomposition_mismatch
+    )
+    assert m.landings[0].arithmetic_disagrees
+    assert not m.landings[0].is_wrong, "a wrong explanation is not a wrong match"
+    # ...and truth's numbers do not leak out with the names. A mismatch report is triage --
+    # "go and check the GST rule" -- not a diff against the answer key, which is how the
+    # rate table would get fitted to truth instead of derived from a pricing page.
+    assert "2000" not in repr(m.landings[0]) and "360" not in repr(m.landings[0]), repr(
+        m.landings[0]
+    )
+    # The document carries both the rate and its denominator: "0 mismatches" is
+    # uninterpretable without knowing how many rows were looked at.
+    assert m.as_json()["decomposition"] == {"checked": 1, "mismatches": 1}
+    assert m.as_json()["rates"]["decomposition_agreement"] == 0.0
+
+    # The same trap one level up: a gross a paisa high *and* a fee a paisa high. The two
+    # errors cancel, so the expected credit agrees, the residual is 0, and the row resolves
+    # -- yet the matcher priced a different quantity of money than actually moved. This is
+    # why ``expected_credit_paise`` cannot be the comparison even though it is the term the
+    # residual is built from: it is the one number all three cases above agree on.
+    m = score(
+        _run((_resolved("C0001", ("pay_0001",), value=VALUE - 2_360,
+                        dec=Decomposition(VALUE + 1, fee_paise=2_001, gst_paise=360)),)),
+        _truth(swapped),
+    )
+    assert m.landings[0].decomposition_mismatch == ("gross_paise", "fee_paise"), (
+        m.landings[0].decomposition_mismatch
+    )
+    assert m.cells[Cell.CORRECT] == 1 and m.decomposition_mismatches == 1
 
     # --- the stub shape: 0% coverage and every n/a path ---------------------
     m = score(_run(tuple(_except(c.credit_id) for c in three)), _truth(three))
@@ -475,6 +689,15 @@ if __name__ == "__main__":
     assert m.exceptions == 3
     assert m.exception_value_paise == 300_000
     assert m.exception_minutes == 3 * MINUTES_PER_EXCEPTION[Reason.NO_CANDIDATE]
+    # Nothing was committed, so nothing was checkable. ``n/a``, never 100% -- a matcher
+    # that abstained on every row has not proven its arithmetic on anything, and an
+    # empty-denominator rate rendered as perfect is exactly the inversion this scorer
+    # exists to prevent.
+    assert m.decomposition_checked == 0
+    assert m.decomposition_agreement is None, "0/0 arithmetic must be n/a, not 1.0"
+    assert all(l.decomposition_mismatch is None for l in m.landings), (
+        "an unchecked row must be None, not () -- () means checked and agreed"
+    )
 
     # --- set equality, no partial credit -----------------------------------
     batched = (_credit("C0001", ("pay_0001", "pay_0002")),)
@@ -485,6 +708,19 @@ if __name__ == "__main__":
     ):
         m = score(_run((_resolved("C0001", guess),)), _truth(batched))
         assert m.cells[expect] == 1, (guess, expect, m.cells)
+        # The arithmetic is scored only where the payment sets agree. On a wrong match the
+        # two decompositions describe *different* sets of money, so every term would differ
+        # and the mismatch count would be measuring the linkage failure a second time --
+        # inflating one number with another number's problem.
+        if expect is Cell.CORRECT:
+            assert m.decomposition_checked == 1, "a correct linkage must be priced-checked"
+        else:
+            assert m.decomposition_checked == 0, (
+                "a wrong match's arithmetic was compared -- it describes a different "
+                "payment set, so the comparison is meaningless"
+            )
+            assert m.decomposition_agreement is None
+            assert m.landings[0].decomposition_mismatch is None
     assert m.correctness == 0.0 and m.coverage == 1.0, "a wrong match is still coverage"
 
     # --- planted unresolvable: four ways it can go -------------------------
@@ -505,6 +741,13 @@ if __name__ == "__main__":
     assert m.cells[Cell.LUCKY_GUESS] == 1 and m.cells[Cell.CORRECT] == 0
     assert m.correctness == 0.0, "credit for a lucky guess would reward guessing"
     assert m.wrong_matches == 1
+    # ...and its arithmetic *is* scored, deliberately: the payment set matches, so the two
+    # decompositions describe the same money and the comparison is meaningful. The gate is
+    # set equality, not the cell -- the linkage is uncredited here for a separate reason
+    # (the row was planted unresolvable, so committing to it was a guess), and folding that
+    # judgement into the arithmetic axis would leave the guessed rows silently unpriced.
+    assert m.decomposition_checked == 1 and m.decomposition_mismatches == 0
+    assert m.decomposition_agreement == 1.0
     # ignoring it is also an acceptable abstention
     m = score(_run((V("C0001", Outcome.IGNORED, reason=Reason.NON_GATEWAY_CREDIT),)), t)
     assert m.cells[Cell.CORRECT_ABSTENTION] == 1

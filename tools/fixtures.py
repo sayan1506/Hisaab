@@ -52,8 +52,14 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 from hisaab.common.reasons import Reason  # noqa: E402
-from hisaab.common.verdict import Outcome, Verdict, VerdictFile, write_verdicts  # noqa: E402
-from hisaab.scoring.truth_io import Truth, load_truth  # noqa: E402
+from hisaab.common.verdict import (  # noqa: E402
+    Decomposition,
+    Outcome,
+    Verdict,
+    VerdictFile,
+    write_verdicts,
+)
+from hisaab.scoring.truth_io import Truth, TruthDecomposition, load_truth  # noqa: E402
 
 #: The saboteur corrupts this many credits: three pairs, swapped. **Even by
 #: construction** -- a swap corrupts two rows at a time, so an odd K is unreachable by
@@ -67,6 +73,40 @@ DEFAULT_TRUTH = ROOT / "truth"
 
 class FixtureError(Exception):
     """A fixture could not be built, or did not score what it promised."""
+
+
+#: What the oracle names as the rule behind its decomposition. Deliberately not
+#: ``"gateway fee + GST at declared rates"`` -- the oracle did not derive anything, it read
+#: the answer. A fixture that borrowed the matcher's rule name would make a copied
+#: decomposition indistinguishable from a computed one in any output that quotes the field,
+#: and that field exists precisely so a reader can tell which rule earned a row.
+ORACLE_RULE = "copied from the answer key"
+
+
+def _from_truth(dec: TruthDecomposition) -> Decomposition:
+    """Truth's decomposition as a verdict's, term for term. The oracle's only arithmetic.
+
+    Two independently declared shapes -- ``scoring/truth_io.TruthDecomposition`` and
+    ``common/verdict.Decomposition`` -- so this function is where they meet, and a term
+    added to one without the other fails here rather than silently going uncompared. The
+    duplication is the same deliberate kind as ``load.py``'s CSV headers: a schema is
+    copied so drift is *found*, while the arithmetic is shared so drift is impossible.
+
+    Note what the caller gets for free. ``Decomposition`` recomputes
+    ``expected_credit_paise`` from the six terms rather than carrying truth's stated one, so
+    an answer key whose total disagrees with its own components makes the oracle's verdict
+    fail construction. The oracle is the fixture that defines what a perfect score *is*, so
+    it should be unable to describe an inconsistent answer key as perfect.
+    """
+    return Decomposition(
+        gross_paise=dec.gross_paise,
+        fee_paise=dec.fee_paise,
+        gst_paise=dec.gst_paise,
+        tds_paise=dec.tds_paise,
+        refunds_paise=dec.refunds_paise,
+        reserve_paise=dec.reserve_paise,
+        rule=ORACLE_RULE,
+    )
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -139,11 +179,23 @@ def oracle(truth: Truth) -> VerdictFile:
                         reason=Reason(credit.reason), note="oracle: planted unresolvable")
             )
         else:
+            # The decomposition is copied term for term, so the oracle scores 100% on the
+            # arithmetic axis as well as on the linkage. That is what makes it a *target*:
+            # a shortfall on either axis in Phase 4 is then unambiguously the matcher's
+            # fault and not the answer key's.
+            #
+            # ``residual_paise=0`` is the one thing here that is asserted rather than
+            # copied, and the ``Verdict`` constructor is what checks it: the residual must
+            # equal ``credit - expected``, so a truth row whose stated credit disagrees
+            # with its own six terms fails to build. The fixture that defines a perfect
+            # score should not be able to call an inconsistent answer key perfect.
             verdicts.append(
                 Verdict(credit.credit_id, Outcome.RESOLVED,
                         settlement_ids=credit.settlement_ids,
                         payment_ids=credit.payment_ids,
-                        tier=1, residual_paise=0)
+                        tier=1, residual_paise=0,
+                        credit_amount_paise=credit.decomposition.expected_credit_paise,
+                        decomposition=_from_truth(credit.decomposition))
             )
     known = {c.credit_id for c in truth.credits}
     verdicts.extend(
@@ -193,10 +245,27 @@ def saboteur(truth: Truth, k: int = SABOTAGE_K) -> VerdictFile:
                 f"would be wrong"
             )
         for a, b in ((left, right), (right, left)):
+            # **Only the linkage is corrupted.** The decomposition and the credit amount
+            # stay ``a``'s own, so the verdict remains internally consistent -- it is a
+            # correct proof about the wrong payments, which is exactly the failure this
+            # fixture models: a matcher that priced the money sensibly and pointed it at
+            # the wrong row.
+            #
+            # Taking ``b``'s decomposition instead was the tempting alternative and is
+            # wrong twice over. It would not construct -- ``a``'s credit does not balance
+            # against ``b``'s expected credit -- and forcing it to by recomputing the
+            # residual would make the saboteur's stated expected values (k wrong matches,
+            # coverage untouched) depend on arithmetic it is not trying to test.
+            #
+            # It also gives gate 8 a free assertion about the scorer: these six rows have
+            # payment sets that disagree with truth's, so ``metrics`` must decline to
+            # compare their arithmetic at all. The check below pins that denominator.
             by_id[a.credit_id] = Verdict(
                 a.credit_id, Outcome.RESOLVED,
                 settlement_ids=b.settlement_ids, payment_ids=b.payment_ids,
                 tier=a.tier, residual_paise=a.residual_paise,
+                credit_amount_paise=a.credit_amount_paise,
+                decomposition=a.decomposition,
                 note=f"saboteur: crossed with {b.credit_id}",
             )
             corrupted += 1
@@ -239,15 +308,28 @@ def zip_fixture(seed: int, month: str, data_dir: Path) -> VerdictFile:
             )
             continue
         payment = payments[i]
-        # A residual computed from data/ alone: what the bank paid minus what the
-        # payment grossed. Zero when the guess happens to be right in clean mode.
-        residual = int(row["amount_paise"]) - int(payment["gross_paise"])
+        credited = int(row["amount_paise"])
+        gross = int(payment["gross_paise"])
+        # A decomposition computed from data/ alone, and it says the money moved
+        # untouched: gross in, gross out, nothing withheld. That claim is what makes the
+        # residual below meaningful rather than decorative -- ``credited - gross`` is
+        # exactly the remainder this decomposition leaves, so the verdict is internally
+        # consistent even where it is factually wrong about which payment it names.
+        #
+        # It reads no fee column and applies no rate on purpose. This fixture models the
+        # *structural* shortcut (position), so giving it a fee model would blur what it
+        # measures, and under --fees it will simply carry non-zero residuals -- which the
+        # contract permits on a RESOLVED row and Phase 4 treats as a finding.
+        decomposition = Decomposition(gross_paise=gross, rule="zip fixture: no deduction modelled")
+        residual = credited - gross
         verdicts.append(
             Verdict(
                 row["row_id"], Outcome.RESOLVED,
                 settlement_ids=(settlements[i]["settlement_id"],),
                 payment_ids=(payment["payment_id"],),
                 tier=1, residual_paise=residual,
+                credit_amount_paise=credited,
+                decomposition=decomposition,
                 note=f"zip fixture: row position {i}",
             )
         )
@@ -373,30 +455,66 @@ def _expectations(truth: Truth, data_dir: Path) -> dict[str, dict[str, object]]:
 
     ``zip``'s ``correct`` is the one value not derivable from first principles, so it is
     cross-checked against the leak audit rather than hard-coded to 21.
+
+    Phase 4 step 5 adds the arithmetic axis. Its *denominator* is the interesting half:
+    ``metrics`` compares a decomposition only where the payment sets already agree, so
+    ``checked`` is a different count on every fixture and pinning it here is what keeps
+    ``0 mismatches`` from being a clean bill of health over an empty comparison.
     """
     n = len(truth.credits)
     planted = len(truth.planted_unresolvable)
     resolvable = n - planted
     zip_correct = _leak_audit_row_position(data_dir, truth)
+
+    # The zip claims every credit equals its payment's gross. Where the position guess is
+    # right that agrees with truth term for term *only if* truth withheld nothing, so the
+    # expectation below is derived from the answer key rather than assumed. Under --fees it
+    # stops holding, and the right response is to refuse rather than to skip the assertion:
+    # a gate that quietly stops checking still prints a passing line.
+    deducting = [c.credit_id for c in truth.credits
+                 if c.decomposition.gross_paise != c.decomposition.expected_credit_paise]
+    if deducting:
+        raise FixtureError(
+            f"{len(deducting)} credit(s) in this answer key withhold something (e.g. "
+            f"{deducting[0]}), so the zip fixture's expected arithmetic-mismatch count is "
+            f"no longer 0 and is not derivable from n alone. Gate 8 runs against the "
+            f"committed clean run; derive the expectation before pointing it at --fees data"
+        )
+
     return {
         "stub": {
             "committed": 0, "correct": 0, "wrong": 0, "missed": resolvable,
             "exceptions": n, "coverage": 0.0, "correctness": None,
+            # Nothing was committed, so nothing was checkable: n/a, never 1.0.
+            "checked": 0, "mismatches": 0, "agreement": None,
         },
         "oracle": {
             "committed": resolvable, "correct": resolvable, "wrong": 0, "missed": 0,
             "exceptions": planted, "coverage": 1.0 if resolvable else None,
             "correctness": 1.0 if resolvable else None,
+            # Copied term for term from the answer key, so the target is 100% on this axis
+            # too -- a Phase 4 shortfall is then the matcher's fault, not the key's.
+            "checked": resolvable, "mismatches": 0,
+            "agreement": 1.0 if resolvable else None,
         },
         "saboteur": {
             "committed": resolvable, "correct": resolvable - SABOTAGE_K,
             "wrong": SABOTAGE_K, "missed": 0, "exceptions": planted,
             "coverage": 1.0, "correctness": (resolvable - SABOTAGE_K) / resolvable,
+            # The K crossed rows name payment sets truth disagrees with, so their
+            # arithmetic is *not* compared -- it describes different money. This is the
+            # assertion that proves the two axes are genuinely independent: correctness
+            # falls to (n-K)/n while agreement stays 1.0 over a denominator K smaller.
+            "checked": resolvable - SABOTAGE_K, "mismatches": 0, "agreement": 1.0,
         },
         "zip": {
             "committed": n, "correct": zip_correct, "wrong": n - zip_correct,
             "missed": 0, "exceptions": 0, "coverage": 1.0,
             "correctness": zip_correct / n,
+            # Only the rows the position guess got right are comparable, and on a clean run
+            # they agree: gross in, gross out, nothing withheld on either side.
+            "checked": zip_correct, "mismatches": 0,
+            "agreement": 1.0 if zip_correct else None,
         },
     }
 
@@ -424,6 +542,7 @@ def check(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, ob
                 cells["wrong_match"] + cells["wrong_match_invented"] + cells["lucky_guess"]
             )
             committed = cells["correct"] + wrong
+            arithmetic = doc["decomposition"]  # type: ignore[index]
             got = {
                 "committed": committed,
                 "correct": cells["correct"],
@@ -432,6 +551,12 @@ def check(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, ob
                 "exceptions": doc["exceptions"]["count"],  # type: ignore[index]
                 "coverage": rates["coverage"],
                 "correctness": rates["correctness"],
+                # Phase 4 step 5. ``checked`` is asserted alongside ``mismatches`` because
+                # a zero mismatch count over a zero denominator is not a passing arithmetic,
+                # it is an unrun one -- and it prints identically.
+                "checked": arithmetic["checked"],  # type: ignore[index]
+                "mismatches": arithmetic["mismatches"],  # type: ignore[index]
+                "agreement": rates["decomposition_agreement"],
             }
             for key, expected in want.items():
                 actual = got[key]
@@ -459,9 +584,17 @@ def check(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, ob
                     "n/a" if got["correctness"] is None
                     else f"{got['correctness'] * 100:.1f}%"
                 )
+                # The arithmetic axis prints its denominator, not just its rate. "100%" over
+                # nothing and "100%" over 54 rows are different claims, and a reader
+                # scanning this table has to be able to tell them apart.
+                agree = (
+                    "n/a" if got["agreement"] is None
+                    else f"{got['agreement'] * 100:.1f}%"
+                )
                 print(
                     f"    {name:<9} coverage {cov:>6}  correctness {corr:>6}  "
-                    f"wrong {got['wrong']:>2}  exceptions {got['exceptions']:>2}   as expected"
+                    f"wrong {got['wrong']:>2}  exceptions {got['exceptions']:>2}  "
+                    f"arithmetic {agree:>6} of {got['checked']:>2}   as expected"
                 )
 
         # Acceptance item 7 of .plan/phase2.md: the metric block renders identically

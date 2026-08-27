@@ -14,6 +14,7 @@ import calendar
 from dataclasses import dataclass, field, fields
 from datetime import timedelta, timezone
 from pathlib import Path
+from typing import ClassVar
 
 #: Fixed UTC+05:30. Deliberately not ``zoneinfo.ZoneInfo("Asia/Kolkata")``: bare
 #: Windows Python ships no tzdata and would raise ZoneInfoNotFoundError. IST has
@@ -27,7 +28,27 @@ IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 CAPTURE_HOUR_MIN = 9
 CAPTURE_HOUR_MAX = 21
 
-PAYMENT_METHODS: dict[str, int] = {"card": 45, "upi": 40, "netbanking": 10, "wallet": 5}
+#: Payment methods and their relative weights. The mix exists so the **fee model is
+#: genuinely method-dependent**: if every method carried the same rate, ``fee_bps()`` would
+#: be a constant function and every per-method argument in this codebase would be untested
+#: prose. Phase 4 step 7 checked the rates against Razorpay's published pricing and found
+#: they are *mostly* flat (2% on all standard domestic instruments), so the diversity that
+#: remains comes from the two rails that genuinely differ -- POS at 0.00% and corporate
+#: cards at 2.15% -- rather than from numbers chosen to look varied.
+#:
+#: ``international_card`` is about the *card's origin*, not its currency: an international
+#: card on a domestic merchant settles in INR and simply costs more (up to 3%). Currency
+#: conversion is a separate concern and belongs to the declared ``--fx`` flag in Phase 6, so
+#: nothing here should be read as pre-empting it.
+PAYMENT_METHODS: dict[str, int] = {
+    "card": 38,
+    "upi": 33,
+    "netbanking": 8,
+    "wallet": 5,
+    "corporate_card": 8,
+    "pos_upi": 6,
+    "international_card": 2,
+}
 
 #: Gross amount bands as (min_rupees, max_rupees, weight). Long-tailed on purpose:
 #: a uniform Rs 100-50,000 spread is a tell that the data is fake, and the tail is
@@ -84,9 +105,43 @@ class MessFlags:
     settlement_report_late: bool = False   # Phase 8  withhold settlement_items.csv
     utr_patchy: bool = False               # Phase 8  UTR missing/truncated on some rows
 
+    #: Flags whose data generation is actually implemented in ``story.py``.
+    #:
+    #: Every other flag is *declared* -- it has a CLI switch, a help line and a slot
+    #: in ``truth.json`` -- but ``story.py`` does not read it, so turning it on would
+    #: return unchanged data **labelled as having that mess**. That is worse than a
+    #: no-op in a specific way: any flag makes ``clean_mode`` false, which used to
+    #: switch off the clean-mode invariants, so the mislabelled run also lost the
+    #: checks that would have noticed. ``GenConfig`` refuses such a flag outright.
+    #:
+    #: A phase that implements a flag adds it here, and that edit is the phase
+    #: admitting the flag now does something. Phase 4 step 3 added
+    #: ``settlement_delay``: ``story.py`` reads ``cfg.delay_days`` and ``cfg.lag_days``,
+    #: both of which are gated on it. Step 4 added ``fees``: ``story._deductions`` reads
+    #: ``cfg.fees`` and returns ``(0, 0)`` without the flag.
+    #:
+    #: The order of that edit is the whole discipline. Adding a name here *before*
+    #: ``story.py`` reads the flag makes ``GenConfig`` accept a run it should refuse, and
+    #: the run then emits unchanged data labelled as having that mess -- which is the
+    #: failure this set exists to prevent. Generation first, declaration last.
+    #: ``ClassVar`` is load-bearing, not decoration: a bare annotation inside a
+    #: dataclass becomes a **field**, so ``IMPLEMENTED: frozenset[str]`` would make
+    #: this a 14th mess flag -- breaking ``names()``, ``all_on()``, the CLI's
+    #: generated switches and the flag block in ``truth.json``. The self-check below
+    #: asserts the count is still 13 for exactly that reason.
+    IMPLEMENTED: ClassVar[frozenset[str]] = frozenset({"settlement_delay", "fees"})
+
     @classmethod
     def names(cls) -> tuple[str, ...]:
         return tuple(f.name for f in fields(cls))
+
+    @classmethod
+    def unimplemented(cls) -> tuple[str, ...]:
+        return tuple(n for n in cls.names() if n not in cls.IMPLEMENTED)
+
+    def declared_but_inert(self) -> list[str]:
+        """Flags this config turns on that ``story.py`` would silently ignore."""
+        return [n for n in self.enabled() if n not in self.IMPLEMENTED]
 
     @classmethod
     def all_on(cls) -> MessFlags:
@@ -107,20 +162,50 @@ class MessFlags:
 class FeeConfig:
     """Gateway fee model. Rates are integer basis points, never float percents.
 
-    **Unused in Phase 1** -- clean mode has zero fees, not "fees applied
-    consistently". It exists now so the rates are a declared assumption rather
-    than a number invented under pressure in Phase 4.
+    **Checked against Razorpay's published pricing in Phase 4 step 7**, and two of the
+    five original assumptions were wrong. Recording what changed, because the status key in
+    ``ASSUMPTIONS.md`` exists precisely to make this moment cheap rather than embarrassing:
 
-    These are ASSUMPTIONS, flagged as such in ASSUMPTIONS.md and in the write-up.
-    Verify against Razorpay's current published pricing before relying on them;
-    real rates vary by method and by plan.
+      * ``netbanking`` was 190 bps on the guess that netbanking is cheaper than cards. The
+        page prices all standard domestic instruments at one flat 2%, netbanking included.
+      * ``upi`` was **0 bps**, which conflated two different things. UPI carries **zero
+        MDR** by mandate, but Razorpay's own 2% *platform fee* still applies on the standard
+        payment-gateway rail -- so a UPI sale is not free to the merchant. This was the
+        expensive error of the two: it is not a number a reader would question, and 36% of
+        rows on a ``--fees`` run were settling at their gross because of it.
+
+    The zero-rated rail survives, but it is now a *verified* one instead of an invented one:
+    POS terminals price UPI and RuPay debit at **0.00%**. That matters beyond bookkeeping --
+    a zero-deduction path has to stay exercised (``story.py`` and ``matcher/fees.py`` both
+    branch on it, and "the residual moved" has to be measured per method or the free rows
+    quietly carry the result), and it should be exercised by something true.
+
+    Rates verified 2026-08-26 against https://razorpay.com/pricing/. Two caveats kept
+    deliberately visible rather than smoothed away: these are **list prices** and real rates
+    are negotiated at volume, and Indian MDR structures move with NPCI/RBI policy. So the
+    right reading is "sourced and dated", not "permanently true" -- which is why every rate
+    is overridable from the matcher's command line (``--fee-bps METHOD=BPS``).
     """
 
     fee_bps_by_method: dict[str, int] = field(
-        default_factory=lambda: {"card": 200, "upi": 0, "netbanking": 190, "wallet": 200}
+        default_factory=lambda: {
+            # 2% on all standard domestic instruments -- one flat rate, verified.
+            "card": 200,
+            "upi": 200,          # zero MDR, but the 2% platform fee still applies
+            "netbanking": 200,   # explicitly "not priced differently from cards"
+            "wallet": 200,
+            # The two rails that genuinely differ, which is where the method-dependence of
+            # this model stops being decorative.
+            "corporate_card": 215,     # business/corporate credit cards
+            "international_card": 300, # up to 3% by card origin, settled in INR
+            "pos_upi": 0,              # POS terminals: UPI and RuPay debit at 0.00%
+        }
     )
-    gst_bps: int = 1800   # 18% GST, charged on the fee, not on the gross
-    tds_bps: int = 100    # 1% -- only applies where --tds is on
+    gst_bps: int = 1800   # 18% GST, charged on the fee, not on the gross -- verified
+    #: **Not verified.** TDS is a tax-withholding matter under §194-O rather than gateway
+    #: pricing, so it is absent from the pricing page and stays an assumption. Unused until
+    #: Phase 6 turns ``--tds`` on (D7), so nothing depends on it being right yet.
+    tds_bps: int = 100
 
     def fee_bps(self, method: str) -> int:
         return self.fee_bps_by_method[method]
@@ -140,11 +225,75 @@ class GenConfig:
     flags: MessFlags = field(default_factory=MessFlags)
     fees: FeeConfig = field(default_factory=FeeConfig)
 
+    #: **Two delays, not one**, and conflating them is the trap Phase 4's plan (a)
+    #: caught. ``ASSUMPTIONS.md`` #15/#16 describe only the first:
+    #:
+    #:   settlement cycle   ``captured_at`` -> ``settled_on``   invisible to the matcher
+    #:   bank posting lag   ``settled_on``  -> ``value_date``   the ONLY one the window sees
+    #:
+    #: Tier 1 joins ``credit.value_date`` against ``settlement.settled_on`` and never
+    #: reads ``captured_at``, so a pure settlement-cycle delay changes nothing the matcher
+    #: can see -- widening ``--window`` for it would prove nothing. The posting lag is what
+    #: makes the date window load-bearing, which is why it exists as its own number.
+    #:
+    #: Both are in **business days** and both take effect only while
+    #: ``--settlement-delay`` is on (see ``delay_days``/``lag_days``). That gating is what
+    #: keeps clean mode byte-identical to the Phase 1 run: with the flag off these are 0,
+    #: ``settled_on`` is the capture date and ``value_date`` equals ``settled_on``, exactly
+    #: as before. Clean mode is row 1 of the mess dial and stays the regression check.
+    settlement_delay_days: int = 2   # T+2, ASSUMPTIONS.md's stated common default
+    posting_lag_days: int = 1        # the credit lands the business day after settlement
+
     def __post_init__(self) -> None:
+        # Refuse a flag whose data generation does not exist yet. This lives here
+        # rather than in the CLI on purpose: constructing GenConfig directly -- from a
+        # test, a tool, or a future harness -- must not be a way around it.
+        if inert := self.flags.declared_but_inert():
+            raise ValueError(
+                f"these mess flags are declared but not implemented yet: "
+                f"{', '.join('--' + n.replace('_', '-') for n in inert)}\n"
+                f"  story.py does not read them, so the run would emit *unchanged* "
+                f"data labelled as having that mess -- and because any flag makes "
+                f"clean_mode false, the run would also skip the clean-mode invariants "
+                f"that would have caught it. A wrong answer that looks like a real "
+                f"result is the failure mode this project is built to prevent.\n"
+                f"  Implemented today: "
+                f"{', '.join(sorted(MessFlags.IMPLEMENTED)) or '(none -- clean mode only)'}. "
+                f"A phase that implements a flag adds it to MessFlags.IMPLEMENTED."
+            )
         if self.n < 1:
             raise ValueError(f"--n must be at least 1, got {self.n}")
         if not 1 <= self.month <= 12:
             raise ValueError(f"--month has an invalid month: {self.month}")
+        # Forward-only, matching ``bizdays.add_business_days``. A negative delay would
+        # settle money before it was captured, and the calendar asserts rather than
+        # guessing at what backwards T+n means.
+        if self.settlement_delay_days < 0:
+            raise ValueError(
+                f"--settlement-delay-days must be >= 0, got {self.settlement_delay_days}"
+            )
+        if self.posting_lag_days < 0:
+            raise ValueError(
+                f"--posting-lag-days must be >= 0, got {self.posting_lag_days}"
+            )
+        # A magnitude moved off its default while the flag that reads it is off. This is
+        # the same class of mistake as a declared-but-inert mess flag above -- the run
+        # would accept the number, ignore it, and describe the output in
+        # ``run_manifest.json`` using a delay that never happened.
+        if not self.flags.settlement_delay:
+            declared = {f.name: f.default for f in fields(self)}
+            ignored = [
+                name
+                for name in ("settlement_delay_days", "posting_lag_days")
+                if getattr(self, name) != declared[name]
+            ]
+            if ignored:
+                raise ValueError(
+                    f"{', '.join('--' + n.replace('_', '-') for n in ignored)} was set, "
+                    f"but --settlement-delay is off, so nothing reads it: settled_on would "
+                    f"stay the capture date and value_date would stay equal to settled_on. "
+                    f"Pass --settlement-delay to make the magnitude take effect."
+                )
         if not 1 <= self.narration_styles <= len(NARRATION_TEMPLATES):
             raise ValueError(
                 f"--narration-styles must be 1..{len(NARRATION_TEMPLATES)}, "
@@ -158,6 +307,28 @@ class GenConfig:
     @property
     def clean_mode(self) -> bool:
         return not self.flags.any_on()
+
+    @property
+    def delay_days(self) -> int:
+        """Business days from capture to settlement -- **0 unless the flag is on**.
+
+        The gate lives here rather than at the call site so ``story.py`` can route
+        through the calendar unconditionally: ``add_business_days(d, 0)`` returns ``d``
+        for a business day, and every capture date is one. So clean mode gets the delay
+        code path exercised at zero magnitude while staying byte-identical to Phase 1 --
+        which matters, because clean mode is row 1 of the mess dial and a regression
+        there is the one failure that invalidates every later number.
+        """
+        return self.settlement_delay_days if self.flags.settlement_delay else 0
+
+    @property
+    def lag_days(self) -> int:
+        """Business days from settlement to the bank credit landing. 0 unless the flag is on.
+
+        Separate from ``delay_days`` because this is the only one the matcher's date
+        window can see -- see the field comments above.
+        """
+        return self.posting_lag_days if self.flags.settlement_delay else 0
 
     def resolved(self) -> dict[str, object]:
         """The resolved-config echo.
@@ -173,6 +344,12 @@ class GenConfig:
             "truth_dir": str(self.truth_dir),
             "narration_styles": self.narration_styles,
             "clean_mode": self.clean_mode,
+            # The *effective* delays, not the declared fields: both are 0 while
+            # --settlement-delay is off. Reporting the declared 2 and 1 on a clean run
+            # would describe a delay that did not happen, and this object is what
+            # run_manifest.json and Phase 11's report header quote verbatim.
+            "settlement_delay_days": self.delay_days,
+            "posting_lag_days": self.lag_days,
             "flags_enabled": self.flags.enabled(),
             "flags": self.flags.as_dict(),
         }
@@ -188,7 +365,130 @@ if __name__ == "__main__":
     assert MessFlags().enabled() == []
     assert MessFlags.all_on().any_on()
     assert len(MessFlags.all_on().enabled()) == 13
-    assert not GenConfig(flags=MessFlags.all_on()).clean_mode
+
+    # IMPLEMENTED must stay a ClassVar, never a field. Spelled as a bare annotation it
+    # would become a 14th mess flag: names() would return 14, the CLI would generate an
+    # --implemented switch, and truth.json's flag block would gain a non-boolean entry.
+    assert "IMPLEMENTED" not in MessFlags.names(), "IMPLEMENTED leaked into the fields"
+    assert isinstance(MessFlags.IMPLEMENTED, frozenset)
+    assert MessFlags.IMPLEMENTED <= set(MessFlags.names()), "IMPLEMENTED names a flag that does not exist"
+
+    # --- step 1: a declared-but-inert flag is refused -------------------------
+    # Phase 4 step 3 moved ``settlement_delay`` into IMPLEMENTED, so this is no longer
+    # "every flag is refused" -- it is "every flag story.py does not read is refused",
+    # which is the assertion that keeps meaning something as the phases land. Driving it
+    # off ``unimplemented()`` rather than a hand-written list is what makes it inverting
+    # automatically instead of going stale.
+    assert MessFlags().declared_but_inert() == []
+    assert MessFlags(batching=True).declared_but_inert() == ["batching"]
+    for _landed in ("settlement_delay", "fees"):
+        assert _landed not in MessFlags.unimplemented()
+        assert MessFlags(**{_landed: True}).declared_but_inert() == [], (
+            f"{_landed} is implemented, so it must not be reported inert"
+        )
+    for flag in MessFlags.unimplemented():
+        try:
+            GenConfig(flags=MessFlags(**{flag: True}))
+        except ValueError as e:
+            assert flag.replace("_", "-") in str(e), f"{flag}: refusal must name the flag"
+        else:
+            raise AssertionError(
+                f"--{flag.replace('_', '-')} was accepted but story.py does not "
+                f"implement it, so the run would be mislabelled"
+            )
+
+    # --- step 3: the two delays -----------------------------------------------
+    # An implemented flag is now reachable through the public constructor, so clean_mode
+    # =False needs no patching seam to exercise. The seam is still used below for a flag
+    # that is *not* implemented yet, because that path still has to work.
+    _delayed = GenConfig(flags=MessFlags(settlement_delay=True))
+    assert not _delayed.clean_mode, "a flag that is on must leave clean mode"
+    assert _delayed.resolved()["flags_enabled"] == ["settlement_delay"]
+    # The magnitudes are live under the flag and zero without it. Both halves matter: the
+    # first is the delay model working, the second is what keeps clean mode byte-identical
+    # to the Phase 1 run.
+    assert (_delayed.delay_days, _delayed.lag_days) == (2, 1)
+    assert (GenConfig().delay_days, GenConfig().lag_days) == (0, 0)
+    # resolved() must echo the *effective* delays, not the declared fields -- otherwise a
+    # clean run's manifest describes a T+2 settlement that never happened.
+    assert GenConfig().resolved()["settlement_delay_days"] == 0
+    assert GenConfig().resolved()["posting_lag_days"] == 0
+    assert _delayed.resolved()["settlement_delay_days"] == 2
+    assert _delayed.resolved()["posting_lag_days"] == 1
+    # A magnitude set while the flag is off is refused rather than silently ignored --
+    # the same rule as a declared-but-inert flag, and the refusal must name the switch.
+    for kwargs in ({"settlement_delay_days": 5}, {"posting_lag_days": 3}):
+        try:
+            GenConfig(**kwargs)  # type: ignore[arg-type]
+        except ValueError as e:
+            key = next(iter(kwargs))
+            assert key.replace("_", "-") in str(e), f"{key}: refusal must name the switch"
+        else:
+            raise AssertionError(f"GenConfig accepted {kwargs} with --settlement-delay off")
+    # Forward-only, matching the calendar's own assertion.
+    for bad in ({"settlement_delay_days": -1}, {"posting_lag_days": -1}):
+        try:
+            GenConfig(flags=MessFlags(settlement_delay=True), **bad)  # type: ignore[arg-type]
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"GenConfig accepted {bad}")
+    # A zero lag under the flag is legitimate: same-day posting, T+n settlement only.
+    assert GenConfig(flags=MessFlags(settlement_delay=True), posting_lag_days=0).lag_days == 0
+
+    # --- step 4: the fee model ------------------------------------------------
+    # The rates are ASSUMPTIONS (ASSUMPTIONS.md #5-#9), so what is asserted here is their
+    # *shape*, never their values -- pinning 200 bps would turn a documented assumption
+    # into a test that has to be edited when the assumption is corrected.
+    _fees = FeeConfig()
+    assert set(_fees.fee_bps_by_method) == set(PAYMENT_METHODS), (
+        "every payment method needs a fee rate, or story._deductions raises KeyError "
+        "on the first payment of that method"
+    )
+    assert all(bps >= 0 for bps in _fees.fee_bps_by_method.values())
+    # GST is charged on the fee, so a rate at or above 100% would make GST exceed the fee
+    # it sits on -- the shape invariant behind invariants.check_settlement_arithmetic.
+    assert 0 <= _fees.gst_bps < 10_000, "GST is a share of the fee, not a multiple of it"
+    assert 0 <= _fees.tds_bps < 10_000
+    # A zero-rate method is legitimate and load-bearing: pos_upi settles at its gross, so
+    # its residual is zero even under --fees. "The residual moved" has to be measured per
+    # method rather than in aggregate, and this is the assertion that says why.
+    #
+    # Asserted as "some method", not "pos_upi specifically", on purpose. The property that
+    # matters is that the zero-deduction branch stays reachable; *which* rail is free is a
+    # rate, and rates get corrected. This assertion did survive that correction: it was
+    # written when upi was the free method, and it still holds now that upi is priced at 200
+    # and POS carries the zero. Naming the method would have made it a test to edit.
+    assert any(bps == 0 for bps in _fees.fee_bps_by_method.values()), (
+        "at least one method is expected to be zero-rated; if that changes, the per-method "
+        "residual reasoning in story._deductions needs revisiting"
+    )
+    _feed = GenConfig(flags=MessFlags(fees=True))
+    assert not _feed.clean_mode
+    assert _feed.resolved()["flags_enabled"] == ["fees"]
+    # --fees and --settlement-delay are independent: the amount wedge and the date wedge
+    # must be switchable one at a time, which is the whole point of the mess dial.
+    assert (_feed.delay_days, _feed.lag_days) == (0, 0), (
+        "--fees alone must not move a single date"
+    )
+
+    # The IMPLEMENTED seam still works for a flag no phase has landed yet. ``batching`` is
+    # Phase 5's; when it lands, move this probe to the next unimplemented flag rather than
+    # deleting it -- the seam has to keep working for as long as any flag is still declared
+    # and inert.
+    _original = MessFlags.IMPLEMENTED
+    try:
+        MessFlags.IMPLEMENTED = _original | {"batching"}
+        assert MessFlags(batching=True).declared_but_inert() == []
+        assert GenConfig(flags=MessFlags(batching=True)).resolved()["flags_enabled"] == ["batching"]
+    finally:
+        MessFlags.IMPLEMENTED = _original
+    assert MessFlags.IMPLEMENTED == _original, "the probe must not leak"
+    assert "batching" in MessFlags.unimplemented(), "batching is not implemented until Phase 5"
+    assert MessFlags.unimplemented(), (
+        "no flag is unimplemented any more -- the seam above is testing nothing, and the "
+        "declared-but-inert refusal in GenConfig has no case left to catch"
+    )
     assert sum(w for *_, w in AMOUNT_BANDS) == 100, "amount band weights must sum to 100"
     assert len(NARRATION_TEMPLATES) == 4
     # Bands must be ordered and non-overlapping, or "long tail" is a lie.
