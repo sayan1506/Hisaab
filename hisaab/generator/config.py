@@ -61,6 +61,55 @@ AMOUNT_BANDS: tuple[tuple[int, int, int], ...] = (
     (1_00_000, 3_00_000, 2),
 )
 
+#: ``--batching``: how many payments settle together, as (size, weight). Phase 5 decision 2
+#: -- **size 1 must stay in the distribution.** A distribution that eliminated it would make
+#: the tier gate read a *swap* (all Tier 2, no Tier 1) rather than a mix, which is exactly the
+#: failure step 2's gate exists to catch: a Tier 1 regression would hide behind a Tier 2
+#: success. 60% singletons keeps Tier 1 the majority tier while still batching most of the
+#: money, because the tail carries the large amounts.
+#:
+#: Mean 1.60 payments per settlement, so ``n`` payments produce ~``n/1.6`` bank rows. That
+#: divisor is why ``--batching`` raises the default ``n``: measured, every candidate
+#: distribution breaches the track's 50-record floor at ``--n 60`` (~37 rows here) and every
+#: one clears it at ``--n 200`` (~125 rows here). See ``.plan/phase5.md`` section 1(d).
+#:
+#: A size is a *ceiling*, not a promise: batches never span a settlement date, so the draw is
+#: capped by how many payments remain on that date. At small ``n`` a date holds ~3 payments and
+#: the larger sizes are simply unreachable, which is why the effective mean rises with ``n``.
+#: The CLI's default record count, and the raised default ``--batching`` resolves to.
+#: ``n`` counts **payments**, and batching makes payments and bank rows different numbers:
+#: at mean 1.60 payments per settlement, ``--n 60`` yields ~37 bank rows and breaches the
+#: track's 50-record floor, while ``--n 200`` yields ~125 and clears it. Measured on every
+#: candidate distribution -- see ``.plan/phase5.md`` section 1(d) and decision 3.
+#:
+#: **Resolved in the CLI, never in ``GenConfig``.** A config that silently rewrote
+#: ``n=60`` into 200 whenever ``batching`` was set would change what every caller passing an
+#: explicit ``n`` was asking for -- gate 12 scores n=60 deliberately, and ``story.py``'s
+#: self-checks assert exact payment counts at a given ``n``. A default belongs to the
+#: argument layer; here it would be a value that lies about what was requested.
+#: ``--settlement-report-late``: the share of settlements whose membership is withheld from
+#: ``settlement_items.csv``. **Partial, never total** -- Phase 5 decision 4. Withholding every
+#: settlement would turn the tier distribution into a *swap* rather than a mix, and a Tier 1
+#: regression could then hide behind a Tier 2 success; gate 12 refuses both one-sided shapes
+#: for that reason. A third is enough to make the search carry real rows while leaving Tier 1
+#: the majority tier.
+#:
+#: The file is still written, with its header and the rows that were not withheld: ``load.py``
+#: raises ``LoadError`` on a missing file, so omitting it would fail the run for the wrong
+#: reason and read as a loader bug rather than as withheld data (#22 settled the same question
+#: for an empty ``refunds.csv``).
+LATE_REPORT_SHARE = 0.30
+
+DEFAULT_N = 60
+DEFAULT_N_BATCHED = 200
+
+BATCH_SIZE_WEIGHTS: tuple[tuple[int, int], ...] = (
+    (1, 60),
+    (2, 25),
+    (3, 10),
+    (4, 5),
+)
+
 #: Percent of amounts landing on a whole rupee. The remainder carry paise, which
 #: is the variety ``--rounding-edge`` needs in Phase 12.
 WHOLE_RUPEE_PERCENT = 70
@@ -133,8 +182,15 @@ class MessFlags:
     #: payment pairs onto one ``(capture_date, gross, method)``, and ``build`` then forces
     #: each pair's two settlements onto one UTR. Both halves are required, and the second is
     #: the load-bearing one -- see ``dup_pairs`` below for the measurement that says why.
+    #: Phase 5 step 1 added ``batching``: ``story._group_into_batches`` partitions each
+    #: settlement date's payments into settlements of 1-4 members, and ``build`` sums the
+    #: deductions per member. Added *after* that code existed, per the paragraph above.
+    #: Phase 5 step 5 added ``settlement_report_late``, pulled forward from Phase 8:
+    #: ``story._withhold_membership`` picks the settlements whose rows ``emit`` leaves out of
+    #: ``settlement_items.csv``. Truth keeps the full membership -- the withholding is a
+    #: property of the *files the matcher reads*, not of what happened.
     IMPLEMENTED: ClassVar[frozenset[str]] = frozenset(
-        {"settlement_delay", "fees", "dup_amounts"}
+        {"settlement_delay", "fees", "dup_amounts", "batching", "settlement_report_late"}
     )
 
     @classmethod
@@ -349,6 +405,46 @@ class GenConfig:
                     f"plant {self.dup_pairs} colliding pair(s), but --n is {self.n}. "
                     f"Raise --n or lower --dup-pairs."
                 )
+        # ``--dup-amounts`` and ``--batching`` do not compose, so the combination is refused
+        # rather than emitting a plant that is not a plant.
+        #
+        # A planted pair is unresolvable because two settlements share one net, one date and
+        # one UTR. Batching either member with other payments makes its net a *sum*, the two
+        # nets diverge, and the pair becomes separable -- at which point ``resolvable=False``
+        # is a false statement about the data, which is the exact failure Phase 4b exists to
+        # close. Invariant I12 does catch it downstream (the planted count comes out at 0),
+        # but it reports a symptom; this names the cause.
+        #
+        # Deliberately **not** fixed by forcing planted payments into singleton settlements:
+        # membership would then correlate with plantedness, handing a matcher "the settlements
+        # holding exactly one payment are the ambiguous ones" as a structural tell. That is a
+        # worse leak than the one being avoided and a self-inflicted one. The honest options
+        # are to design the combination properly or to refuse it, and a combined run buys
+        # nothing Phase 5 needs.
+        if self.flags.dup_amounts and self.flags.batching:
+            raise ValueError(
+                "--dup-amounts and --batching cannot be combined: batching a planted "
+                "payment with others makes its settlement's net a sum, so the pair no "
+                "longer shares one net and stops being unresolvable -- truth would then "
+                "claim resolvable=false about data that is separable. Run them separately; "
+                "gate 11 covers the planted rows and gate 12 covers batching."
+            )
+        # Withholding must be **partial** (decision 4), so the flag needs at least two
+        # settlements to have a choice: withholding the only one is total by definition, and a
+        # total withholding turns the tier distribution into a swap rather than a mix. Refused
+        # here rather than silently withholding nothing, which is the mess-flag footgun this
+        # codebase refuses by name -- a run labelled as having a mess it does not have.
+        #
+        # ``n < 2`` is the part knowable from the config alone: 1:1 gives exactly ``n``
+        # settlements and batching can only reduce that count, so ``n == 1`` is always one
+        # settlement. Small ``n`` *with* batching can also land on one settlement as a matter
+        # of the draw (measured: n=2 on 1 of 60 seeds), which no config-time check can see --
+        # ``story.build`` carries the backstop for that.
+        if self.flags.settlement_report_late and self.n < 2:
+            raise ValueError(
+                f"--settlement-report-late needs at least 2 settlements so that the "
+                f"withholding can be partial, but --n {self.n} produces one. Raise --n."
+            )
         if not 1 <= self.narration_styles <= len(NARRATION_TEMPLATES):
             raise ValueError(
                 f"--narration-styles must be 1..{len(NARRATION_TEMPLATES)}, "
@@ -450,8 +546,8 @@ if __name__ == "__main__":
     # off ``unimplemented()`` rather than a hand-written list is what makes it inverting
     # automatically instead of going stale.
     assert MessFlags().declared_but_inert() == []
-    assert MessFlags(batching=True).declared_but_inert() == ["batching"]
-    for _landed in ("settlement_delay", "fees"):
+    assert MessFlags(netted_refunds=True).declared_but_inert() == ["netted_refunds"]
+    for _landed in ("settlement_delay", "fees", "dup_amounts", "batching"):
         assert _landed not in MessFlags.unimplemented()
         assert MessFlags(**{_landed: True}).declared_but_inert() == [], (
             f"{_landed} is implemented, so it must not be reported inert"
@@ -542,23 +638,59 @@ if __name__ == "__main__":
         "--fees alone must not move a single date"
     )
 
-    # The IMPLEMENTED seam still works for a flag no phase has landed yet. ``batching`` is
-    # Phase 5's; when it lands, move this probe to the next unimplemented flag rather than
-    # deleting it -- the seam has to keep working for as long as any flag is still declared
-    # and inert.
+    # The IMPLEMENTED seam still works for a flag no phase has landed yet. This probe was
+    # written against ``batching``; Phase 5 landed it, so the probe moved to
+    # ``netted_refunds`` (Phase 6) rather than being deleted -- the seam has to keep working
+    # for as long as *any* flag is still declared and inert, and the moment it tests a landed
+    # flag it tests nothing. Move it again, do not delete it, when Phase 6 lands.
     _original = MessFlags.IMPLEMENTED
     try:
-        MessFlags.IMPLEMENTED = _original | {"batching"}
-        assert MessFlags(batching=True).declared_but_inert() == []
-        assert GenConfig(flags=MessFlags(batching=True)).resolved()["flags_enabled"] == ["batching"]
+        MessFlags.IMPLEMENTED = _original | {"netted_refunds"}
+        assert MessFlags(netted_refunds=True).declared_but_inert() == []
+        assert GenConfig(flags=MessFlags(netted_refunds=True)).resolved()["flags_enabled"] == [
+            "netted_refunds"
+        ]
     finally:
         MessFlags.IMPLEMENTED = _original
     assert MessFlags.IMPLEMENTED == _original, "the probe must not leak"
-    assert "batching" in MessFlags.unimplemented(), "batching is not implemented until Phase 5"
+    assert "netted_refunds" in MessFlags.unimplemented(), "netted_refunds lands in Phase 6"
+    assert "batching" in MessFlags.IMPLEMENTED, "Phase 5 step 1 implements batching"
     assert MessFlags.unimplemented(), (
         "no flag is unimplemented any more -- the seam above is testing nothing, and the "
         "declared-but-inert refusal in GenConfig has no case left to catch"
     )
+    # --- Phase 5 step 1: the batch size distribution --------------------------
+    # Shape, never the exact weights: the weights are a tuning choice and pinning them would
+    # make this a test to edit. What must hold is that size 1 stays in play (decision 2 --
+    # otherwise the tier gate reads a swap rather than a mix) and that some size above 1 does
+    # too, or --batching is an expensive no-op.
+    assert any(size == 1 for size, w in BATCH_SIZE_WEIGHTS if w), (
+        "size 1 must stay in the distribution, or Tier 1 has no rows left and the "
+        "tier-distribution gate reads a tier *swap* instead of a mix -- which would hide a "
+        "Tier 1 regression behind a Tier 2 success (Phase 5 decision 2)"
+    )
+    assert any(size > 1 for size, w in BATCH_SIZE_WEIGHTS if w), "--batching must batch something"
+    assert all(size >= 1 and w >= 0 for size, w in BATCH_SIZE_WEIGHTS)
+    _batched = GenConfig(flags=MessFlags(batching=True))
+    assert not _batched.clean_mode
+    assert _batched.resolved()["flags_enabled"] == ["batching"]
+    # --batching alone moves no date and no amount: it changes cardinality only. Same
+    # one-variable-at-a-time discipline that put --settlement-delay before --fees.
+    assert (_batched.delay_days, _batched.lag_days) == (0, 0), "--batching must move no date"
+    # --dup-amounts + --batching is refused: batching a planted payment makes its net a sum,
+    # so the pair stops colliding and truth's resolvable=false becomes a false statement.
+    try:
+        GenConfig(flags=MessFlags(dup_amounts=True, batching=True))
+    except ValueError as e:
+        assert "dup-amounts" in str(e) and "batching" in str(e), (
+            f"the refusal must name both flags: {e}"
+        )
+    else:
+        raise AssertionError("GenConfig accepted --dup-amounts with --batching")
+    # Each flag alone stays legal, or the refusal above is too broad.
+    assert GenConfig(flags=MessFlags(dup_amounts=True)).planted_pairs == 2
+    assert GenConfig(flags=MessFlags(batching=True)).planted_pairs == 0
+
     assert sum(w for *_, w in AMOUNT_BANDS) == 100, "amount band weights must sum to 100"
     assert len(NARRATION_TEMPLATES) == 4
     # Bands must be ordered and non-overlapping, or "long tail" is a lie.

@@ -107,7 +107,16 @@ def metric_block(m: Metrics) -> str:
         _line(
             "Records processed",
             f"{rows} bank rows "
-            f"({m.gateway_credits} gateway, {m.non_gateway_credits} non-gateway)",
+            f"({m.gateway_credits} gateway, {m.non_gateway_credits} non-gateway)"
+            # Stated only when the two differ, which is exactly when --batching is on. On a
+            # 1:1 run "from 60 payments" after "60 bank rows" is noise; under batching its
+            # absence would let 200 payments read as 120 records, and the track's floor is
+            # checked against one of those two numbers (.plan/phase5.md decision 3).
+            + (
+                f" from {m.total_payments} payments"
+                if m.total_payments and m.total_payments != rows
+                else ""
+            ),
         ),
         _line("Run", run_line(m)),
         _line("Matcher", m.matcher),

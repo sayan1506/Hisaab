@@ -157,6 +157,12 @@ def build_manifest(
         "generator_version": __import__("hisaab").__version__,
         "config": cfg.resolved(),
         "counts": story.counts(),
+        # Named, not just counted. A withheld membership is the disk equivalent of a suspended
+        # invariant: it removes information the matcher would otherwise read, and the rule
+        # this codebase settled after the ``clean_mode`` footgun is that such a removal must be
+        # announced rather than left to be inferred from a row count. ``[]`` on every run
+        # without ``--settlement-report-late``.
+        "membership_withheld": list(story.membership_withheld),
         "totals_paise": {
             "gross": story.total_gross_paise(),
             "net": story.total_net_paise(),
@@ -201,7 +207,22 @@ def emit(
     )
     rows[SETTLEMENTS_CSV] = len(settlements)
 
-    items = sorted(row for s in story.settlements for row in s.item_rows())
+    # ``--settlement-report-late`` omits the withheld settlements' rows. **The file is still
+    # written, with its header and every row that was not withheld** -- ``load.py`` raises
+    # ``LoadError`` on a missing file, so omitting it would fail the run for the wrong reason
+    # and read as a loader bug rather than as data the report has not caught up with (#22
+    # settled the same question for an empty ``refunds.csv``: header-only, never absent).
+    #
+    # This is the only place the withholding exists. ``story.settlements`` still lists every
+    # member and ``truth.json`` still publishes them, so the answer key stays complete and a
+    # searched payment set can still be graded against the real one.
+    withheld = set(story.membership_withheld)
+    items = sorted(
+        row
+        for s in story.settlements
+        if s.settlement_id not in withheld
+        for row in s.item_rows()
+    )
     hashes[SETTLEMENT_ITEMS_CSV] = write_csv(
         data_dir / SETTLEMENT_ITEMS_CSV, SETTLEMENT_ITEMS_HEADER, items
     )

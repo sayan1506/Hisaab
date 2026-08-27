@@ -39,6 +39,7 @@ module owns gates 0, 3 and 7, and sequences the rest.
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import json
 import re
@@ -59,6 +60,7 @@ from hisaab.generator.story import build  # noqa: E402
 # is a test harness and imports both halves by design; it is not on the matching path,
 # which is why check_isolation.py scans hisaab/matcher/ and not tools/.)
 from hisaab.matcher.engine import DECISION_FIELDS  # noqa: E402
+from hisaab.matcher.tier2 import MAX_POOL as TIER2_MAX_POOL  # noqa: E402
 
 #: Modules with a ``__main__`` self-check, in dependency order -- the order they
 #: were built in, so the first failure is the deepest one.
@@ -1061,6 +1063,336 @@ def gate_11_planted(sizes: tuple[int, ...] = (60, 200)) -> None:
         )
 
 
+#: Seeds for gate 12. Wider than ``DEV_SEEDS`` on purpose: a tier *distribution* is a
+#: claim about a mix, and a mix measured on three seeds is a mix that can be one seed's
+#: accident. `.plan/phase5.md` step 2 specifies seeds 1-5.
+TIER_MIX_SEEDS: tuple[int, ...] = (1, 2, 3, 4, 5)
+
+#: The size gate 12's over-cap probe runs at. The tier 2 pool cap (``matcher/tier2.py``
+#: ``MAX_POOL``) never binds at the gate's own sizes -- the pool tops out near 20 there against
+#: a cap of 64 -- so without this the bound is a number in a docstring rather than a behaviour.
+#:
+#: Measured before choosing: at n=1200 the cap never fires; n=1500 fires it on 129 rows and
+#: costs 8.7s; **n=2000 fires it on 345 rows and costs 3.2s**. The larger size being the
+#: *cheaper* one is not a fluke and is the cap doing its job -- a refused pool skips the
+#: enumeration entirely, so past the point where the cap binds, more data means less work. That
+#: is the whole claim behind a bounded refusal, and it is why this probe is affordable on every
+#: acceptance run.
+TIER_MIX_CAP_N: int = 2000
+
+#: The flag set gate 12 scores. ``--batching`` alone does not force a subset search:
+#: ``settlement_items.csv`` declares which payments belong to which settlement, so Tier 1
+#: resolves a 4-payment batch by lookup and Tier 2 is never reached -- which is why the gate
+#: was landed red in step 2 with only that flag. ``--settlement-report-late`` withholds that
+#: membership for *some* settlements, and a withheld batch is work only a search can do.
+#:
+#: Deliberately **not** adding ``--fees`` and ``--settlement-delay``. They are gate 10's
+#: subject, they would need ``--window 1`` here, and this gate reads a tier *distribution* --
+#: one variable at a time is the discipline that put ``--settlement-delay`` before ``--fees``
+#: in Phase 4. Measured at both settings before choosing: the mix, correctness and wrong-match
+#: count are identical with and without them across seeds 1-5 at n=60 and n=200, so the extra
+#: flags would add a second moving part and no signal.
+TIER_MIX_FLAGS: tuple[str, ...] = ("--batching", "--settlement-report-late")
+
+
+def _tier_mix_failure(
+    verdicts: list[dict[str, object]], label: str
+) -> str | None:
+    """Describe what is wrong with a run's tier distribution, or ``None`` if it is healthy.
+
+    Factored out of the gate so that the **same predicate** can be run against synthetic
+    inputs whose answer is known. That is not tidiness: gate 12 is landed in a state where it
+    *fails*, and a check that fails on every input it will ever see is indistinguishable from
+    a ``raise``. The probe in ``_gate_12_self_check`` feeds this function a healthy mix, an
+    all-Tier-1 run and an all-Tier-2 run, and requires it to accept the first and reject the
+    other two -- so the red state below is a **measurement**, not a hard-coded refusal.
+
+    The predicate, and why each half is here:
+
+      * **Tier 2 must be non-zero.** This is the half that fails today. A green 100/100/0
+        under ``--batching`` says nothing about the search, because Tier 1 resolves batches
+        by declared membership; the *numbers* are right and the *capability* is absent.
+      * **Tier 1 must also be non-zero.** The failure this half catches is the opposite one
+        and it is easy to walk into: withhold membership for *every* settlement and the
+        distribution becomes a swap rather than a mix, so a Tier 1 regression can hide behind
+        a Tier 2 success. It is the reason step 5 withholds *partially*.
+      * **Every resolved row carries a tier.** A resolved row with ``tier=None`` is a row no
+        rule claims, which makes per-rule attribution unauditable.
+    """
+    resolved = [v for v in verdicts if v.get("outcome") == "RESOLVED"]
+    if not resolved:
+        return f"{label}: no row resolved at all, so there is no distribution to check"
+
+    untiered = [str(v.get("credit_id")) for v in resolved if v.get("tier") is None]
+    if untiered:
+        return (
+            f"{label}: {len(untiered)} resolved row(s) carry no tier "
+            f"(e.g. {untiered[:3]}). Per-rule attribution cannot be audited if a resolved "
+            f"row belongs to no rule."
+        )
+
+    by_tier = collections.Counter(int(v["tier"]) for v in resolved)  # type: ignore[arg-type]
+    tier1, tier2 = by_tier.get(1, 0), by_tier.get(2, 0)
+
+    if tier1 and not tier2:
+        return (
+            f"{label}: Tier 1 resolved {tier1} row(s) and Tier 2 resolved 0. The run is "
+            f"green and the search is never exercised. This is the state the gate was built "
+            f"to refuse, and with the search present it is a regression rather than a "
+            f"pending step: either membership is being declared for every settlement (check "
+            f"that TIER_MIX_FLAGS still carries --settlement-report-late and that the "
+            f"withholding share is non-zero), or every withheld row is abstaining -- in "
+            f"which case the reason codes on the unresolved rows say which of the tier 2 "
+            f"refusals fired."
+        )
+    if tier2 and not tier1:
+        return (
+            f"{label}: Tier 2 resolved {tier2} row(s) and Tier 1 resolved 0. Membership was "
+            f"withheld from every settlement, so the distribution is a *swap* rather than a "
+            f"mix and a Tier 1 regression would hide behind a Tier 2 success. Withhold "
+            f"partially (decision 3)."
+        )
+    if not tier1 and not tier2:
+        return f"{label}: nothing resolved at Tier 1 or Tier 2, only {dict(by_tier)}"
+    return None
+
+
+def _gate_12_self_check() -> None:
+    """Prove ``_tier_mix_failure`` is satisfiable before using it to fail the suite.
+
+    Gate 12 lands red. The one thing that would make that worthless is a predicate that
+    cannot go green, so this runs it against three hand-built inputs whose verdict is known.
+    """
+    def rows(*tiers: int | None) -> list[dict[str, object]]:
+        return [
+            {"credit_id": f"C{i:04d}", "outcome": "RESOLVED", "tier": t}
+            for i, t in enumerate(tiers, start=1)
+        ]
+
+    healthy = rows(1, 1, 2, 1, 2)
+    if _tier_mix_failure(healthy, "probe") is not None:
+        raise GateFailure(
+            "gate 12's own predicate rejects a healthy Tier 1 / Tier 2 mix, so the failure "
+            "it reports below would be unconditional and would prove nothing"
+        )
+    for bad, want in ((rows(1, 1, 1), "Tier 2 resolved 0"), (rows(2, 2), "Tier 1 resolved 0")):
+        got = _tier_mix_failure(bad, "probe")
+        if got is None or want not in got:
+            raise GateFailure(
+                f"gate 12's predicate failed to reject a one-sided distribution: "
+                f"expected a complaint containing {want!r}, got {got!r}"
+            )
+    # An abstaining row legitimately carries no tier, and must not be read as untiered.
+    mixed = healthy + [{"credit_id": "C9999", "outcome": "EXCEPTION", "tier": None}]
+    if _tier_mix_failure(mixed, "probe") is not None:
+        raise GateFailure(
+            "gate 12's predicate counts an abstaining row as untiered. Only RESOLVED rows "
+            "carry a tier -- verdict.py refuses an EXCEPTION that names one."
+        )
+
+
+def _gate_12_cap_probe(root: Path) -> str:
+    """Run one deliberately over-cap dataset and require the tier 2 refusal to fire.
+
+    The cap is the answer to "what happens at 10,000 records?", and the answer is only worth
+    something if the refusal is a behaviour rather than a branch nobody has taken. At the
+    gate's own sizes the pool never approaches it, so this generates a run big enough that it
+    binds.
+
+    Two things are asserted, and the second matters more than the first:
+
+      * the refusal fires at all, with a note that **names the bound** -- an exception saying
+        "the pool of 91 exceeds the cap of 64" is triage-able, and "could not resolve" is not;
+      * refusing costs only coverage. Correctness stays 1.0 and wrong matches stay 0 while
+        hundreds of rows are refused, which is the property that separates a bounded refusal
+        from a search that gives up and guesses.
+
+    Returns the line to print, so the gate reports the measurement rather than only its pass.
+    """
+    data, truth = root / "capdata", root / "captruth"
+    out = root / "capmatches.json"
+    _run(
+        [
+            sys.executable, "-m", "hisaab.generator",
+            "--seed", "1", "--n", str(TIER_MIX_CAP_N), "--month", "2026-08",
+            "--out", str(data), "--truth", str(truth), "--quiet", *TIER_MIX_FLAGS,
+        ],
+        f"generator at n={TIER_MIX_CAP_N} for the tier 2 cap probe",
+    )
+    doc = _matcher_and_score(data, truth, out, 1)
+    verdicts = json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+
+    refused = [
+        v for v in verdicts
+        if v.get("outcome") != "RESOLVED"
+        and str(v.get("reason")) == "MEMBERSHIP_UNDECLARED"
+    ]
+    if not refused:
+        raise GateFailure(
+            f"the tier 2 pool cap never fired at n={TIER_MIX_CAP_N}, so the bound in "
+            f"matcher/tier2.py is a declared number rather than a demonstrated behaviour. "
+            f"Either the cap moved, or the pool no longer grows with n -- raise "
+            f"TIER_MIX_CAP_N until it binds, and check the note names the bound."
+        )
+    named = [v for v in refused if str(TIER2_MAX_POOL) in str(v.get("note") or "")]
+    if not named:
+        raise GateFailure(
+            f"{len(refused)} row(s) were refused for an undeclared membership at "
+            f"n={TIER_MIX_CAP_N}, but no note names the cap of {TIER2_MAX_POOL}. A refusal "
+            f"that does not state its bound is indistinguishable from a search that gave up."
+        )
+    cells, rates = doc["cells"], doc["rates"]  # type: ignore[index]
+    if rates["correctness"] != 1.0 or cells["wrong_match"]:  # type: ignore[index]
+        raise GateFailure(
+            f"at n={TIER_MIX_CAP_N} the cap refused {len(refused)} row(s) and correctness "
+            f"fell to {rates['correctness']} with "  # type: ignore[index]
+            f"{cells['wrong_match']} wrong match(es). "  # type: ignore[index]
+            f"Refusing an over-cap pool must cost coverage and nothing else."
+        )
+    return (
+        f"    the cap is demonstrated, not declared: at n={TIER_MIX_CAP_N} the pool exceeds "
+        f"{TIER2_MAX_POOL} on {len(refused)} row(s), each naming the bound, and correctness "
+        f"stays 100% with 0 wrong matches"
+    )
+
+
+def gate_12_tier_mix(sizes: tuple[int, ...] = (60, 200)) -> None:
+    """Phase 5: **both tiers must carry rows**, not just the totals.
+
+    Every gate before this one scores a run in which one rule resolves everything, so
+    "the search works" has never been a claim any run could contradict. This gate is the
+    per-rule attribution check, and Phase 5 is the first phase where it can say anything.
+
+    **It was landed deliberately red in step 2, and step 6 turned it green.** The state it
+    refuses was measured, not hypothetical: at seeds 1-5 and 42, n=60 and n=200,
+    ``--batching`` alone scored coverage 1.0, correctness 1.0 and decomposition agreement 1.0
+    with **Tier 2 at zero on every one of them** -- 120 of 120 rows at Tier 1 at seed 42,
+    n=200, 49 of them citing more than one payment. So a batched run already looked like a
+    passing phase while the subset search did not exist, because ``settlement_items.csv``
+    declares membership and turns the search into a lookup. Unlike Phase 4's version of this
+    trap the numbers were *correct*; only the mechanism claim was false, which is what made it
+    worth a gate rather than a note. It is also the shape of a comparable Track 04 build's
+    recorded near-miss, where the tier designed as the showcase was resolved by enumerating
+    narration substrings instead.
+
+    That history is why the predicate is separate from the data. A check that cannot pass is a
+    ``raise`` wearing a gate's clothes, so ``_gate_12_self_check`` runs the predicate against a
+    healthy mix and against both one-sided distributions before the gate reads a single run --
+    which is what made the red state attributable to the data, and makes the green one worth
+    something now.
+
+    The unconditional lines are asserted here too, so that step 6 cannot buy a Tier 2 number
+    with a wrong match: correctness 100%, 0 wrong matches, and every coverage shortfall
+    carrying an ``ABSTENTION_REASONS`` code.
+    """
+    print(
+        f"\ngate 12 -- the tier distribution: both tiers must carry rows, seeds "
+        f"{list(TIER_MIX_SEEDS)}"
+    )
+    _gate_12_self_check()
+    print("    predicate accepts a healthy mix and rejects either one-sided run")
+
+    with tempfile.TemporaryDirectory(prefix="hisaab-tiers-") as tmp:
+        root = Path(tmp)
+        failures: list[str] = []
+        for seed in TIER_MIX_SEEDS:
+            for n in sizes:
+                base = root / f"s{seed}n{n}"
+                data, truth = base / "data", base / "truth"
+                _run(
+                    [
+                        sys.executable, "-m", "hisaab.generator",
+                        "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                        "--out", str(data), "--truth", str(truth), "--quiet",
+                        *TIER_MIX_FLAGS,
+                    ],
+                    f"generator with {' '.join(TIER_MIX_FLAGS)} at seed {seed}, n={n}",
+                )
+                out = base / "matches.json"
+                doc = _matcher_and_score(data, truth, out, seed)
+                verdicts = json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+
+                # The lines that never bend, checked before the distribution: a Tier 2 count
+                # bought with a wrong match is worse than a Tier 2 count of zero.
+                cells, rates = doc["cells"], doc["rates"]  # type: ignore[index]
+                if rates["correctness"] != 1.0 or cells["wrong_match"]:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: correctness "
+                        f"{rates['correctness']} with "  # type: ignore[index]
+                        f"{cells['wrong_match']} wrong match(es). "  # type: ignore[index]
+                        f"Correctness 100% and 0 wrong matches are unconditional."
+                    )
+                # The third axis, with the denominator that stops it being vacuous.
+                # ``decomposition_agreement`` is a ratio, so 1.0 over three checked rows would
+                # pass a 200-row run while the arithmetic went unexamined; tying ``checked`` to
+                # the correct-cell count is what makes the number mean "every row it got right
+                # also proved its money". Measured equal on all ten gate runs before being
+                # asserted here.
+                dec = doc["decomposition"]  # type: ignore[index]
+                if rates["decomposition_agreement"] != 1.0:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: decomposition agreement "
+                        f"{rates['decomposition_agreement']} with "  # type: ignore[index]
+                        f"{dec['mismatches']} mismatch(es) over "  # type: ignore[index]
+                        f"{dec['checked']} checked row(s). A resolved row must prove "  # type: ignore[index]
+                        f"its arithmetic term by term, and a batched settlement is where "
+                        f"per-member rounding would show up."
+                    )
+                if dec["checked"] != cells["correct"]:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: decomposition agreement is 1.0 but only "
+                        f"{dec['checked']} row(s) were checked against "  # type: ignore[index]
+                        f"{cells['correct']} correct match(es). "  # type: ignore[index]
+                        f"Agreement is a ratio: a perfect score over a subset of the "
+                        f"correct rows is satisfied by not looking."
+                    )
+
+                unresolved = [v for v in verdicts if v.get("outcome") != "RESOLVED"]
+                dishonest = [
+                    str(v.get("credit_id")) for v in unresolved
+                    if str(v.get("reason")) not in ABSTENTION_REASONS
+                ]
+                if dishonest:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(dishonest)} unresolved row(s) carry a "
+                        f"reason outside ABSTENTION_REASONS (e.g. {dishonest[:3]}). A "
+                        f"coverage shortfall is only acceptable as an honest abstention."
+                    )
+
+                # Batching must actually be producing multi-payment settlements, or the
+                # distribution below is a claim about data that does not exist.
+                multi = sum(1 for v in verdicts if len(v.get("payment_ids") or []) > 1)
+                if not multi:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: no resolved row cites more than one payment, "
+                        f"so {' '.join(TIER_MIX_FLAGS)} batched nothing and a tier mix "
+                        f"cannot be read off this run"
+                    )
+
+                problem = _tier_mix_failure(verdicts, f"seed {seed}, n={n}")
+                if problem:
+                    failures.append(problem)
+                else:
+                    by_tier = collections.Counter(
+                        int(v["tier"]) for v in verdicts if v.get("outcome") == "RESOLVED"
+                    )
+                    print(
+                        f"    seed {seed}, n={n:<4} tier1={by_tier.get(1, 0):<4} "
+                        f"tier2={by_tier.get(2, 0):<4} multi-payment rows={multi}"
+                    )
+
+        if failures:
+            raise GateFailure(
+                f"{len(failures)} of {len(TIER_MIX_SEEDS) * len(sizes)} scored run(s) do "
+                f"not exercise both tiers.\n\n  " + "\n  ".join(failures[:4])
+                + (f"\n  ... and {len(failures) - 4} more" if len(failures) > 4 else "")
+            )
+
+        # Last, because it is the most expensive line in the gate and there is no reason to
+        # pay for it when the distribution above is already wrong.
+        print(_gate_12_cap_probe(root))
+
+
 def gate_7_assumptions() -> None:
     """ASSUMPTIONS.md must exist and cover every topic the write-up has to state."""
     print("\ngate 7 -- ASSUMPTIONS.md")
@@ -1086,7 +1418,7 @@ def gate_7_assumptions() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-4b).")
+    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-5).")
     p.add_argument("--skip-slow", action="store_true",
                    help="skip the n=200 sweeps in gates 3, 6, 9, 10 and 11")
     args = p.parse_args(argv)
@@ -1103,6 +1435,7 @@ def main(argv: list[str] | None = None) -> int:
         lambda: gate_9_matcher((60,) if args.skip_slow else (60, 200)),
         lambda: gate_10_mess((60,) if args.skip_slow else (60, 200)),
         lambda: gate_11_planted((60,) if args.skip_slow else (60, 200)),
+        lambda: gate_12_tier_mix((60,) if args.skip_slow else (60, 200)),
     ]
     try:
         for gate in gates:
@@ -1112,7 +1445,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all eleven gates pass -- Phases 1 through 4b are complete")
+    print("all twelve gates pass -- Phases 1 through 5 are complete")
     print("\nClean mode still resolves at 100/100/0 (gate 9), and the first two rows of the")
     print("mess dial are on: --fees wedges gross against net, --settlement-delay moves the")
     print("dates, and the matcher holds 100% correctness with 0 wrong matches while proving")

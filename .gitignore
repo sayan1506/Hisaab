@@ -23,3 +23,33 @@ truth/
 # Matcher and scorer output. Same reasoning: matches.json regenerates from the
 # data plus a matcher, and tools/fixtures.py writes here by default.
 out/
+
+# Windows and OneDrive. Not hypothetical here: this working tree lives under
+# OneDrive/Desktop, Explorer drops desktop.ini into any folder it has been asked
+# to theme, and OneDrive writes sync-conflict copies next to the original rather
+# than refusing the write.
+desktop.ini
+Thumbs.db
+$RECYCLE.BIN/
+
+# Virtualenvs. Nothing here pins an environment, because the project is standard
+# library only -- there is no requirements.txt for these to correspond to.
+.venv/
+venv/
+env/
+
+# Editor and IDE state. Personal to a machine, not to the project.
+.vscode/
+.idea/
+*.swp
+
+# Caches belonging to tools this project does not currently use. Listed ahead of
+# need: the phase that adds a linter or a test runner should not also have to
+# notice its cache in the same diff.
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Log files, at any depth -- no log in this project is a source artifact. The
+# measurement harnesses' own output is already covered by .scratch/ above.
+*.log

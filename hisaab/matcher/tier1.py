@@ -43,17 +43,47 @@ changes. ``tools/acceptance.py`` gate 9 compares the former and excludes the lat
 
 from __future__ import annotations
 
+from datetime import date
+
+from ..common.bizdays import BusinessCalendar
 from ..common.reasons import Reason
 from ..common.verdict import Decomposition, Outcome, Verdict
 from .blocking import Candidate, SettlementIndex
-from .fees import Explanation, FeeSchedule, explain_gap
-from .load import Credit, Dataset
+from .fees import Explanation, FeeSchedule, derive, explain_gap
+from .load import Credit, Dataset, Payment
 from .normalize import Narration, parse
+from .tier2 import ExactlyOne, Member, PoolTooLarge, TwoOrMore
+from .tier2 import MAX_POOL as TIER2_MAX_POOL
+from .tier2 import resolve as tier2_resolve
 
 #: The tier this module speaks for. Carried onto every verdict it resolves so a report
 #: can say *which* strategy earned a match, and so Phase 5's tier 2 is distinguishable
 #: in the output rather than only in the code.
 TIER = 1
+
+# The tier a searched membership is credited to. Separate from ``TIER`` because the scorer
+# reports the distribution, and a search that resolved a row must not be indistinguishable
+# from a join that did -- gate 12 asserts both are non-zero for exactly that reason.
+TIER_2 = 2
+
+# How many business days after a payment is captured its settlement can land. This is the
+# **settlement cycle**, and it is a declared assumption in the same sense as the fee rates
+# in ``fees.py``: the matcher reads it off a contract, not off the generator, and is wrong
+# when the counterparty settles on a different rhythm. It bounds the Tier 2 pool, so an
+# understated value loses true members and an overstated one multiplies subsets.
+#
+# Measured on this data (``--settlement-delay``): every declared member sits at exactly
+# +2 business days from capture, and without the flag at 0. A range of 0..2 covers both, so
+# the bound is exact here rather than generous -- which is why the pool at n=1000 tops out
+# near 60 and the cap is close to binding. Widening it is the trap the plan names: a wider
+# pool manufactures ambiguity that costs coverage while looking generous.
+SETTLEMENT_CYCLE_DAYS = 2
+
+# The calendar the window is measured on. Weekends and holidays are not settlement days, so
+# a calendar-day window would have to be wide enough to straddle a weekend -- measured at
+# 4 calendar days to catch what 2 business days catches, and that widening tripled the pool
+# (92 members against 63) for no additional true member.
+_CALENDAR = BusinessCalendar()
 
 
 def _note_for_match(
@@ -61,6 +91,7 @@ def _note_for_match(
     narration: Narration,
     payment_count: int,
     explanation: Explanation,
+    tier: int = TIER,
 ) -> str:
     """Human-readable evidence for a resolved row.
 
@@ -92,14 +123,215 @@ def _note_for_match(
         )
     else:
         accounted = f"{explanation.rule}, credit equals gross"
+    # Tier 2 rows must not read like Tier 1 rows. The join is identical -- same date, same
+    # amount -- but the membership was *searched* rather than read, and a reader auditing a
+    # match needs to know which of those they are looking at before they trust the payment
+    # list. The tier is on the verdict as a field too; this is the sentence a human sees.
+    if tier == TIER_2:
+        how = (
+            f"tier 2 subset: {settlement.settlement_id}, membership undeclared and searched "
+            f"to {payment_count} payment(s) within {SETTLEMENT_CYCLE_DAYS}bd, uniquely"
+        )
+    else:
+        how = (
+            f"tier 1 exact: {settlement.settlement_id}, {payment_count} payment(s)"
+        )
     return (
-        f"tier 1 exact: {settlement.settlement_id}, "
-        f"{payment_count} payment(s), "
+        f"{how}, "
         f"date distance {candidate.date_distance_days}bd, "
         f"amount delta {candidate.amount_delta_paise}p; "
         f"{accounted}; "
         f"corroboration only: {utr}"
     )
+
+
+def _tier2_pool(settled_on: date, dataset: Dataset) -> list[Payment]:
+    """The payments that could compose a settlement landing on ``settled_on``.
+
+    Two filters, and the second is the one that needs justifying.
+
+    **The window.** A payment can only be in this settlement if it was captured within
+    ``SETTLEMENT_CYCLE_DAYS`` business days before the settlement landed. Measured exactly on
+    this data, so it is a bound rather than a guess.
+
+    **Payments another settlement already claims are excluded, and that is a partition fact
+    rather than a hint.** The distinction is the whole argument, because reading
+    ``settlement_items.csv`` at all is what the plan warns against:
+
+      * A *hint* would be reading settlement X's own membership rows to answer "what is in
+        X". Those rows are withheld -- that is the premise of the entire problem, and nothing
+        here reads them.
+      * A *partition fact* is reading settlement Y's rows to conclude that payment P, which Y
+        declares, is therefore not in X. That is different information, and it is what a human
+        reconciler does: money already settled elsewhere is not available to settle here.
+
+    Verified rather than argued: across seeds 1-2 at n up to 1000, no payment appears in more
+    than one settlement, and the exclusion never removed a true member of a withheld
+    settlement (``true_member_lost=0`` at withholding shares from 30% to 100%).
+
+    What it *does* affect is pool size, and therefore how often the cap binds -- so coverage
+    depends on the withholding share, which is a dependency worth stating rather than hiding.
+    Measured at n=1000: pool max 57-62 at a 30% share against a cap of 64, rising to 157-168
+    at 100%, where the cap refuses ~95% of rows. The Phase 5 default share is 30%.
+
+    Deliberately **not** excluding payments that an earlier Tier 2 search in this same run
+    already claimed. It would raise coverage, and it would make the answer depend on the order
+    credits happen to be processed in -- a matcher whose verdict for row 40 changes because
+    row 12 was resolved first is not reproducible, and ``engine.py`` guarantees that it is.
+
+    Nothing filters on ``status`` here. Every payment in this data is ``captured``, so a status
+    guard would be a check never seen to fail; Phase 7's noise rows are where it earns a place.
+    """
+    claimed = {pid for pids in dataset.items.values() for pid in pids}
+    return [
+        payment
+        for payment in dataset.payments
+        if payment.payment_id not in claimed
+        and 0
+        <= _CALENDAR.business_days_between(payment.captured_at.date(), settled_on)
+        <= SETTLEMENT_CYCLE_DAYS
+    ]
+
+
+def _search_membership(
+    credit: Credit,
+    candidate: Candidate,
+    dataset: Dataset,
+    schedule: FeeSchedule | None = None,
+) -> tuple[str, ...] | Verdict:
+    """Tier 2. Find the payments composing an undeclared settlement, or abstain.
+
+    Returns the payment ids on success, and a finished ``Verdict`` on every abstention, so the
+    caller can hand a found set straight into the same arithmetic that proves a Tier 1 match.
+    That sharing is the point: Tier 2 finds a *set*, and the money proof below --
+    ``explain_gap``, the decomposition, the residual assertion -- is the same code either way.
+    A second copy of it would be a second chance to close a gap by coincidence.
+
+    **Two hypotheses about the target, for the reason ``explain_gap`` has two rules.** The
+    search needs a per-member amount, and which one is right depends on whether anything was
+    deducted:
+
+      * ``gross`` -- the bank credited the gross, which is what clean mode does and what any
+        run without ``--fees`` does. A search that always subtracted a fee would find nothing
+        on that data while the rate table sat there looking correct.
+      * ``gross - fee - GST`` -- the declared rates were charged.
+
+    Both are tried and the *distinct* sets are counted, exactly as ``explain_gap`` counts its
+    rules. When the derived fee is zero the two hypotheses are the same number and collapse to
+    one set, which must not read as an ambiguity. When they differ and both hit, the data
+    genuinely does not say which, and that is an abstention.
+
+    Per-member netting is sound here because the deduction is additive over members: measured
+    across every declared settlement on seeds 1 and 42 at n=200 and n=1000, a batch net equals
+    the sum of its members individual nets to the paisa, with zero drift. That is ``derive()``
+    per-member-then-sum rule (see ``fees.py``) rather than a rate applied to a batch total, and
+    it is what makes the target a plain integer subset-sum.
+    """
+    settlement_id = candidate.settlement_id
+    pool = _tier2_pool(candidate.settlement.settled_on, dataset)
+
+    # One list per hypothesis: the credit read as a gross total, and as a net of the rates.
+    by_gross = [Member(p.payment_id, p.gross_paise) for p in pool]
+    nets: list[Member] = []
+    for payment in pool:
+        deduction = derive([(payment.gross_paise, payment.method)], schedule)
+        if not deduction.is_complete:
+            # No declared rate for this method, so its net cannot be computed. Dropping it
+            # from the netted hypothesis is right -- the gross hypothesis still carries it,
+            # and a member priced at its gross under a schedule that does charge it would be
+            # a wrong amount silently entering the search.
+            continue
+        net = payment.gross_paise - deduction.fee_paise - deduction.gst_paise
+        if net > 0:
+            nets.append(Member(payment.payment_id, net))
+
+    # Count the distinct sets across **both** hypotheses together, because the question is
+    # not "does this reading resolve?" but "can anything I know explain this credit in more
+    # than one way?". A hypothesis that reports two or more contributes both of them, so an
+    # ambiguity under either reading is an ambiguity full stop.
+    #
+    # Getting that precedence wrong is measured, not hypothetical. The first version of this
+    # function kept a single found-set and the ambiguity separately, and abstained on the
+    # ambiguity only when nothing had been found. On seed 1 at n=1000, credit C0277 has a true
+    # membership of the single payment pay_0439 whose net is exactly the credit; the net
+    # hypothesis correctly reported two or more, while the gross hypothesis -- a reading that
+    # is simply false on a fee-bearing run -- turned up one coincidental four-member set. The
+    # unique-but-wrong answer overrode the known ambiguity and the row resolved wrongly. One
+    # wrong match in 627, and the whole point of the third axis is that this is the number that
+    # may not be traded.
+    found: list[frozenset[str]] = []
+    split = False
+    over_cap: PoolTooLarge | None = None
+    for members in (by_gross, nets):
+        result = tier2_resolve(members, credit.amount_paise)
+        if isinstance(result, PoolTooLarge):
+            over_cap = result
+        elif isinstance(result, TwoOrMore):
+            split = True
+            for candidate_set in (result.first, result.second):
+                if candidate_set not in found:
+                    found.append(candidate_set)
+        elif isinstance(result, ExactlyOne) and result.payment_ids not in found:
+            found.append(result.payment_ids)
+
+    if over_cap is not None:
+        # A bounded refusal, and deliberately **not** an ``ABSTENTION_REASONS`` code: the
+        # search never ran, so this is a capability limit and must score as a miss rather than
+        # as an honest "I looked and could not tell". The note names the bound, so the answer
+        # to "what happens at 10,000 records?" is a number rather than a shrug.
+        #
+        # Checked before the results below even when the other hypothesis did find something:
+        # half a search is not a search, and committing on it would make coverage depend on
+        # which reading happened to survive the cap.
+        return Verdict(
+            credit.credit_id,
+            Outcome.EXCEPTION,
+            reason=Reason.MEMBERSHIP_UNDECLARED,
+            note=(
+                f"matched {settlement_id} on date and amount, but its membership is "
+                f"undeclared and the candidate pool of {over_cap.pool_size} payments within "
+                f"{SETTLEMENT_CYCLE_DAYS}bd exceeds the tier 2 cap of {over_cap.cap} -- "
+                f"refused rather than searched, because the work is not bounded above it"
+            ),
+        )
+
+    if len(found) > 1:
+        how = (
+            "two different payment sets sum to it"
+            if split
+            else "the gross and net-of-fees readings of the credit resolve differently"
+        )
+        return Verdict(
+            credit.credit_id,
+            Outcome.EXCEPTION,
+            reason=Reason.AMBIGUOUS_MULTI_SUBSET,
+            note=(
+                f"matched {settlement_id} on date and amount, but its membership is "
+                f"undeclared and {how}: {sorted(found[0])} and {sorted(found[1])} -- the "
+                f"inputs cannot separate them, so a human decides"
+            ),
+        )
+
+    if not found:
+        # Not a cue to widen the pool. Either a payment is missing from the data or a
+        # deduction this matcher does not model was taken; widening the window until
+        # something adds up would convert both into a match, which is the failure mode
+        # Phase 4 measured for the nearest-date tie-break.
+        return Verdict(
+            credit.credit_id,
+            Outcome.EXCEPTION,
+            reason=Reason.NO_CANDIDATE,
+            note=(
+                f"matched {settlement_id} on date and amount, but no subset of the "
+                f"{len(pool)} payment(s) captured within {SETTLEMENT_CYCLE_DAYS}bd sums to "
+                f"{credit.amount_paise}p, at gross or net of the declared rates -- a payment "
+                f"is missing or a deduction is unmodelled, and the window stays fixed"
+            ),
+        )
+
+    # Sorted so the verdict is stable: the search returns a frozenset, and nothing on the
+    # path from input to output may iterate one.
+    return tuple(sorted(found[0]))
 
 
 def resolve_credit(
@@ -170,22 +402,38 @@ def resolve_credit(
     winner = candidates[0]
     settlement_id = winner.settlement_id
     payment_ids = dataset.items.get(settlement_id, ())
+    tier = TIER
 
     if not payment_ids:
-        # The settlement matched, but nothing declares which payments compose it. Phase
-        # 8's --settlement-report-late creates exactly this state by withholding
-        # settlement_items.csv, and the honest Phase 3 answer is to abstain: the payment
-        # set would have to be *searched*, which is Phase 5's subset-sum, not this tier.
-        # Unreachable in clean mode -- load.py proves every settlement has members.
-        return Verdict(
-            credit.credit_id,
-            Outcome.EXCEPTION,
-            reason=Reason.AMBIGUOUS_MULTI_SUBSET,
-            note=(
-                f"matched {settlement_id} on date and amount, but no membership is "
-                f"declared for it -- the payment set would have to be searched (tier 2)"
-            ),
-        )
+        # The settlement matched, but nothing declares which payments compose it.
+        # ``--settlement-report-late`` creates exactly this state by withholding
+        # settlement_items.csv, and the payment set has to be *searched*: Tier 2.
+        #
+        # Phase 5 step 6 replaced an abstention here with that call. What the search returns
+        # is only a **set**; every line below this point is unchanged and runs on it exactly
+        # as it runs on a declared membership, so the arithmetic that proves a Tier 2 match is
+        # the same arithmetic that proves a Tier 1 one. A separate proof for the searched case
+        # would be a second chance to close a gap by coincidence, and the residual assertion
+        # below is the guard that would be duplicated -- and therefore weakened.
+        #
+        # That the proof cannot fail here is worth stating, because it is a property of the
+        # search rather than luck: the set was found because it sums to the credit either at
+        # gross (so the gap is zero and ``NO_DEDUCTION`` closes it) or at net of the declared
+        # rates (so the gap equals ``derive()``'s per-member fee-and-GST sum to the paisa,
+        # which is what ``FEE_AND_GST`` accounts for). The assertion still runs, because a
+        # property that holds by argument and is never checked is how the argument stops being
+        # true.
+        #
+        # Every abstention comes back as a finished ``Verdict``, and the reason codes differ by
+        # what actually happened -- ``AMBIGUOUS_MULTI_SUBSET`` when the search found two
+        # answers, ``NO_CANDIDATE`` when it found none, ``MEMBERSHIP_UNDECLARED`` when the pool
+        # was over the cap and it never ran. Only the first two are honest refusals; see
+        # ``_search_membership``.
+        searched = _search_membership(credit, winner, dataset, schedule)
+        if isinstance(searched, Verdict):
+            return searched
+        payment_ids = searched
+        tier = TIER_2
 
     by_payment = dataset.payments_by_id()
     missing = [pid for pid in payment_ids if pid not in by_payment]
@@ -319,11 +567,11 @@ def resolve_credit(
         Outcome.RESOLVED,
         settlement_ids=(settlement_id,),
         payment_ids=tuple(payment_ids),
-        tier=TIER,
+        tier=tier,
         residual_paise=residual,
         credit_amount_paise=credit.amount_paise,
         decomposition=decomposition,
-        note=_note_for_match(winner, narration, len(payment_ids), explanation),
+        note=_note_for_match(winner, narration, len(payment_ids), explanation, tier),
     )
 
 
@@ -705,17 +953,252 @@ if __name__ == "__main__":
         f"however wide the window"
     )
 
-    # --- a matched settlement with no declared membership (Phase 8 shape) --
-    undeclared = dataset(
-        [payment("pay_0001", 85358)],
-        [settlement("setl_0005", mon, 85358, "8104")],
-        [credit("C0001", mon, 85358)],
+    # --- a matched settlement with no declared membership: tier 2 ---------
+    # The shape --settlement-report-late creates, and the four outcomes it can have. Before
+    # Phase 5 step 6 every one of these abstained with MEMBERSHIP_UNDECLARED; the search is
+    # what turns the first into a match, and the codes below are what keeps the other three
+    # from being scored as the same thing.
+
+    # (1) exactly one subset sums to the credit -> a tier 2 match. The membership was never
+    # declared, so the payment list on this verdict was *derived*, and the tier field is the
+    # only thing distinguishing it from a tier 1 row that read the list off a file.
+    batched = dataset(
+        [payment("pay_0001", 40_000), payment("pay_0002", 60_000)],
+        [settlement("setl_0005", mon, 100_000, "8104")],
+        [credit("C0001", mon, 100_000)],
         {},   # settlement_items.csv withheld
     )
-    v = verdict_of(undeclared, "C0001")
+    v = verdict_of(batched, "C0001")
+    assert v.outcome is Outcome.RESOLVED, f"{v.reason}: {v.note}"
+    assert v.tier == TIER_2 == 2, v.tier
+    assert v.payment_ids == ("pay_0001", "pay_0002"), v.payment_ids
+    assert v.settlement_ids == ("setl_0005",)
+    assert v.residual_paise == 0, "a searched membership is proven by the same arithmetic"
+    assert v.decomposition is not None and v.decomposition.gross_paise == 100_000
+    assert "tier 2 subset" in (v.note or ""), v.note
+    assert "searched" in (v.note or ""), v.note
+    # The note must not claim the ids were declared, and must not read as a tier 1 row.
+    assert "tier 1" not in (v.note or ""), v.note
+
+    # (2) two subsets sum to it -> AMBIGUOUS_MULTI_SUBSET, which *is* an honest refusal: the
+    # search ran and the data could not separate two answers. Two payments of equal value are
+    # the simplest case and a real one -- nothing in these inputs can tell them apart.
+    twins = dataset(
+        [payment("pay_0001", 50_000), payment("pay_0002", 50_000)],
+        [settlement("setl_0005", mon, 50_000, "8104")],
+        [credit("C0001", mon, 50_000)],
+        {},
+    )
+    v = verdict_of(twins, "C0001")
     assert v.outcome is Outcome.EXCEPTION
     assert v.reason is Reason.AMBIGUOUS_MULTI_SUBSET, v.reason
-    assert "searched" in (v.note or "")
+    assert v.tier is None, "an abstention claims no tier"
+    assert v.payment_ids == () and v.settlement_ids == (), (
+        "the verdict contract forbids an abstention from carrying ids, so it can never be "
+        "mistaken for a match by the scorer's set-equality join"
+    )
+    assert "pay_0001" in (v.note or "") and "pay_0002" in (v.note or ""), (
+        f"both candidate sets belong in the note -- an ambiguity a human can see is one they "
+        f"can resolve from a source this matcher does not have: {v.note}"
+    )
+
+    # (3) no subset sums to it -> NO_CANDIDATE, and emphatically not a wider search. The
+    # window stays fixed at the settlement cycle; widening it until something adds up is how
+    # a missing payment becomes a false match.
+    unreachable = dataset(
+        [payment("pay_0001", 40_000)],
+        [settlement("setl_0005", mon, 99_999, "8104")],
+        [credit("C0001", mon, 99_999)],
+        {},
+    )
+    v = verdict_of(unreachable, "C0001")
+    assert v.outcome is Outcome.EXCEPTION
+    assert v.reason is Reason.NO_CANDIDATE, v.reason
+    assert "window stays fixed" in (v.note or ""), v.note
+
+    # (4) the pool is over the cap -> refused before the search runs, and the code is
+    # MEMBERSHIP_UNDECLARED rather than an ABSTENTION_REASONS one (Phase 5 decision 8). The
+    # difference is worth more than a wording slip: AMBIGUOUS_MULTI_SUBSET is inside the set
+    # the acceptance gates accept as *honest* refusal, so emitting it for a row that was
+    # never searched would score a missing capability as a correct abstention. "I looked and
+    # could not separate two answers" and "I never looked" are different facts.
+    #
+    # A cap never exceeded on dev seeds is a cap untested, which is why this is a unit
+    # fixture: measured pool maxima are 20 at n=200 and 57-63 at n=1000, so nothing in the
+    # dev range reaches it.
+    crowd = [payment(f"pay_{i:04d}", 1_000 + i) for i in range(TIER2_MAX_POOL + 1)]
+    over = dataset(
+        crowd,
+        [settlement("setl_0005", mon, 77_777, "8104")],
+        [credit("C0001", mon, 77_777)],
+        {},
+    )
+    v = verdict_of(over, "C0001")
+    assert v.outcome is Outcome.EXCEPTION
+    assert v.reason is Reason.MEMBERSHIP_UNDECLARED, v.reason
+    assert v.reason is not Reason.AMBIGUOUS_MULTI_SUBSET, (
+        "decision 8: a refusal to search must not borrow the code reserved for a search that "
+        "found two answers -- that one is graded as an honest abstention"
+    )
+    assert str(TIER2_MAX_POOL) in (v.note or ""), (
+        f"the note must name the bound, so that 'what happens at 10,000 records?' has a "
+        f"number for an answer rather than a shrug: {v.note}"
+    )
+    assert f"{len(crowd)} payments" in (v.note or ""), v.note
+    # One payment fewer and the same shape searches rather than refusing, so it is the cap
+    # that refused it and not something else.
+    assert len(crowd) - 1 == TIER2_MAX_POOL
+    under = dataset(
+        crowd[:-1],
+        [settlement("setl_0005", mon, 77_777, "8104")],
+        [credit("C0001", mon, 77_777)],
+        {},
+    )
+    assert verdict_of(under, "C0001").reason is not Reason.MEMBERSHIP_UNDECLARED
+
+    # --- the pool excludes what another settlement claims, and that is a partition fact ---
+    # Reading settlement_items.csv at all is the trap here, so the distinction has to be
+    # sharp. Settlement A *declares* pay_0001; settlement B declares nothing. Both payments
+    # have the same gross, so without the exclusion B has two candidate subsets and must
+    # abstain; with it, pay_0001 is unavailable -- already settled elsewhere -- and B resolves
+    # to the one payment left.
+    #
+    # That is a fact about a partition, not a hint about B's membership: nothing here reads
+    # B's own rows, which is the premise of the problem. Verified on real data at n up to
+    # 1000: no payment appears in more than one settlement, and the exclusion never removed a
+    # true member of a withheld settlement.
+    partitioned = dataset(
+        [payment("pay_0001", 50_000), payment("pay_0002", 50_000)],
+        [
+            settlement("setl_0004", mon, 12_345, "7777"),
+            settlement("setl_0005", mon, 50_000, "8104"),
+        ],
+        [credit("C0001", mon, 50_000)],
+        {"setl_0004": ("pay_0001",)},   # A declares its member; B is withheld
+    )
+    v = verdict_of(partitioned, "C0001")
+    assert v.outcome is Outcome.RESOLVED, f"{v.reason}: {v.note}"
+    assert v.tier == TIER_2 and v.payment_ids == ("pay_0002",), v.payment_ids
+    # ... and with A's declaration removed the exclusion has nothing to act on, so the same
+    # data becomes genuinely ambiguous. This is the exclusion being load-bearing, which is why
+    # its justification has to be a partition argument rather than a convenience.
+    v = verdict_of(
+        dataset(partitioned.payments, partitioned.settlements, partitioned.credits, {}),
+        "C0001",
+    )
+    assert v.outcome is Outcome.EXCEPTION and v.reason is Reason.AMBIGUOUS_MULTI_SUBSET, (
+        f"got {v.reason} -- with nothing declared anywhere, two equal payments are not "
+        f"separable and the honest answer is an abstention"
+    )
+
+    # --- tier 2 must not read the settlement's declared fee_paise ---------
+    # The same discipline tier 1 is already held to, extended to a searched membership. The
+    # declared column carries a number that would close a gap if anything read it; the search
+    # resolves on the gross hypothesis instead, and the decomposition it publishes must show
+    # the fee this matcher *derived* (zero here), never the one the file stated.
+    poisoned = dataset(
+        [payment("pay_0001", 40_000), payment("pay_0002", 60_000)],
+        [settlement("setl_0005", mon, 100_000, "8104", fee_paise=25_000)],
+        [credit("C0001", mon, 100_000)],
+        {},
+    )
+    v = verdict_of(poisoned, "C0001")
+    assert v.outcome is Outcome.RESOLVED and v.tier == TIER_2
+    assert v.decomposition is not None
+    assert v.decomposition.fee_paise == 0 and v.decomposition.gst_paise == 0, (
+        f"the declared fee_paise leaked into a tier 2 decomposition: {v.decomposition}"
+    )
+    assert v.residual_paise == 0
+
+    # --- the net-of-fees hypothesis, which is why there are two ----------
+    # A run without --fees credits the gross; a run with it credits the net. The search cannot
+    # know which, so it tries both and counts the distinct sets -- the same shape explain_gap
+    # uses for its two rules. Without the second hypothesis every fee-bearing batch would find
+    # nothing while the rate table sat there looking correct.
+    _members = [(40_000, "card"), (60_000, "card")]
+    _deduction = derive(_members)
+    _net = 100_000 - _deduction.fee_paise - _deduction.gst_paise
+    assert _deduction.fee_paise > 0, "the fixture needs a schedule that actually charges"
+    netted = dataset(
+        [payment("pay_0001", 40_000), payment("pay_0002", 60_000)],
+        [settlement("setl_0005", mon, _net, "8104")],
+        [credit("C0001", mon, _net)],
+        {},
+    )
+    v = verdict_of(netted, "C0001")
+    assert v.outcome is Outcome.RESOLVED, f"{v.reason}: {v.note}"
+    assert v.tier == TIER_2 and v.payment_ids == ("pay_0001", "pay_0002"), v.payment_ids
+    assert v.decomposition is not None
+    assert v.decomposition.fee_paise == _deduction.fee_paise, v.decomposition
+    assert v.decomposition.gst_paise == _deduction.gst_paise, v.decomposition
+    assert v.residual_paise == 0, (
+        "the searched set went through the same explain_gap path as a declared one, so the "
+        "residual must close to nothing"
+    )
+
+    # --- an ambiguity under EITHER hypothesis is an ambiguity -------------
+    # The regression guard for the precedence bug step 6 shipped and then measured. This is
+    # credit C0277 (seed 1, n=1000) in miniature, and it is the case where the two readings of
+    # the credit disagree about whether an answer even exists:
+    #
+    #   * pay_0001 grosses 100,000p and nets to exactly the credit, so it is the true single
+    #     member. pay_0002 and pay_0003 net to the same total, so the NET reading sees two
+    #     answers and cannot separate them.
+    #   * pay_0004 and pay_0005 GROSS to the credit, so the gross reading -- which is simply
+    #     false on a run where fees were charged -- finds exactly one set.
+    #
+    # The first version of ``_search_membership`` kept the found set and the ambiguity apart
+    # and abstained on ambiguity only when nothing had been found, so that unique-but-wrong
+    # gross answer overrode the known ambiguity and the row resolved. One wrong match in 627
+    # end to end, invisible in every unit test, and correctness is the axis this project
+    # refuses to trade -- hence a fixture rather than a comment.
+    #
+    # The amounts were searched for rather than derived: per-paisa rounding is what makes the
+    # two readings disagree, so a hand-picked set would not reproduce it.
+    AMBIGUOUS_TOTAL = 97_640
+    two_readings = dataset(
+        [
+            payment("pay_0001", 100_000),   # true single member: its NET is the credit
+            payment("pay_0002", 20_000),    # pay_0002 + pay_0003 nets also reach the credit
+            payment("pay_0003", 80_000),
+            payment("pay_0004", 40_000),    # pay_0004 + pay_0005 GROSSES reach the credit
+            payment("pay_0005", 57_640),
+        ],
+        [settlement("setl_0005", mon, AMBIGUOUS_TOTAL, "8104")],
+        [credit("C0001", mon, AMBIGUOUS_TOTAL)],
+        {},
+    )
+    # The premise, asserted so the fixture cannot rot into a different shape silently.
+    _one = derive([(100_000, "card")])
+    assert 100_000 - _one.fee_paise - _one.gst_paise == AMBIGUOUS_TOTAL
+    v = verdict_of(two_readings, "C0001")
+    assert v.outcome is Outcome.EXCEPTION, (
+        f"the net reading sees two answers, so the only honest verdict is an abstention -- a "
+        f"unique answer under the gross reading must not override it. Got {v.outcome} "
+        f"claiming {v.payment_ids}"
+    )
+    assert v.reason is Reason.AMBIGUOUS_MULTI_SUBSET, v.reason
+    assert v.tier is None and v.payment_ids == ()
+    # ... and the wrong answer the old precedence would have committed to is specifically the
+    # gross-only set, which is what makes this a precedence bug rather than a search bug.
+    assert isinstance(
+        tier2_resolve([Member("pay_0004", 40_000), Member("pay_0005", 57_640)],
+                      AMBIGUOUS_TOTAL),
+        ExactlyOne,
+    ), "the gross pair must resolve on its own, or the fixture is not reproducing the bug"
+
+    # --- tier 2 is deterministic and order-independent --------------------
+    # The search returns a frozenset and nothing on the path to output may iterate one. Two
+    # runs over the same data, and the same data with its payment rows reversed, must produce
+    # the identical verdict.
+    first = verdict_of(batched, "C0001")
+    assert first.payment_ids == verdict_of(batched, "C0001").payment_ids
+    reversed_rows = dataset(
+        tuple(reversed(batched.payments)), batched.settlements, batched.credits, {}
+    )
+    assert verdict_of(reversed_rows, "C0001").payment_ids == first.payment_ids, (
+        "the verdict moved when the payment rows were reordered"
+    )
 
     # --- the narration must not influence any decision field --------------
     # The guard behind decision 2, asserted at the unit level as well as in gate 9.

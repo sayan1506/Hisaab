@@ -294,6 +294,14 @@ class Story:
     settlements_without_credit: list[str] = field(default_factory=list)
     non_gateway_credit_ids: list[str] = field(default_factory=list)
 
+    #: Settlements whose rows ``emit`` omits from ``settlement_items.csv``
+    #: (``--settlement-report-late``). **The membership itself is not removed** -- every
+    #: ``Settlement`` here still lists its payments and truth still publishes them. What is
+    #: withheld is the *declaration a judge's files carry*, which is what forces the matcher
+    #: to search for a payment set instead of reading it off the settlement report. Keeping
+    #: the two apart is why every in-memory invariant still runs unchanged under the flag.
+    membership_withheld: list[str] = field(default_factory=list)
+
     def counts(self) -> dict[str, int]:
         return {
             "payments": len(self.payments),

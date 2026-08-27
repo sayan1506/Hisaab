@@ -26,7 +26,7 @@ from dataclasses import fields
 from pathlib import Path
 
 from ..common.money import fmt
-from .config import GenConfig, MessFlags
+from .config import DEFAULT_N, DEFAULT_N_BATCHED, GenConfig, MessFlags
 from .emit import DETERMINISTIC_FILES, emit
 from .invariants import InvariantError, check_story
 from .story import build
@@ -89,8 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--seed", type=int, default=42, help="master seed (default: 42)")
     p.add_argument(
-        "--n", type=int, default=60,
-        help="record count; the track's floor is 50 (default: 60)",
+        # ``None`` rather than a number, so "the user asked for 60" and "nobody said"
+        # stay distinguishable. --batching may only raise a *default*: an explicit
+        # --n 60 is a request and is honoured under every flag.
+        "--n", type=int, default=None, metavar="N",
+        help=(
+            f"payment count; the track's floor is 50 *bank rows* (default: {DEFAULT_N}, "
+            f"or {DEFAULT_N_BATCHED} with --batching, which settles ~1.6 payments per row)"
+        ),
     )
     p.add_argument(
         "--month", type=_month, default=(2026, 8), metavar="YYYY-MM",
@@ -183,9 +189,23 @@ def config_from_args(args: argparse.Namespace) -> GenConfig:
         if args.all_mess
         else MessFlags(**{n: getattr(args, n) for n in flag_names})
     )
+    # Decision 3: --batching raises the default ``n``, because ``n`` counts payments while
+    # the track's 50-record floor is counted in *bank rows*, and batching makes those two
+    # different numbers. At mean 1.60 payments per settlement, n=60 yields ~37 bank rows --
+    # under the floor -- and n=200 yields ~125. Measured on every candidate distribution
+    # (.plan/phase5.md section 1(d)).
+    #
+    # Resolved here rather than inside GenConfig, which is the tempting place for it: a
+    # config that rewrote an explicit ``n`` would change what every caller passing one was
+    # asking for. Gate 12 scores n=60 under --batching deliberately, and story.py asserts
+    # exact payment counts at a given ``n``; both would silently become runs of 200.
+    n = args.n
+    if n is None:
+        n = DEFAULT_N_BATCHED if flags.batching else DEFAULT_N
+
     return GenConfig(
         seed=args.seed,
-        n=args.n,
+        n=n,
         year=year,
         month=month,
         out_dir=args.out,

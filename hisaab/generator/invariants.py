@@ -146,6 +146,40 @@ MAX_WITHIN_BLOCK_ALIGNMENT_RATE = 0.60
 #: (at n=12 most dates hold a single record, and 2/2 = 100% is pure chance).
 MIN_BLOCK_POPULATION_FOR_RATE = 20
 
+#: I14: what fraction of multi-member batches may be a *consecutive* run of payment ids.
+#:
+#: Same shape as I8b above, and for the same reason -- a rate against an identity baseline,
+#: with a population floor below which the rate means nothing. Payments are capture-sorted and
+#: numbered in that order, so one settlement date's payments are a contiguous id run. Slicing
+#: that run in place would make every batch a set of consecutive ids, and once
+#: ``--settlement-report-late`` withholds membership a searcher could enumerate contiguous runs
+#: (O(k^2)) instead of subsets (O(2^k)) and resolve the file without ever performing a subset
+#: search. ``story._group_into_batches`` shuffles each date's pool before slicing to prevent
+#: exactly that, and this is the check that says the shuffle is still there.
+#:
+#: **Measured, seeds 1-5 plus 42, multi-member batches only** (a singleton is trivially a run
+#: of one and carries no information, so it is excluded from the denominator):
+#:
+#:   n=60    10-15 batches   42.9%-80.0%   <- below the floor, deliberately not asserted
+#:   n=200   45-51 batches    8.9%-19.6%
+#:   n=1000 234-255 batches    1.6%- 4.5%
+#:
+#: Dropping the shuffle scores **100%**. The rate falls as dates grow more populated, which is
+#: the birthday-problem baseline: a 2-batch drawn from a date holding three payments is
+#: consecutive by chance a third of the time, and driving that to zero would require
+#: *anti*-correlating membership against id order, which is itself a signal.
+#:
+#: So n=60 is left unasserted rather than given a loose ceiling. A 60% ceiling would pass
+#: seed 2's honest 80% and would also pass a genuine regression at the same size -- a check
+#: that cannot distinguish those is decoration, and the ceiling that would fit n=60 is above
+#: the identity baseline this check exists to catch. n=200 is the default under ``--batching``
+#: (decision 3), so the check is live on the configuration a judge runs.
+MAX_CONSECUTIVE_ID_BATCH_RATE = 0.60
+
+#: Below this many multi-member batches the rate above is not asserted. Set to clear n=60's
+#: 10-15 and admit n=200's 45-51.
+MIN_MULTI_BATCH_POPULATION_FOR_RATE = 40
+
 
 class InvariantError(AssertionError):
     """A generated story or written file violated a structural guarantee."""
@@ -378,6 +412,39 @@ def check_within_block_alignment(
             f"amount, which lets a zip matcher score without doing any work",
         )
     return aligned, population
+
+
+def check_batch_adjacency(multi_batches: list[list[int]]) -> tuple[int, int]:
+    """I14 — batch membership carries no payment-id adjacency information.
+
+    ``multi_batches`` is one sorted list of payment *numbers* per settlement holding more than
+    one payment. Singletons are excluded by the caller: a batch of one is trivially a run of
+    one and says nothing. Returns ``(consecutive, population)`` for reporting.
+
+    Factored out like ``check_within_block_alignment`` and for the same two reasons: the
+    on-disk pass in ``tools/verify_output.py`` re-runs it against ``settlement_items.csv``, and
+    a check that can only be reached by constructing a whole broken story is a check nobody
+    can prove fires. See ``MAX_CONSECUTIVE_ID_BATCH_RATE`` for the measurement.
+    """
+    if len(multi_batches) < MIN_MULTI_BATCH_POPULATION_FOR_RATE:
+        return (
+            sum(1 for b in multi_batches if b == list(range(b[0], b[0] + len(b)))),
+            len(multi_batches),
+        )
+    consecutive = sum(1 for b in multi_batches if b == list(range(b[0], b[0] + len(b))))
+    rate = consecutive / len(multi_batches)
+    _require(
+        rate <= MAX_CONSECUTIVE_ID_BATCH_RATE,
+        "I14",
+        f"{rate:.0%} of multi-member batches ({consecutive}/{len(multi_batches)}) are a "
+        f"consecutive run of payment ids, above the {MAX_CONSECUTIVE_ID_BATCH_RATE:.0%} "
+        f"ceiling -- batches appear to be sliced out of capture order without shuffling the "
+        f"date's pool first. Payments are numbered in capture order, so consecutive-id "
+        f"batches let a searcher enumerate contiguous runs (O(k^2)) instead of subsets "
+        f"(O(2^k)) and resolve withheld membership without ever performing a subset search. "
+        f"See story._group_into_batches.",
+    )
+    return consecutive, len(multi_batches)
 
 
 # ---------------------------------------------------------------------------
@@ -674,11 +741,75 @@ def check_story(
             f"could in fact have resolved.",
         )
 
-    # I8a — the ID numbering carries no information
-    pay_index = {p.payment_id: i for i, p in enumerate(payments)}
+    # I13 — the successor to the cardinality coverage --batching takes away.
+    #
+    # ``I3.cardinality`` asserts ``payments == settlements == credits == cfg.n`` and
+    # ``batching`` genuinely breaks it: n payments become ~n/1.6 settlements and that many
+    # credits. It is listed in ``SUSPENDED_BY`` and the run announces the skip -- but this is
+    # the first suspension to remove *load-bearing* coverage, so the announcement is a bill
+    # rather than a permission.
+    #
+    # **What the bill actually comes to was measured, not assumed, and it is smaller here than
+    # .plan/phase5.md predicted.** Trap 8 says "with it off, a grouping loop that drops a
+    # payment passes everything." In this module it does not: probed by deliberate violation,
+    # dropping one member from a batch raises I2 ``payments never settled``, a credit dropped
+    # raises I2 ``settlements never credited``, and a credit citing two settlements raises I2
+    # ``settlements in more than one credit``. Those clauses are unconditional and dominate
+    # every partition error reachable through a whole story -- ``Settlement.__post_init__``
+    # forbids a repeated member and ``Credit.__post_init__`` forbids citing none, so by
+    # pigeonhole a member-count or settlement/credit mismatch always surfaces as an uncited or
+    # twice-cited id first. Writing those as I13 clauses too would have shipped three checks
+    # that can never fire, which this module's own self-check calls decoration.
+    #
+    # What is genuinely lost is exactly one thing: the comparison against ``cfg.n``. Nothing
+    # else in this module relates the record count to the config, so ``--batching --n 200``
+    # emitting 199 payments would pass everything. Unconditional, under every flag --
+    # ``--unsettled`` changes which payments get *settled*, never how many were captured.
+    #
+    # The rest of the bill is real but falls due in a different file. ``tools/verify_output.py``
+    # gates its "payments never settled" check on ``truth.clean_mode``, which is false under
+    # *any* flag -- so the on-disk pass, the one that sees only what a judge sees, does lose
+    # the partition check under ``--batching``. That is trap 8's worry, correctly located, and
+    # it is fixed there rather than here.
+    _require(
+        len(payments) == cfg.n,
+        "I13",
+        f"--n asked for {cfg.n} payments but the story holds {len(payments)}. Batching "
+        f"changes how payments are grouped, never how many exist -- so this is a draw-loop "
+        f"or grouping bug, and every per-record rate computed from it would be scaled wrong.",
+    )
+
+    # Payment index by id, used by I14 below and I8a after it. Position in ``payments`` is
+    # capture order, which is also id order -- that identity is what I14 is about.
+    pay_number = {p.payment_id: i for i, p in enumerate(payments)}
+
+    # I14 — batch membership carries no id-adjacency information.
+    #
+    # The successor to nothing: this guards a property ``--batching`` *creates*. See
+    # ``MAX_CONSECUTIVE_ID_BATCH_RATE`` for the measurement and for why n=60 is left
+    # unasserted rather than given a ceiling loose enough to pass an honest 80%.
+    #
+    # Runs unconditionally, not only under the flag. Without ``--batching`` every settlement
+    # holds one payment, the population is 0 and the check is satisfied -- which is the
+    # correct answer, and it means a future flag that starts grouping payments without
+    # announcing it does not escape this.
+    multi_batches = [
+        sorted(pay_number[pid] for pid in s.payment_ids)
+        for s in settlements
+        if len(s.payment_ids) > 1
+    ]
+    consecutive, batch_population = check_batch_adjacency(multi_batches)
+
+    # I8a — the ID numbering carries no information.
+    #
+    # ``payment_ids[0]`` is the lowest-numbered member, which is the whole member list when
+    # nothing is batched. Under ``--batching`` there are fewer settlements than payments so the
+    # two index spaces only overlap on the low range, but the property under test is unchanged:
+    # ``rng_settlements.shuffle(groups)`` is a genuine shuffle either way, so a fixed point is
+    # still a coincidence and identity ordering still scores ~n.
     setl_index = {s.settlement_id: i for i, s in enumerate(settlements)}
     numbering_fixed = sum(
-        1 for s in settlements if pay_index[s.payment_ids[0]] == setl_index[s.settlement_id]
+        1 for s in settlements if pay_number[s.payment_ids[0]] == setl_index[s.settlement_id]
     )
     _require(
         numbering_fixed <= MAX_NUMBERING_FIXED_POINTS,
@@ -718,6 +849,10 @@ def check_story(
         "date_blocks": len(p_by_date),
         "numbering_fixed_points": numbering_fixed,
         "within_block_aligned": f"{aligned}/{population}",
+        # Reported even when the population is below the floor that makes the rate
+        # assertable: the numbers travel into run_manifest.json, and "0/0" is how a reader
+        # sees that a run did no batching at all.
+        "consecutive_id_batches": f"{consecutive}/{batch_population}",
         "gross_paise_total": story.total_gross_paise(),
         # Which conditional checks did not run, and the flag that excused each. Empty in
         # clean mode. This travels into run_manifest.json beside "status": "pass", which
@@ -821,24 +956,33 @@ if __name__ == "__main__":
     # a whole story without tripping an earlier assertion first -- a GST error large
     # enough to exceed its fee also breaks the subtraction and the totals -- so the unit
     # probe is the only way to know the specific assertion fires rather than a neighbour.
-    def must_raise(what: str, fn) -> None:
+    def must_raise(code: str, what: str, fn) -> None:
+        """Probe one check function directly, asserting *which* invariant fires.
+
+        ``code`` is a parameter rather than a hard-coded ``"I4"`` because Phase 5's I14 uses
+        this helper too, and a probe that accepts any InvariantError cannot tell the check it
+        is testing from a neighbour firing first -- which is the whole reason these unit
+        probes exist alongside the whole-story ones.
+        """
         try:
             fn()
         except InvariantError as e:
-            assert str(e).startswith("I4"), f"{what}: expected I4, got: {e}"
-            fired.append("I4")
+            assert str(e).startswith(code), f"{what}: expected {code}, got: {e}"
+            fired.append(code)
         else:
             raise AssertionError(f"{what} did not fire")
 
     # GST charged on the gross instead of on the fee: 18% of a ₹10,000 gross is nine times
     # a 2% fee, so it lands above the fee it is supposed to sit on.
     must_raise(
+        "I4",
         "gst on the gross",
         lambda: check_settlement_arithmetic(
             [("setl_x", 1_000_000, 1_000_000 - 20_000 - 180_000, 20_000, 180_000, 0)]
         ),
     )
     must_raise(
+        "I4",
         "net off by a paisa",
         lambda: check_settlement_arithmetic(
             [("setl_x", 1_000_000, 976_401, 20_000, 3_600, 0)]
@@ -850,10 +994,12 @@ if __name__ == "__main__":
     check_settlement_arithmetic([("setl_x", 1_000_000, 1_000_000, 0, 0, 0)])
 
     must_raise(
+        "I4",
         "wedge is not the deductions",
         lambda: check_totals(1_000_000, 976_400, 976_400, [20_000, 3_500, 0], fees_on=True),
     )
     must_raise(
+        "I4",
         "settled but never credited",
         lambda: check_totals(1_000_000, 976_400, 976_399, [20_000, 3_600, 0], fees_on=True),
     )
@@ -1021,6 +1167,115 @@ if __name__ == "__main__":
         )
     ]
     must_fail("I8b", dataclasses.replace(story, credits=time_ordered))
+
+    # --- Phase 5 step 1: batching, and the checks that replace what it suspends ---
+    bat_cfg = GenConfig(seed=42, n=200, flags=MessFlags(batching=True))
+    bat = build(bat_cfg)
+    bat_rep = check_story(bat, bat_cfg)
+    # The suspension is announced, and it is the *only* one --batching earns. In particular
+    # I3.unique_date_amount stays strict (step 4): the batched-net nudge in story.py is what
+    # keeps it satisfiable rather than a relaxation of the check.
+    assert bat_rep["checks_skipped"] == {"I3.cardinality": ["batching"]}, bat_rep
+    assert len(bat.settlements) < len(bat.payments), "--batching batched nothing"
+    assert len(bat.settlements) == len(bat.credits), "one settlement, one credit"
+    # Decision 2: both tiers must have rows to find, or the tier gate reads a swap.
+    _sizes = [len(s.payment_ids) for s in bat.settlements]
+    assert 1 in _sizes and max(_sizes) > 1, f"a mix of batch sizes is required, got {set(_sizes)}"
+    assert sum(_sizes) == bat_cfg.n, "the member lists are not a partition of payments.csv"
+
+    # I13 — the successor to the suspended cardinality check. Probed by lying about --n,
+    # because that is the one thing I3 asserted that nothing else in this module covers:
+    # measurement showed I2's unconditional clauses already catch a dropped or duplicated
+    # member (see the comment at I13 itself), so a payment-count check is all that was owed.
+    must_fail("I13", bat, GenConfig(seed=42, n=201, flags=MessFlags(batching=True)))
+
+    # I14 — batch membership must not be a consecutive run of payment ids. Probed on the
+    # standalone function rather than through a story: constructing a story whose batches are
+    # all consecutive means reimplementing the grouping loop inside the test, which would
+    # assert that the test agrees with itself. Population is above the floor on purpose --
+    # 40 batches is the point at which the rate becomes assertable.
+    must_raise(
+        "I14",
+        "consecutive-id batches",
+        lambda: check_batch_adjacency([[i, i + 1] for i in range(0, 120, 2)]),
+    )
+    # ... and the honest case passes, or the probe above proves nothing. Interleaved pairs at
+    # the same population: none is a consecutive run.
+    _ok = check_batch_adjacency([[i, i + 60] for i in range(60)])
+    assert _ok == (0, 60), _ok
+    # Below the floor nothing is asserted, however bad the rate looks -- which is why n=60 is
+    # not covered by this check. 100% of 10 batches must not raise.
+    assert check_batch_adjacency([[i, i + 1] for i in range(0, 20, 2)]) == (10, 10)
+    # Real batched data sits far below the ceiling: measured 8.9%-19.6% at n=200 against 100%
+    # for capture-order slicing. Asserted as a *number* rather than trusting the ceiling,
+    # because a ceiling nothing approaches is indistinguishable from a check that cannot fail.
+    _c, _pop = (int(x) for x in str(bat_rep["consecutive_id_batches"]).split("/"))
+    assert _pop >= MIN_MULTI_BATCH_POPULATION_FOR_RATE, (
+        f"only {_pop} multi-member batches at n=200 -- below the floor, so I14 did not "
+        f"actually assert anything on this run"
+    )
+    assert _c / _pop < 0.30, f"consecutive-id rate {_c}/{_pop} is far above the measured 8.9-19.6%"
+
+    # I14 must also *fire* end to end, not only as a unit probe -- the regression it guards
+    # is someone slicing a date's pool without shuffling it first, and that arrives as a whole
+    # story rather than as a call into one function.
+    #
+    # **Regrouped within each settlement date, not across the file.** The first version of this
+    # probe handed settlements the next k payments in global id order, and I11 caught it before
+    # I14 could: reassigning members across dates moves a settlement's date away from its
+    # members' capture dates, which is exactly what I11 asserts. So the probe reproduces the
+    # bug faithfully -- consecutive ids *within* the date, which is what an unshuffled slice
+    # actually produces -- and every member keeps the settlement date it had.
+    _p_by_date: dict[date, list[str]] = defaultdict(list)
+    for _p in bat.payments:  # capture order, which is id order
+        _p_by_date[_p.business_date].append(_p.payment_id)
+    _s_by_date: dict[date, list[object]] = defaultdict(list)
+    for _s in sorted(bat.settlements, key=lambda s: s.settlement_id):
+        _s_by_date[_s.settled_on].append(_s)
+
+    _gross_of = {p.payment_id: p.gross_paise for p in bat.payments}
+    _regrouped: dict[str, list[str]] = {}
+    for _when, _setls in _s_by_date.items():
+        _pool = _p_by_date[_when]
+        # Batches never span a settlement date, so a date's settlements hold exactly that
+        # date's payments. Asserted, because if it were false the probe would be silently
+        # testing something else.
+        assert sum(len(s.payment_ids) for s in _setls) == len(_pool), (
+            f"{_when}: batches do not partition their date"
+        )
+        _cur = 0
+        for _s in _setls:
+            _k = len(_s.payment_ids)
+            _regrouped[_s.settlement_id] = _pool[_cur : _cur + _k]
+            _cur += _k
+
+    # The nets have to be rewritten to match the new member lists, or I4 fires first and the
+    # probe tests the wrong assertion.
+    _contig_settlements = [
+        dataclasses.replace(
+            _s,
+            payment_ids=_regrouped[_s.settlement_id],
+            net_paise=sum(_gross_of[pid] for pid in _regrouped[_s.settlement_id]),
+        )
+        for _s in bat.settlements
+    ]
+    _contig_by_id = {s.settlement_id: s for s in _contig_settlements}
+    _contig_credits = [
+        dataclasses.replace(
+            c,
+            amount_paise=_contig_by_id[c.settlement_ids[0]].net_paise,
+            payment_ids=list(_contig_by_id[c.settlement_ids[0]].payment_ids),
+            decomposition=Decomposition(
+                gross_paise=_contig_by_id[c.settlement_ids[0]].net_paise
+            ),
+        )
+        for c in bat.credits
+    ]
+    must_fail(
+        "I14",
+        dataclasses.replace(bat, settlements=_contig_settlements, credits=_contig_credits),
+        bat_cfg,
+    )
 
     # Counted, not written down: the literal "6" here went stale the moment Phase 4
     # added a seventh case, and a self-check that misreports its own coverage is a

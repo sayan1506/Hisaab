@@ -36,8 +36,10 @@ from .load import Dataset
 from .tier1 import TIER, resolve_credit
 
 #: Bumped when the matching *behaviour* changes, so a verdict file names the engine that
-#: produced it. Tier 2 arriving in Phase 5 makes this ``tier1+2@0.5.0``.
-MATCHER_NAME = "tier1@0.3.0"
+#: produced it. Phase 5 step 6 added tier 2, which is a behaviour change of exactly the kind
+#: this string exists for: the same input can now RESOLVE where it previously abstained, so a
+#: verdict file from before and after are not comparable and must not silently look it.
+MATCHER_NAME = "tier1+2@0.5.0"
 
 #: The fields that constitute a *decision*. ``note`` is deliberately absent: it carries
 #: the UTR corroboration, so blanking every narration legitimately changes it while

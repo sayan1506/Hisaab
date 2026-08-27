@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import random
+from collections import defaultdict
 from datetime import date, datetime
 
 from ..common import ids
@@ -38,6 +39,8 @@ from ..common.reasons import Reason
 from .config import (
     AMOUNT_BANDS,
     BANK_CHANNELS,
+    BATCH_SIZE_WEIGHTS,
+    LATE_REPORT_SHARE,
     CAPTURE_HOUR_MAX,
     CAPTURE_HOUR_MIN,
     COUNTERPARTY,
@@ -190,6 +193,94 @@ def _unique_amount(taken: set[tuple[date, int]], day: date, amount: int) -> int:
     return amount
 
 
+def _batch_net(
+    cfg: GenConfig, grosses: list[int], methods: list[str], members: list[int]
+) -> int:
+    """A batch's ``net_paise``: per member, per method, each rounded at the paisa, summed.
+
+    The one place this arithmetic is spelled, so the uniqueness nudge below and the
+    ``Settlement`` built in ``build`` cannot disagree about what a batch nets. Decision 7 --
+    and see ``matcher/fees.derive``, which does the same sum independently and is what makes
+    the residual a test rather than a tautology.
+    """
+    total = 0
+    for i in members:
+        fee, gst = _deductions(cfg, grosses[i], methods[i])
+        total += grosses[i] - fee - gst
+    return total
+
+
+def _make_nets_unique(
+    cfg: GenConfig,
+    grosses: list[int],
+    methods: list[str],
+    capture_dates: list[date],
+    settled_on_of: list[date],
+    groups: list[list[int]],
+    taken_gross: set[tuple[date, int]],
+) -> int:
+    """Nudge grosses until no two settlements share a ``(settled_on, net)``. Returns nudges.
+
+    **``_unique_amount``'s guarantee does not survive summation, and this restores it.** That
+    function keeps every ``(capture_date, gross)`` distinct, which is what makes a 1:1 credit
+    resolvable from date and amount at all. A batch's net is a *sum* of member nets, and no
+    invariant compared that derived value to anything -- so two settlements on one date can
+    land on one net. ASSUMPTIONS.md #24c named batching as the channel that would widen this
+    and it does.
+
+    **Measured before this existed, seeds 1-5 plus 42 at n = 60/200/1000:** zero colliding
+    pairs at n=60 and n=200, and **one pair on 3 of 6 seeds at n=1000** (seed 3 collided at
+    454,300p on 2026-08-21: one payment against a two-payment batch summing to the same net).
+    Step 4 of ``.plan/phase5.md`` pre-committed the response before that number was visible,
+    and this is it. The alternative on the table -- relaxing ``I3.unique_date_amount`` to D6's
+    "mark every colliding pair unresolvable" -- was refused in advance and stays refused: at
+    n <= 1000 a collision is a generator artifact rather than honest ambiguity, and absorbing
+    it would remove the tripwire exactly where it is load-bearing. The genuinely
+    indistinguishable case has its own flag, ``--dup-amounts``, which plants it deliberately.
+
+    **Called only under ``--batching``.** The 1:1 path is left byte-for-byte alone, so every
+    number ASSUMPTIONS.md #24a/#24b records (collision-free to n=2000, first natural collision
+    at n=4000) still describes the code that produced it. A nudge running on every path would
+    have silently changed what those measurements mean.
+
+    Consumes **no randomness**, for ``_unique_amount``'s reason: a redraw would make the draw
+    count depend on whether a collision happened, which is trap 4 inside a stream.
+
+    Both uniqueness sets are maintained together. Bumping a gross to dodge a net collision can
+    walk onto another payment's ``(capture_date, gross)`` on the same day -- trading a batched
+    collision for the 1:1 collision ``_unique_amount`` exists to prevent -- so every bump skips
+    values that key is already holding.
+
+    Iterates ``groups`` in the order given, which ``_group_into_batches`` builds by sorted
+    date: no set or dict iteration order reaches the choice of which gross moves.
+    """
+    taken_net: set[tuple[date, int]] = set()
+    nudges = 0
+    for members in groups:
+        when = settled_on_of[members[0]]
+        # The lowest member index, so the victim is a function of the data alone.
+        victim = members[0]
+        while (when, _batch_net(cfg, grosses, methods, members)) in taken_net:
+            nudges += 1
+            assert nudges < 100 * max(len(groups), 1), (
+                f"runaway nudging around {when} -- the amount space is saturated, which at "
+                f"this project's sizes means a generator change rather than pressure"
+            )
+            day = capture_dates[victim]
+            taken_gross.discard((day, grosses[victim]))
+            # One paisa at a time, skipping any value that would collide on
+            # (capture_date, gross). Under --fees a 1p bump need not move the *net* at all
+            # (the fee absorbs it at some magnitudes), which is why the loop above re-tests
+            # the net rather than assuming one bump was enough.
+            while True:
+                grosses[victim] += 1
+                if (day, grosses[victim]) not in taken_gross:
+                    break
+            taken_gross.add((day, grosses[victim]))
+        taken_net.add((when, _batch_net(cfg, grosses, methods, members)))
+    return nudges
+
+
 def _plant_dup_pairs(
     rng: random.Random, drafts: list[tuple[datetime, int, str]], pairs: int
 ) -> set[tuple[date, int]]:
@@ -237,6 +328,115 @@ def _plant_dup_pairs(
     return planted
 
 
+def _draw_batch_size(rng: random.Random, remaining: int) -> int:
+    """One draw -> how many of a date's remaining payments settle together.
+
+    Exactly one draw, made unconditionally and *then* clamped, so the values this stream
+    consumes per batch do not depend on how many payments are left (``rng.py`` rule 2).
+    ``remaining`` is a ceiling rather than a rejection: a date holding two payments cannot
+    form a batch of four, and redrawing until the size fitted would make the draw count a
+    function of the date's population -- which is trap 4 reintroduced inside one stream.
+
+    The consequence is worth stating because it shows up in the record counts: the
+    *effective* mean batch size is below ``BATCH_SIZE_WEIGHTS``' nominal mean at small ``n``,
+    since a thinly populated date clamps the tail of the distribution away.
+    """
+    total = sum(w for _, w in BATCH_SIZE_WEIGHTS)
+    ticket = rng.randrange(total)
+    upto = 0
+    for size, weight in BATCH_SIZE_WEIGHTS:
+        upto += weight
+        if ticket < upto:
+            return min(size, remaining)
+    raise AssertionError("unreachable: BATCH_SIZE_WEIGHTS weights did not cover the ticket")
+
+
+def _group_into_batches(
+    rng: random.Random, settled_on_of: list[date]
+) -> list[list[int]]:
+    """``--batching``: partition payment indices into settlements. Returns member lists.
+
+    **Never across a settlement date.** Cross-date batching is section 19's undesigned mess
+    type, added at Phase 12 and reported unprompted -- it is the cheapest credibility in the
+    submission and only cheap while genuinely undesigned. Grouping by ``settled_on`` rather
+    than by the capture date is the same partition today (every capture lands on a business
+    day and ``add_business_days`` is strictly monotone there, so the map only relabels days),
+    but it is the one that stays *correct* if the delay model ever stops being injective.
+    Invariant I11 independently re-derives every member's settlement date, so a batch that
+    straddled two dates fails before anything reaches disk.
+
+    **The date's pool is shuffled before it is sliced, and that is the load-bearing line.**
+    Payments are capture-sorted and numbered in that order, so one date's payments are a
+    contiguous run of payment ids. Slicing that run in place would make every batch a set of
+    *consecutive* ids -- and once ``--settlement-report-late`` withholds membership, a
+    searcher could enumerate contiguous runs (O(k^2)) instead of subsets (O(2^k)) and resolve
+    the file without ever performing a subset search. That is the plan amendment's enduring
+    test applied to this flag ("could an unbounded, model-free brute-force strategy solve
+    this?") and it is finrecon's recorded failure exactly: its showcase tier fell to
+    exhaustive enumeration because the intended difficulty was not information-theoretic.
+    Shuffling first makes a batch an arbitrary subset of its date, so consecutive ids carry
+    no information about membership.
+
+    Members are returned **sorted** even so. The order of a member list reaches
+    ``truth.json`` and is not a signal the matcher can read -- ``settlement_items.csv`` is
+    written sorted by ``emit.py``, and a gross sum does not care -- so the randomness belongs
+    in *which* payments group, never in how the group is spelled.
+
+    Dates are iterated in sorted order. Not a style choice: ``date.__hash__`` goes through
+    ``bytes``, which ``PYTHONHASHSEED`` randomises per process, so any iteration that depended
+    on the hash of a date would make the run irreproducible across processes and
+    ``tools/repro_check.py`` would catch it as a cross-process byte difference.
+    """
+    by_date: dict[date, list[int]] = defaultdict(list)
+    for i, when in enumerate(settled_on_of):
+        by_date[when].append(i)
+
+    groups: list[list[int]] = []
+    for when in sorted(by_date):
+        pool = by_date[when]
+        rng.shuffle(pool)
+        cut = 0
+        while cut < len(pool):
+            size = _draw_batch_size(rng, len(pool) - cut)
+            groups.append(sorted(pool[cut : cut + size]))
+            cut += size
+    return groups
+
+
+def _withhold_membership(
+    rng: random.Random, settlement_ids: list[str], share: float
+) -> list[str]:
+    """Pick the settlements whose rows ``emit`` leaves out of ``settlement_items.csv``.
+
+    ``--settlement-report-late``. Returns the ids, **sorted**, so the list written into
+    ``run_manifest.json`` is stable across processes -- ``rng.sample`` returns selection order,
+    which is deterministic for a given seed but reads as arbitrary in a report.
+
+    **Partial by construction** (decision 4): the share is a fraction, and the count is
+    clamped so that at least one settlement keeps its membership and at least one loses it
+    wherever both are possible. Withholding everything would make the tier distribution a
+    *swap* rather than a mix -- all Tier 2, no Tier 1 -- and a Tier 1 regression would then
+    hide behind a Tier 2 success, which is the failure gate 12 exists to catch. Withholding
+    nothing would leave the search unexercised, which is the other half of the same gate.
+
+    One ``sample`` call rather than a draw per settlement: its consumption is a function of
+    the population and the count alone, both fixed by ``cfg``, so the stream stays auditable
+    in the sense rule 2 asks for. It is the last thing ``build`` does, so no other stream can
+    shift when the flag turns on.
+    """
+    population = len(settlement_ids)
+    if population == 0:
+        return []
+    k = round(population * share)
+    # A single settlement cannot be both withheld and kept, so the floor gives way to the
+    # population rather than the reverse: at n=1 the honest answer is to withhold nothing.
+    if population > 1:
+        k = max(1, min(k, population - 1))
+    else:
+        k = 0
+    return sorted(rng.sample(settlement_ids, k))
+
+
 def _draw_tails(rng: random.Random, n: int) -> list[int]:
     """``n`` distinct 4-digit UTR tails, plus spares for the fixup in ``build``.
 
@@ -270,6 +470,7 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     rng_settlements = substream(cfg.seed, "settlement_order")
     rng_bank = substream(cfg.seed, "bank_order")
     rng_dup = substream(cfg.seed, "dup")
+    rng_batching = substream(cfg.seed, "batching")
 
     # --- Step 4: invent the payments -------------------------------------
     # Drawn first, then sorted by capture time, then numbered -- a real gateway
@@ -294,41 +495,114 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         planted_keys = _plant_dup_pairs(rng_dup, drafts, cfg.dup_pairs)
 
     drafts.sort(key=lambda d: (d[0], d[1], d[2]))
+
+    # --- Step 4c: group into settlements, before the payments are frozen -------
+    # Batching is decided here rather than after ``payments`` is built because the batched-net
+    # uniqueness nudge below has to be able to *move a gross*, and ``Payment`` is a frozen
+    # dataclass. The three parallel lists are the mutable view; the frozen objects are built
+    # from them once every amount is final.
+    capture_dates = [d[0].date() for d in drafts]
+    grosses = [d[1] for d in drafts]
+    methods = [d[2] for d in drafts]
+    settled_on_of = [cal.add_business_days(day, cfg.delay_days) for day in capture_dates]
+
+    if cfg.flags.batching:
+        groups = _group_into_batches(rng_batching, settled_on_of)
+        # ``taken`` still holds every (capture_date, gross) the draw loop reserved, so the
+        # nudge can dodge both collision channels at once. Gated on the flag: the 1:1 path
+        # must stay byte-identical to Phase 1, since clean mode is the regression check and
+        # ASSUMPTIONS.md #24a's numbers describe that exact code.
+        _make_nets_unique(
+            cfg, grosses, methods, capture_dates, settled_on_of, groups, taken
+        )
+    else:
+        groups = [[i] for i in range(cfg.n)]
+
     payments = [
         Payment(
             payment_id=ids.payment_id(i),
             order_id=ids.order_id(i),
             captured_at=captured_at,
-            gross_paise=gross,
+            gross_paise=grosses[i - 1],
             method=method,
         )
-        for i, (captured_at, gross, method) in enumerate(drafts, start=1)
+        for i, (captured_at, _drafted_gross, method) in enumerate(drafts, start=1)
     ]
 
-    # --- Step 5: derive settlements, 1:1 ---------------------------------
+    # --- Step 5: derive settlements --------------------------------------
     # net == gross and every deduction is zero: clean mode has no fees at all.
     # settled_on is ``cfg.delay_days`` business days after the IST capture date --
     # which is the capture date itself in clean mode, since the delay is 0 there and
-    # every capture lands on a business day. payment_ids is a one-element *list*
-    # (decision #10) so Phase 5's batching is a change of contents, not a change of type.
+    # every capture lands on a business day. payment_ids has been a *list* since
+    # Phase 1 (decision #10), so ``--batching`` is a change of contents here and not a
+    # change of type -- which is the whole reason that decision was taken this early.
+    #
+    # ``_draw_tails`` still draws ``cfg.n`` tails and not one per settlement (Phase 5
+    # decision 11). Drawing for the settlement count would shift every UTR in the file the
+    # moment batching turned on, making the clean-vs-batching diff at one seed unreadable --
+    # the same property that kept ASSUMPTIONS.md #24b's cross-run comparison valid. Batching
+    # produces *fewer* settlements than ``n``, so the pool is a superset and the spares the
+    # credit fixup consumes still start at ``tails[cfg.n:]``.
     tails = _draw_tails(rng_utr, cfg.n)
-    order = list(range(cfg.n))
-    rng_settlements.shuffle(order)  # step 7: numbering must carry no information
+
+    # ``groups`` was built above, before the payments were frozen. Shuffled here so the
+    # numbering carries no information (step 7). Without ``--batching`` it is one payment per
+    # settlement in payment order, and the shuffle draws as a function of list *length*
+    # alone -- which is ``cfg.n`` either way, so clean mode stays byte-identical to Phase 1.
+    rng_settlements.shuffle(groups)
 
     settlements: list[Settlement] = []
-    for seq, payment_index in enumerate(order, start=1):
-        p = payments[payment_index]
-        # net = gross - fee - GST. Both are 0 without --fees, so this is ``net == gross``
-        # in clean mode and the expression stops being trivial exactly when the flag
-        # turns on. tds_paise stays 0: TDS is dial row 7, Phase 6 (decision D7) -- two
-        # gross/net wedges at once means two hypotheses per failing row.
-        fee, gst = _deductions(cfg, p.gross_paise, p.method)
+    for seq, members in enumerate(groups, start=1):
+        batch = [payments[i] for i in members]
+        # **Per member, per method, each rounded at the paisa -- never the rate on the batch
+        # total at one blended rate.** Phase 5 decision 7, and the two failure modes it
+        # guards differ by four orders of magnitude. Holding the rate constant, batch-total
+        # rounding differs from the per-member sum by <=5 paise, but on 27-71% of batches.
+        # Pricing a mixed-method batch at any single blended rate differs by up to **11,596
+        # rupees on one row** -- that is the 0-300 bps spread across the method table, not
+        # rounding, and the amount bands make a mixed batch the common case rather than the
+        # corner.
+        #
+        # Those two figures are **upper bounds from the plan's synthetic sweep** (20,000
+        # batches at k up to 8, .plan/phase5.md section 1(b)), not descriptions of this
+        # file's output: ``BATCH_SIZE_WEIGHTS`` caps a batch at 4, so k=8's spread is out of
+        # reach here. Measured on what this generator actually emits, across seeds 1-5 and 42
+        # at n=200 and n=1000, same-method rounding maxes at **1p** and the blended-rate gap
+        # reaches **Rs 7,310.15** on one settlement. Both bounds are cited rather than
+        # replaced because a later phase raising the batch ceiling moves this data toward
+        # them, and the discipline has to be justified by the failure mode's size rather than
+        # by today's sample.
+        #
+        # ``matcher/fees.derive`` prices the same way, independently, which is what makes the
+        # residual a test instead of a tautology.
+        #
+        # This side fails safe: getting it wrong here puts every batched row into
+        # UNEXPLAINED_RESIDUAL, which is loud. The matcher side would fail quietly.
+        deductions = [_deductions(cfg, p.gross_paise, p.method) for p in batch]
+        fee = sum(f for f, _ in deductions)
+        gst = sum(g for _, g in deductions)
+        gross_total = sum(p.gross_paise for p in batch)
+        # Every member of a batch shares a settlement date by construction
+        # (``_group_into_batches`` partitions within one date), so the settlement's date is
+        # any member's. Asserted rather than assumed: I11 re-derives it per member, and a
+        # batch that straddled two dates would otherwise emit a date that is right for some
+        # of its payments and wrong for the rest.
+        when = settled_on_of[members[0]]
+        assert all(settled_on_of[i] == when for i in members), (
+            f"setl_{seq:04d} spans more than one settlement date -- cross-date batching is "
+            f"section 19's undesigned mess type (Phase 12), not this flag"
+        )
         settlements.append(
             Settlement(
                 settlement_id=ids.settlement_id(seq),
-                settled_on=cal.add_business_days(p.business_date, cfg.delay_days),
-                payment_ids=[p.payment_id],
-                net_paise=p.gross_paise - fee - gst,
+                settled_on=when,
+                payment_ids=[p.payment_id for p in batch],
+                # net = gross - fee - GST, summed over the members. Both deductions are 0
+                # without --fees, so this is ``net == sum of grosses`` in clean mode and the
+                # expression stops being trivial exactly when the flag turns on. tds_paise
+                # stays 0: TDS is dial row 7, Phase 6 (decision D7) -- two gross/net wedges
+                # at once means two hypotheses per failing row.
+                net_paise=gross_total - fee - gst,
                 fee_paise=fee,
                 gst_paise=gst,
                 tds_paise=0,
@@ -351,14 +625,28 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     # ``date.__hash__`` goes through ``bytes``, which PYTHONHASHSEED randomises, so a set
     # of ``(date, int)`` has no stable iteration order and ``tools/repro_check.py`` would
     # catch it as a cross-process byte difference. The set is only ever *looked up*.
+    # Indexed through ``groups`` rather than the old flat ``order``: after the shuffle above
+    # ``groups[i]`` is the member list of ``settlements[i]``, which is the same relationship
+    # ``order[i]`` carried when every settlement held exactly one payment.
     planted_settlement_ids: set[str] = set()
     if planted_keys:
         first_utr: dict[tuple[date, int], str] = {}
         for i, s in enumerate(settlements):
-            p = payments[order[i]]
+            members = groups[i]
+            p = payments[members[0]]
             key = (p.business_date, p.gross_paise)
             if key not in planted_keys:
                 continue
+            # Guaranteed single-member: ``GenConfig`` refuses ``--dup-amounts`` together with
+            # ``--batching``, because a planted payment sharing a settlement with others turns
+            # that settlement's net into a sum, diverging it from its pair's and quietly
+            # un-planting the collision. Asserted rather than trusted -- the config check is
+            # one edit away from being relaxed, and this loop is where the damage would be
+            # silent (a wrong planted count, not a crash).
+            assert len(members) == 1, (
+                f"{s.settlement_id} holds {len(members)} payments and carries a planted "
+                f"collision -- see GenConfig's --dup-amounts/--batching refusal"
+            )
             if key in first_utr:
                 settlements[i] = dataclasses.replace(s, utr=first_utr[key])
             else:
@@ -474,7 +762,47 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
 
     # Phase 1 has no orphans, no noise and no refunds -- the empty lists are the
     # point: Phase 7 fills them and the scorer already knows how to read them.
-    return Story(payments=payments, settlements=settlements, credits=credits, refunds=[])
+    # --- Step 5c: --settlement-report-late withholds membership declarations ---
+    # Last, and gated, for two separate reasons. Gated so that every run without the flag
+    # consumes the ``late`` stream not at all and stays byte-identical to Phase 1 through
+    # Phase 5 step 1. Last so that this selection cannot move any other draw: it reads the
+    # finished settlement list and returns ids, touching no amount, date, method or grouping.
+    #
+    # **What is withheld is the declaration, not the membership.** Every ``Settlement`` below
+    # still lists its payments, and ``truth.json`` still publishes them -- so the answer key
+    # stays complete, every in-memory invariant still runs, and the scorer can still grade a
+    # searched payment set against the real one. ``emit`` is the only place the withholding
+    # becomes visible, by leaving those rows out of ``settlement_items.csv``.
+    withheld: list[str] = []
+    if cfg.flags.settlement_report_late:
+        withheld = _withhold_membership(
+            substream(cfg.seed, "late"),
+            [s.settlement_id for s in settlements],
+            LATE_REPORT_SHARE,
+        )
+        # The backstop GenConfig cannot provide. It refuses ``n < 2``, which is certain from
+        # the config; how many settlements a *batched* run produces is a draw, and a small n
+        # can land on a single settlement (measured: n=2 with --batching on 1 of 60 seeds).
+        # A refusal rather than an assert, and rather than withholding nothing: a run labelled
+        # with a mess flag must either have that mess or say why it cannot.
+        if not withheld:
+            raise ValueError(
+                f"--settlement-report-late cannot withhold partially: this run produced "
+                f"{len(settlements)} settlement(s) from n={cfg.n}, and withholding the only "
+                f"one would be total (decision 4). Raise --n."
+            )
+        assert len(withheld) < len(settlements), (
+            "--settlement-report-late withheld every settlement: the tier distribution "
+            "would be a swap rather than a mix (decision 4)"
+        )
+
+    return Story(
+        payments=payments,
+        settlements=settlements,
+        credits=credits,
+        refunds=[],
+        membership_withheld=withheld,
+    )
 
 
 def _tail_echoes_amount(tail: int, amount_paise: int) -> bool:
@@ -592,6 +920,214 @@ if __name__ == "__main__":
     # n=1 and a single-narration-style run must both work.
     assert len(build(GenConfig(seed=7, n=1)).credits) == 1
     assert len(build(GenConfig(seed=7, n=12, narration_styles=1)).credits) == 12
+
+    # --- Phase 5 step 1: --batching -------------------------------------------
+    # What is asserted here is the *partition* and the *containment*. Which payments group
+    # together is a draw and is not asserted; that they group into exactly one settlement
+    # each, never across a settlement date, and that the deductions sum per member rather
+    # than being priced on the batch total, are structural.
+    bat_cfg = GenConfig(seed=42, n=200, flags=MessFlags(batching=True))
+    bat_story = build(bat_cfg)
+    assert len(bat_story.payments) == 200, "--batching must not change how many payments exist"
+    assert len(bat_story.settlements) == len(bat_story.credits), "one settlement, one credit"
+    assert len(bat_story.settlements) < len(bat_story.payments), "--batching batched nothing"
+    # A partition: every payment in exactly one settlement, every member a real payment.
+    # Measured at seed 42, n=200: 200 payments into 120 settlements, sizes 1 to 4.
+    members = [pid for s in bat_story.settlements for pid in s.payment_ids]
+    assert len(members) == len(set(members)) == 200, (
+        f"member lists are not a partition of payments.csv: {len(members)} members, "
+        f"{len(set(members))} distinct, 200 payments"
+    )
+    assert set(members) == {p.payment_id for p in bat_story.payments}
+    # Decision 2: size 1 must survive. If every settlement became a batch this would be a
+    # *swap* rather than a mix, and a Tier 1 regression could hide behind a Tier 2 success.
+    bat_sizes = [len(s.payment_ids) for s in bat_story.settlements]
+    assert min(bat_sizes) == 1, "size-1 batches must remain, or Tier 1 has no rows left"
+    assert max(bat_sizes) > 1, "some settlement must hold more than one payment"
+    # No batch spans a settlement date. Cross-date batching is the undesigned mess type held
+    # for Phase 12, and it must stay undesigned. I11 re-derives every member date
+    # independently; naming the property here says it is intended rather than incidental.
+    bat_by_pay = {p.payment_id: p for p in bat_story.payments}
+    for s in bat_story.settlements:
+        days = {bat_by_pay[pid].business_date for pid in s.payment_ids}
+        assert len(days) == 1, f"{s.settlement_id} spans capture dates {sorted(days)}"
+        assert s.settled_on == next(iter(days)), "delay 0: settled_on is the capture date"
+        # No --fees, so net is the plain sum of member grosses and every deduction is zero.
+        assert s.net_paise == sum(bat_by_pay[pid].gross_paise for pid in s.payment_ids)
+        assert (s.fee_paise, s.gst_paise, s.tds_paise) == (0, 0, 0)
+    # Each credit still closes to its own amount, now over a *set* of payments rather than
+    # one. Per credit, not in total: two compensating errors cancel in a sum.
+    for c in bat_story.credits:
+        assert c.decomposition.expected_credit_paise == c.amount_paise, c.credit_id
+        assert c.decomposition.gross_paise == sum(
+            bat_by_pay[pid].gross_paise for pid in c.payment_ids
+        )
+    assert [c.csv_row() for c in build(bat_cfg).credits] == [
+        c.csv_row() for c in bat_story.credits
+    ], "--batching is not deterministic"
+
+    # --batching changes the settlement grouping and nothing about the payments. At n=200 the
+    # payment stream is byte-identical to the clean run at the same seed, which is what keeps
+    # a clean-versus-batching diff readable. Built fresh rather than reusing the fee block
+    # clean_200, so that editing one config cannot silently redefine the other assertion.
+    bat_clean = build(GenConfig(seed=42, n=200))
+    assert [p.csv_row() for p in bat_clean.payments] == [
+        p.csv_row() for p in bat_story.payments
+    ], "--batching perturbed the payment stream at n=200, where no nudge should fire"
+
+    # The batched-net nudge, at the size where it genuinely fires. Batching creates a new way
+    # for two settlements to collide: a sum can equal a single net. Measured at seed 3,
+    # n=1000: a collision on 2026-08-21 at 454,300p, one 1-member settlement against a
+    # 2-member batch. Step 4 of the plan pre-committed the response -- extend the nudge,
+    # never relax I3.unique_date_amount -- because a relaxed check would let honestly
+    # ambiguous data through as if it were designed that way.
+    nudged = build(GenConfig(seed=3, n=1000, flags=MessFlags(batching=True)))
+    nudged_nets = [(s.settled_on, s.net_paise) for s in nudged.settlements]
+    assert len(set(nudged_nets)) == len(nudged_nets), "two settlements share a (settled_on, net)"
+    nudged_keys = [(c.value_date, c.amount_paise) for c in nudged.credits]
+    assert len(set(nudged_keys)) == len(nudged_keys), "the nudge left a colliding credit pair"
+    # It is surgical, not a resample: exactly one payment moves, by exactly one paisa.
+    # Measured: pay_0661 at seed 3, and no movement at all at n=60 or n=200 on any seed.
+    clean_1k = {p.payment_id: p.gross_paise for p in build(GenConfig(seed=3, n=1000)).payments}
+    nudge_moved = {
+        p.payment_id: p.gross_paise - clean_1k[p.payment_id]
+        for p in nudged.payments
+        if p.gross_paise != clean_1k[p.payment_id]
+    }
+    assert nudge_moved == {pid: 1 for pid in nudge_moved}, (
+        f"the nudge moved a gross by more than a paisa: {nudge_moved}"
+    )
+    assert len(nudge_moved) == 1, f"expected one nudged payment, got {sorted(nudge_moved)}"
+
+    # --batching with --fees: deductions sum **per member at that member's own method rate**,
+    # never the rate on the batch total (decision 7). Two distinct errors are excluded, and
+    # they are not the same size. Pricing a same-method batch on its total is a rounding
+    # difference of at most 1p. Pricing a *mixed*-method batch at one blended rate is the
+    # 0-to-300 bps spread across the method table, and measured across seeds 1-5 and 42 it
+    # reaches Rs 7,310.15 on a single settlement (setl_0491, seed 42, n=1000) -- this
+    # generator's k<=4 ceiling, against the plan's synthetic Rs 11,596 at k=8. The cheap
+    # error and the expensive one share a shape, so the per-member sum is asserted directly.
+    bf_cfg = GenConfig(seed=42, n=200, flags=MessFlags(batching=True, fees=True))
+    bf_story = build(bf_cfg)
+    bf_by_pay = {p.payment_id: p for p in bf_story.payments}
+    bf_mixed = 0
+    for s in bf_story.settlements:
+        mem = [bf_by_pay[pid] for pid in s.payment_ids]
+        want = [_deductions(bf_cfg, p.gross_paise, p.method) for p in mem]
+        assert s.fee_paise == sum(f for f, _ in want), (
+            f"{s.settlement_id}: fee {s.fee_paise} is not the per-member sum "
+            f"{sum(f for f, _ in want)} -- a batch priced at one blended rate"
+        )
+        assert s.gst_paise == sum(g for _, g in want)
+        assert s.net_paise == sum(p.gross_paise for p in mem) - s.fee_paise - s.gst_paise
+        if len({p.method for p in mem}) > 1:
+            bf_mixed += 1
+    # A mixed-method batch must actually occur, or the per-member assertion above is
+    # asserting nothing and the expensive error goes untested. Measured: 46 of 49 multi-member
+    # batches at seed 42, n=200 -- mixed is the common case, not the corner.
+    assert bf_mixed, "no mixed-method batch in 200 records -- decision 7 went untested"
+
+    # Edge sizes. One payment cannot be batched with anything; a handful may each land on
+    # their own date and batch nothing, which is a legal outcome and not asserted away.
+    assert len(build(GenConfig(seed=7, n=1, flags=MessFlags(batching=True))).settlements) == 1
+    small_bat = build(GenConfig(seed=7, n=4, flags=MessFlags(batching=True)))
+    assert sum(len(s.payment_ids) for s in small_bat.settlements) == 4
+
+    # --dup-amounts and --batching are refused at config time. Batching a planted payment
+    # makes the net of its settlement a sum, so the pair stops sharing one net and stops
+    # being unresolvable -- truth would then claim resolvable=false about separable data.
+    try:
+        GenConfig(seed=42, n=200, flags=MessFlags(dup_amounts=True, batching=True))
+    except ValueError as exc:
+        assert "dup-amounts" in str(exc) and "batching" in str(exc), exc
+    else:
+        raise AssertionError("--dup-amounts with --batching must be refused")
+
+    # --- Phase 5 step 5: --settlement-report-late ------------------------------
+    # What is asserted is that the withholding is **partial**, that it is confined to the
+    # membership *declaration*, and that it moves nothing else. Which settlements are picked
+    # is a draw and is not asserted.
+    late_cfg = GenConfig(seed=42, n=200, flags=MessFlags(settlement_report_late=True))
+    late = build(late_cfg)
+    late_ids = {s.settlement_id for s in late.settlements}
+    assert late.membership_withheld, "--settlement-report-late withheld nothing"
+    # Partial, never total (decision 4). Total withholding makes the tier distribution a
+    # *swap* rather than a mix, so a Tier 1 regression could hide behind a Tier 2 success --
+    # the failure gate 12 exists to catch, from the other side.
+    assert len(late.membership_withheld) < len(late.settlements), (
+        f"every one of {len(late.settlements)} settlements was withheld: that is a swap, "
+        f"not a mix"
+    )
+    assert set(late.membership_withheld) <= late_ids, "withheld ids must be real settlements"
+    assert len(set(late.membership_withheld)) == len(late.membership_withheld)
+    # Sorted, so the list written into run_manifest.json is stable to read across runs.
+    # ``rng.sample`` returns selection order, which is deterministic but reads as arbitrary.
+    assert late.membership_withheld == sorted(late.membership_withheld)
+    # Measured: 30% at every size where the share is reachable (60/200/1000 -> 18/60/300).
+    assert len(late.membership_withheld) == 60, len(late.membership_withheld)
+
+    # **The membership is not removed, only its declaration.** Every settlement still lists
+    # its payments here and truth.json still publishes them, which is what keeps the answer
+    # key complete: a payment set the matcher *searched* has to be gradeable against the real
+    # one. ``emit`` is the only place the withholding exists.
+    assert all(s.payment_ids for s in late.settlements), (
+        "--settlement-report-late removed a membership from the story rather than from the "
+        "file the matcher reads -- then a searched payment set could not be graded"
+    )
+    # It moves nothing else: same payments, settlements and credits as the clean run at the
+    # same seed. The ``late`` stream is drawn last and only under the flag, so a run without
+    # it consumes no randomness here at all.
+    late_clean = build(GenConfig(seed=42, n=200))
+    assert not late_clean.membership_withheld, "a clean run must withhold nothing"
+    assert [p.csv_row() for p in late_clean.payments] == [p.csv_row() for p in late.payments]
+    assert [s.csv_row() for s in late_clean.settlements] == [
+        s.csv_row() for s in late.settlements
+    ], "--settlement-report-late changed a settlement rather than only its declaration"
+    assert [c.csv_row() for c in late_clean.credits] == [c.csv_row() for c in late.credits]
+    assert build(late_cfg).membership_withheld == late.membership_withheld
+
+    # Combined with --batching, which is the combination step 6 needs: a withheld
+    # multi-member batch is a row whose payment set can only be found by searching. Measured
+    # at seed 42, n=200: 120 settlements, 36 withheld, 12 of them multi-member.
+    late_bat = build(
+        GenConfig(seed=42, n=200, flags=MessFlags(batching=True, settlement_report_late=True))
+    )
+    late_bat_withheld = set(late_bat.membership_withheld)
+    searchable = [
+        s for s in late_bat.settlements
+        if s.settlement_id in late_bat_withheld and len(s.payment_ids) > 1
+    ]
+    assert searchable, (
+        "no withheld settlement holds more than one payment, so nothing in this run requires "
+        "a subset search and Tier 2 would be unexercised"
+    )
+    # Tier 1 must still have rows: settlements that kept their declaration. Both halves
+    # non-empty is the mix gate 12 asserts end to end.
+    assert len(late_bat_withheld) < len(late_bat.settlements)
+
+    # Both refusals. The flag needs two settlements to have a choice, so a run that cannot
+    # withhold partially is refused rather than quietly withholding nothing -- a run labelled
+    # with a mess flag must either have that mess or say why it cannot.
+    try:
+        GenConfig(seed=42, n=1, flags=MessFlags(settlement_report_late=True))
+    except ValueError as exc:
+        assert "at least 2 settlements" in str(exc), exc
+    else:
+        raise AssertionError("--settlement-report-late at n=1 must be refused at config time")
+    # The build-time backstop, for what no config-time check can see: how many settlements a
+    # *batched* run produces is a draw. Measured -- n=2 lands on a single settlement on seed
+    # 10, where GenConfig sees only a legal n=2.
+    assert len(build(GenConfig(seed=10, n=2, flags=MessFlags(batching=True))).settlements) == 1
+    try:
+        build(GenConfig(seed=10, n=2,
+                        flags=MessFlags(batching=True, settlement_report_late=True)))
+    except ValueError as exc:
+        assert "partially" in str(exc), exc
+    else:
+        raise AssertionError(
+            "a batched run that produced one settlement must refuse to withhold it: "
+            "withholding the only settlement is total, not partial"
+        )
 
     # --- the UTR tail ceiling ---------------------------------------------
     # Tails are drawn without replacement from a 9,000-value space, so n has a hard upper

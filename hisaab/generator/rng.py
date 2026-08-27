@@ -52,6 +52,7 @@ RESERVED_STREAMS = (
     "dup",        # Phase 4b --dup-amounts
     "fx",         # Phase 8  --fx
     "utr_patchy",  # Phase 8  --utr-patchy
+    "late",       # Phase 5  --settlement-report-late (pulled from Phase 8)
 )
 
 KNOWN_STREAMS = frozenset(PHASE1_STREAMS + RESERVED_STREAMS)

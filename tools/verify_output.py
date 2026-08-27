@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from hisaab.common import ids  # noqa: E402
 from hisaab.generator.invariants import (  # noqa: E402
     InvariantError,
+    check_batch_adjacency,
     check_headers,
     check_int_money,
     check_no_leak,
@@ -115,6 +116,63 @@ def parse_captured_at(value: str, where: str) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         raise InvariantError(f"{where}: not an ISO timestamp: {value!r}") from None
+
+
+#: Which mess flags legitimately invalidate each check in *this* pass, mirroring
+#: ``invariants.SUSPENDED_BY``. Same reasoning, and not a stylistic echo: this file used a
+#: binary ``truth.clean_mode`` gate, and ``clean_mode`` means "all thirteen flags off", so any
+#: flag at all switched off the partition check along with the cardinality one.
+#:
+#: Phase 5 is where that stopped being theoretical. ``--batching`` changes the payment:
+#: settlement ratio and nothing else -- measured on real batched output at n=200: every
+#: payment is still cited exactly once in ``settlement_items.csv``, ``truth.credits`` still
+#: equals the bank row count, and settlements still equal credits. Only 1:1:1 genuinely
+#: breaks. Under the old gate all four stood down together, so the *on-disk* pass -- the one
+#: that sees only what a judge sees -- lost partition coverage precisely where a new grouping
+#: loop could break it. ``.plan/phase5.md``'s trap 8 worried about this and located it in
+#: ``invariants.py``, where measurement showed I2's unconditional clauses already catch it
+#: (a dropped batch member raises "payments never settled"); here the gap was real.
+#:
+#: Keys are ``<invariant>.<what it asserts>``, so a typo raises ``KeyError`` at the call site
+#: rather than silently never suspending.
+DISK_SUSPENDED_BY: dict[str, tuple[str, ...]] = {
+    # Genuinely broken by batching: n payments become ~n/1.6 settlements and that many credits.
+    "I3.one_to_one_to_one":     ("batching", "noise_rows", "unsettled"),
+    "I3.no_refunds":            ("netted_refunds",),
+    # A payment in no settlement is --unsettled's business and nothing else's.
+    "I2.every_payment_settled": ("unsettled",),
+    # A noise row is a bank row with no truth entry, so the two counts diverge.
+    "I6.truth_covers_bank":     ("noise_rows",),
+    # The legitimate signal must resolve the dataset. This list was **corrected by
+    # measurement** rather than reasoned, and it was wrong in both directions first time:
+    #
+    #   clean          200/200      fees            200/200      batching       120/120
+    #   fees+batching  120/120      delay             0/200      delay+batching   0/120
+    #   fees+delay       0/200      dup_amounts     196/200
+    #
+    # ``settlement_delay`` breaks it **completely**, and was omitted from the first draft of
+    # this list. Strategy D joins on an *exact* date, and the posting lag puts every credit one
+    # business day after its settlement, so the join finds nothing at all -- 0/200, not a
+    # shortfall. That is the same fact the matcher's ``--window`` exists for
+    # (ASSUMPTIONS.md #15b: window 0 scores 0% coverage under the lag, window 1 scores 100%),
+    # seen from the audit side.
+    #
+    # ``settlement_report_late`` was in the first draft and does **not** belong: it withholds
+    # ``settlement_items.csv``, which declares payment-to-settlement membership, while this
+    # strategy joins credits to *settlements* on (date, amount) and never reads membership.
+    # Phase 5 step 5 will withhold that file and this check must keep passing.
+    #
+    # ``dup_amounts`` falls short by exactly the planted rows (196/200 = 2 pairs) and that is
+    # the flag working. ``fees`` and ``batching`` are deliberately absent -- both still resolve
+    # 100%, so both are now *asserted* where the old ``clean_mode`` gate skipped them, which is
+    # a strengthening and the same one Phase 4 made in ``invariants.py``.
+    "I3.date_amount_resolves":  ("settlement_delay", "dup_amounts"),
+}
+
+
+def _disk_suspended(flags: dict[str, bool], check: str) -> list[str]:
+    """Flags this run turns on that legitimately invalidate ``check``."""
+    return [f for f in DISK_SUSPENDED_BY[check] if flags.get(f)]
 
 
 def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, object]:
@@ -185,7 +243,23 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     # this pass independent of the generator's config object -- it sees only what was
     # written, which is the whole point of the second pass.
     truth = load_truth(truth_dir)
-    fees_on = bool(truth.flags.get("fees", False))
+    flags: dict[str, bool] = {k: bool(v) for k, v in truth.flags.items()}
+    fees_on = flags.get("fees", False)
+    late_on = flags.get("settlement_report_late", False)
+    #: settlement -> payments, as the *answer key* declares it. Used only to stand in for the
+    #: rows ``--settlement-report-late`` withholds from settlement_items.csv, so that the
+    #: partition and per-settlement arithmetic checks keep running at full coverage instead of
+    #: being suspended. Built only from credits citing exactly one settlement; a credit paid by
+    #: several cannot attribute its payments to one of them, and inventing an attribution here
+    #: would be worse than declining to check that row.
+    truth_members: dict[str, tuple[str, ...]] = {}
+    for c in truth.credits:
+        if len(c.settlement_ids) == 1:
+            truth_members[c.settlement_ids[0]] = tuple(c.payment_ids)
+    truth_members_all = {pid for pids in truth_members.values() for pid in pids}
+    #: Checks this pass skipped, and the flag that excused each. Reported rather than silent:
+    #: an invisible skip is what made the old clean_mode gate dangerous.
+    skipped: dict[str, list[str]] = {}
 
     # --- I4: the money adds up, in aggregate --------------------------------
     check_totals(
@@ -196,15 +270,20 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         fees_on=fees_on,
     )
 
-    # --- I3: 1:1:1 in clean mode -------------------------------------------
-    if truth.clean_mode:
-        if not (len(payments) == len(settlements) == len(bank)):
-            raise InvariantError(
-                f"I3: clean mode must be 1:1:1, got "
-                f"{len(payments)}/{len(settlements)}/{len(bank)}"
-            )
-        if refunds:
-            raise InvariantError(f"I3: clean mode emitted {len(refunds)} refund rows")
+    # --- I3: cardinality, per flag rather than per clean_mode ----------------
+    if on := _disk_suspended(flags, "I3.one_to_one_to_one"):
+        skipped["I3.one_to_one_to_one"] = on
+    elif not (len(payments) == len(settlements) == len(bank)):
+        raise InvariantError(
+            f"I3: 1:1:1 must hold while every flag that changes cardinality is off, got "
+            f"{len(payments)}/{len(settlements)}/{len(bank)}"
+        )
+    if on := _disk_suspended(flags, "I3.no_refunds"):
+        skipped["I3.no_refunds"] = on
+    elif refunds:
+        raise InvariantError(
+            f"I3: {len(refunds)} refund rows written while --netted-refunds is off"
+        )
 
     # --- I2: membership, via settlement_items.csv ---------------------------
     members: dict[str, list[str]] = defaultdict(list)
@@ -220,29 +299,81 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     multi = sorted(p for p, k in counts.items() if k > 1)
     if multi:
         raise InvariantError(f"I2: payments in more than one settlement: {multi[:5]}")
-    if truth.clean_mode:
-        missing = sorted(set(gross_by_payment) - set(counts))
+    # **The check Phase 5 restored.** Gated on ``clean_mode`` this stood down under any flag,
+    # so a batching loop that dropped a payment from a member list passed this pass entirely.
+    # Only ``--unsettled`` legitimately breaks it: batching regroups payments, it never loses
+    # one, and the partition claim is what makes every per-settlement gross sum meaningful.
+    if on := _disk_suspended(flags, "I2.every_payment_settled"):
+        skipped["I2.every_payment_settled"] = on
+    else:
+        # ``--settlement-report-late`` withholds some settlements' rows, so the *disk* file is
+        # deliberately not a partition. The partition claim does not weaken -- it moves to
+        # truth.json, which still declares every member. Sourcing it from there keeps this
+        # check at full coverage instead of standing it down, which is the difference between
+        # a relaxation with a successor and a hole.
+        cited = set(counts) | (truth_members_all if late_on else set())
+        missing = sorted(set(gross_by_payment) - cited)
         if missing:
-            raise InvariantError(f"I2: payments never settled: {missing[:5]}")
+            where = (
+                "settlement_items.csv (plus truth.json for the withheld settlements)"
+                if late_on else "settlement_items.csv"
+            )
+            raise InvariantError(
+                f"I2: {len(missing)} payment(s) are in no settlement: {missing[:5]} -- "
+                f"{where} is not a partition of payments.csv, so no gross sum "
+                f"over a settlement means what it claims"
+            )
 
     # --- I4: the money adds up, per settlement ------------------------------
     # This used to be an inline "net equals the member gross, while --fees is off" check
     # nested under clean mode. Phase 4 strengthens it to the full subtraction and runs it
     # unconditionally, which at zero deductions is the old equality unchanged.
     #
-    # Membership comes from settlement_items.csv, not from truth.json: this pass must reach
-    # its verdict from the files a judge gets. A settlement with no member rows is a
-    # failure today -- Phase 8's --settlement-report-late is what makes withholding them
-    # legitimate, and it will have to relax this deliberately rather than by accident.
+    # Membership normally comes from settlement_items.csv rather than truth.json, because this
+    # pass must reach its verdict from the files a judge gets. ``--settlement-report-late`` is
+    # the one flag that makes a missing member row legitimate, and **this is the deliberate
+    # relaxation that comment predicted** -- written as a relaxation with a successor rather
+    # than a suspension: ``effective_members`` falls back to truth's declaration for exactly
+    # the withheld settlements, so the per-settlement arithmetic still runs on **every**
+    # settlement. Nothing is skipped; one input is sourced from a different file, and the run
+    # says which.
     orphan_settlements = sorted(set(net_by_settlement) - set(members))
-    if orphan_settlements:
+    effective_members = dict(members)
+    if late_on:
+        recovered = {sid: truth_members.get(sid, ()) for sid in orphan_settlements}
+        unrecoverable = sorted(sid for sid, pids in recovered.items() if not pids)
+        if unrecoverable:
+            raise InvariantError(
+                f"I2: {len(unrecoverable)} settlement(s) have no members in "
+                f"settlement_items.csv *and* none in truth.json: {unrecoverable[:5]}. "
+                f"--settlement-report-late withholds a declaration from the matcher's files; "
+                f"it must never remove the membership from the answer key, or a searched "
+                f"payment set could not be graded against anything."
+            )
+        # Partial, never total (decision 4). All-withheld would make the tier distribution a
+        # swap rather than a mix, and gate 12 would then pass on a run where Tier 1 is dead.
+        if not orphan_settlements:
+            raise InvariantError(
+                "I2: --settlement-report-late is on but every settlement declares its "
+                "members, so nothing was withheld and the search is unexercised"
+            )
+        if len(orphan_settlements) == len(net_by_settlement):
+            raise InvariantError(
+                f"I2: every one of the {len(net_by_settlement)} settlements had its "
+                f"membership withheld. Withholding must be partial (decision 4): a total "
+                f"withholding turns the tier mix into a swap and lets a Tier 1 regression "
+                f"hide behind a Tier 2 success."
+            )
+        effective_members.update(recovered)
+        skipped["I2.membership_on_disk"] = ["settlement_report_late"]
+    elif orphan_settlements:
         raise InvariantError(
             f"I2: settlements with no rows in settlement_items.csv: "
             f"{orphan_settlements[:5]} -- their net cannot be checked against any gross"
         )
     check_settlement_arithmetic(
         [
-            (sid, sum(gross_by_payment[p] for p in members[sid]),
+            (sid, sum(gross_by_payment[p] for p in effective_members[sid]),
              net_by_settlement[sid], *deductions[sid])
             for sid in sorted(net_by_settlement)
         ]
@@ -266,9 +397,12 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
                 f"I4: truth expects {c.decomposition.expected_credit_paise} for "
                 f"{c.credit_id} but the bank file says {amount_by_credit[c.credit_id]}"
             )
-    if truth.clean_mode and len(truth.credits) != len(bank):
+    if on := _disk_suspended(flags, "I6.truth_covers_bank"):
+        skipped["I6.truth_covers_bank"] = on
+    elif len(truth.credits) != len(bank):
         raise InvariantError(
-            f"I6: truth has {len(truth.credits)} credits, bank file has {len(bank)} rows"
+            f"I6: truth has {len(truth.credits)} credits, bank file has {len(bank)} rows -- "
+            f"every bank row needs an answer-key entry unless --noise-rows is on"
         )
 
     # --- Section 2: the leak audit (the honest gate 4) ---------------------
@@ -289,8 +423,25 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
             c_by_date[parse_date(r["value_date"], r["row_id"])].append(pid)
     aligned, population = check_within_block_alignment(p_by_date, c_by_date)
 
+    # --- I14: batch membership carries no id-adjacency information -----------
+    # Re-run here against ``settlement_items.csv`` rather than trusted from the in-memory
+    # pass: this file is the membership declaration a judge reads, and the shuffle in
+    # ``story._group_into_batches`` is what stops consecutive-id enumeration from standing in
+    # for a subset search once Phase 5 step 5 withholds it.
+    batch_numbers = [
+        sorted(int(pid.removeprefix("pay_")) for pid in pids)
+        for pids in members.values()
+        if len(pids) > 1
+    ]
+    consecutive, batch_population = check_batch_adjacency(batch_numbers)
+
     report: dict[str, object] = {
         "files_verified": len(CSV_FILES),
+        "consecutive_id_batches": f"{consecutive}/{batch_population}",
+        # Every check this pass skipped and the flag that excused it. Collected above and
+        # reported here -- a skip that is recorded and never surfaced is the same silence that
+        # made the ``clean_mode`` gate dangerous in the first place.
+        "checks_skipped": {k: list(v) for k, v in sorted(skipped.items())},
         "payments": len(payments),
         "settlements": len(settlements),
         "settlement_items": len(items),
@@ -372,13 +523,17 @@ def leak_audit(
             f"(pay->credit {number_hits}/{n}, pay->settlement {setl_number_hits}/{n}) "
             f"-- the numbering is the answer key"
         )
-    # ... and the legitimate one must resolve it completely, or clean mode is not
-    # the 100% baseline the mess dial requires.
-    if truth.clean_mode and arithmetic_hits != n:  # type: ignore[attr-defined]
+    # ... and the legitimate one must resolve it completely, or row 1 of the mess dial is not
+    # the 100% baseline the whole ramp is measured against. Gated per flag rather than on
+    # ``clean_mode``, so ``--fees`` and ``--batching`` are held to it too.
+    audit_flags = {k: bool(v) for k, v in truth.flags.items()}  # type: ignore[attr-defined]
+    if suspended_by := _disk_suspended(audit_flags, "I3.date_amount_resolves"):
+        pass  # named in the returned report, never silently dropped
+    elif arithmetic_hits != n:
         raise InvariantError(
-            f"I3: date+amount resolves only {arithmetic_hits}/{n} credits in clean "
-            f"mode, but row 1 of the mess dial requires 100% -- the Phase 3 matcher "
-            f"cannot hit its target on this data"
+            f"I3: date+amount resolves only {arithmetic_hits}/{n} credits while every flag "
+            f"that legitimately breaks that join is off -- the mess dial requires 100% here, "
+            f"so the Phase 3 matcher cannot hit its target on this data"
         )
     return {
         "leak_audit": {
@@ -387,6 +542,8 @@ def leak_audit(
             "by_settlement_numbering": f"{setl_number_hits}/{n}",
             "by_narration": f"{narration_hits}/{n}",
             "by_date_and_amount": f"{arithmetic_hits}/{n}",
+            # Present so a reader can tell "resolves everything" from "was not required to".
+            "date_amount_not_required_by": suspended_by,
         }
     }
 

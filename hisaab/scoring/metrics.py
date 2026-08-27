@@ -42,7 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ..common.reasons import CORRECT_ABSTENTION_CODES, Reason
+from ..common.reasons import Reason
 from ..common.verdict import Decomposition, Outcome, Verdict, VerdictFile
 from .truth_io import Truth, TruthCredit, TruthDecomposition
 
@@ -54,6 +54,12 @@ from .truth_io import Truth, TruthCredit, TruthDecomposition
 MINUTES_PER_EXCEPTION: dict[Reason, int] = {
     Reason.NO_CANDIDATE: 10,
     Reason.AMBIGUOUS_MULTI_SUBSET: 15,
+    # Strictly more work than the code above, which is why it is priced higher: there, the
+    # search ran and the human picks between candidates it already found; here nothing
+    # declares the members, so the human has to *construct* the candidate set by hand before
+    # they can choose. Once Tier 2 exists this code should be rare -- a run full of them is
+    # reporting that the search was unavailable, not that the data was hard.
+    Reason.MEMBERSHIP_UNDECLARED: 20,
     Reason.AMBIGUOUS_DUPLICATE_AMOUNT: 8,
     Reason.UNEXPLAINED_RESIDUAL: 12,
     Reason.PARTIAL_SETTLEMENT_PENDING: 5,
@@ -210,6 +216,16 @@ class Metrics:
     non_gateway_credits: int
     planted_unresolvable: int
 
+    #: Payments behind those bank rows. **Two counts, because ``--batching`` makes them two
+    #: different numbers** -- 200 payments settle as ~120 bank rows at mean 1.60 per
+    #: settlement -- and "record count" is the figure a judge checks against the track's
+    #: 50-record floor. One number reported alone is ambiguous the moment batching is on, and
+    #: which one it is changes whether the floor is cleared (.plan/phase5.md decision 3).
+    #:
+    #: **Derived from truth's credits, not read from its ``counts`` header.** The header is a
+    #: number the generator states; this is one the answer key can be held to.
+    total_payments: int
+
     cells: dict[Cell, int]
     landings: tuple[Landing, ...] = field(repr=False)
 
@@ -331,6 +347,9 @@ class Metrics:
             "timing": {"wall_clock_seconds": self.wall_clock_seconds},
             "totals": {
                 "bank_rows": self.total_bank_rows,
+                # Both counts, always, even when they are equal: a reader must not have to
+                # infer from one number whether batching was on.
+                "payments": self.total_payments,
                 "gateway_credits": self.gateway_credits,
                 "non_gateway_credits": self.non_gateway_credits,
                 "planted_unresolvable": self.planted_unresolvable,
@@ -360,6 +379,12 @@ class Metrics:
 #: Bumped on a breaking change to ``Metrics.as_json``. Phase 9 re-ranks this document
 #: and Phase 11 renders it; a format that shifts silently costs both.
 #:
+#: v3 (Phase 5 step 3): ``totals.payments``. Breaking by the same rule as v2 below, and the
+#: reason is the phase itself: until ``--batching`` a bank row *was* a payment, so a v2
+#: document's single count was unambiguous. Under batching it is not, and a renderer that
+#: defaulted the missing key to ``bank_rows`` would silently restate 200 payments as 120 --
+#: which is the number the track's 50-record floor is checked against.
+#:
 #: v2 (Phase 4 step 5): a new ``decomposition`` block and a seventh rate. Counted as
 #: breaking even though it only *adds* keys, for the reason this codebase refuses
 #: absent-versus-null everywhere else: a Phase 11 renderer that reads
@@ -367,7 +392,7 @@ class Metrics:
 #: v1 document is a run where the arithmetic was never checked -- which is a different fact
 #: from a run where it was checked and agreed. Refusing the old document says so; reading
 #: it and defaulting the missing key would not.
-METRICS_SCHEMA_VERSION = 2
+METRICS_SCHEMA_VERSION = 3
 
 
 class MetricsError(Exception):
@@ -534,6 +559,25 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
             )
 
     gateway = [c for c in truth.credits if c.credit_id not in noise_ids]
+
+    # The payment count, derived rather than quoted. Every payment either sits behind some
+    # credit or is named as unsettled, so the union is the whole population -- and unlike
+    # ``truth.counts["payments"]`` it is a number this answer key can be held to. Where the
+    # header does state one, the two must agree: a truth file whose header disagrees with its
+    # own credits is one where every rate below has an unclear denominator, and that is worth
+    # refusing rather than averaging over.
+    total_payments = len(
+        {pid for c in truth.credits for pid in c.payment_ids}
+        | set(truth.unsettled_payment_ids)
+    )
+    stated_payments = truth.counts.get("payments")
+    if isinstance(stated_payments, int) and stated_payments != total_payments:
+        raise MetricsError(
+            f"truth states {stated_payments} payments but its credits and unsettled list "
+            f"account for {total_payments}. The scorer will not guess which denominator "
+            f"the coverage and arithmetic rates below are over."
+        )
+
     metrics = Metrics(
         seed=truth.seed,
         month=truth.month,
@@ -545,6 +589,7 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
         gateway_credits=len(gateway),
         non_gateway_credits=len(noise_ids),
         planted_unresolvable=sum(1 for c in gateway if c.is_planted_unresolvable),
+        total_payments=total_payments,
         cells=cells,
         landings=tuple(landings),
         exceptions=counts["EXCEPTION"],
@@ -812,5 +857,36 @@ if __name__ == "__main__":
         "a Landing must never carry truth's answer -- that is how Phase 3 starts "
         "fitting the answer key"
     )
+
+    # --- the payment count: derived, and cross-checked against the header -----
+    # The positive path runs on every real file, since the generator always writes
+    # ``counts.payments``; this is the negative one. A truth file whose header disagrees with
+    # its own credits has an unclear denominator for every rate in the block, and an
+    # unexercised refusal is decoration -- so the disagreement is staged here.
+    from dataclasses import replace
+
+    three_t = _truth(three)
+    assert score(_run(tuple(_except(c.credit_id) for c in three)), three_t).total_payments == 3
+    # The header is absent in these fixtures, so the check must stay quiet rather than read a
+    # missing key as a zero and refuse every truth file that omits it.
+    assert "payments" not in three_t.counts
+    try:
+        score(
+            _run(tuple(_except(c.credit_id) for c in three)),
+            replace(three_t, counts={"credits": 3, "payments": 99}),
+        )
+    except MetricsError as e:
+        assert "99" in str(e) and "3" in str(e), e
+    else:
+        raise AssertionError(
+            "a truth file stating 99 payments while its credits account for 3 must be "
+            "refused, not scored against whichever denominator won"
+        )
+    # An unsettled payment belongs to the population even though no credit cites it, so the
+    # derived count is the union rather than the credited set alone.
+    assert score(
+        _run(tuple(_except(c.credit_id) for c in three)),
+        replace(three_t, unsettled_payment_ids=("pay_9001", "pay_9002")),
+    ).total_payments == 5
 
     print("metrics.py self-check ok")
