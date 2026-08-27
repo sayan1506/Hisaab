@@ -99,7 +99,7 @@ class MessFlags:
     tds: bool = False                      # Phase 6  another gross/net wedge
     noise_rows: bool = False               # Phase 7  bank rows to be ignored
     unsettled: bool = False                # Phase 7  payments never paid out
-    dup_amounts: bool = False              # Phase 8  planted unresolvable
+    dup_amounts: bool = False              # Phase 4b planted unresolvable
     fx: bool = False                       # Phase 8  rate moves between capture/settle
     rounding_edge: bool = False            # Phase 8  fee x GST on a half-paisa
     settlement_report_late: bool = False   # Phase 8  withhold settlement_items.csv
@@ -129,7 +129,13 @@ class MessFlags:
     #: this a 14th mess flag -- breaking ``names()``, ``all_on()``, the CLI's
     #: generated switches and the flag block in ``truth.json``. The self-check below
     #: asserts the count is still 13 for exactly that reason.
-    IMPLEMENTED: ClassVar[frozenset[str]] = frozenset({"settlement_delay", "fees"})
+    #: Phase 4b added ``dup_amounts``: ``story._plant_dup_pairs`` forces ``dup_pairs``
+    #: payment pairs onto one ``(capture_date, gross, method)``, and ``build`` then forces
+    #: each pair's two settlements onto one UTR. Both halves are required, and the second is
+    #: the load-bearing one -- see ``dup_pairs`` below for the measurement that says why.
+    IMPLEMENTED: ClassVar[frozenset[str]] = frozenset(
+        {"settlement_delay", "fees", "dup_amounts"}
+    )
 
     @classmethod
     def names(cls) -> tuple[str, ...]:
@@ -244,6 +250,27 @@ class GenConfig:
     settlement_delay_days: int = 2   # T+2, ASSUMPTIONS.md's stated common default
     posting_lag_days: int = 1        # the credit lands the business day after settlement
 
+    #: How many **planted unresolvable pairs** ``--dup-amounts`` creates (Phase 4b).
+    #:
+    #: A pair is two payments forced to share a capture date, a gross and a method, so
+    #: their settlements derive the same net on the same day and their bank credits collide
+    #: on ``(value_date, amount_paise)``. Both credits are marked ``resolvable=False`` in
+    #: truth, and the only correct verdict on either is an abstention.
+    #:
+    #: **The pair also shares one UTR, and that is the load-bearing half.** Measured before
+    #: this flag was built (gate 11, ``tools/acceptance.py``): a tail-only strategy that
+    #: reads no date and no amount resolves 60/60, 200/200 and 1000/1000 credits *correctly*
+    #: on every dev seed, clean and under --fees --settlement-delay alike, because
+    #: ``_draw_tails`` samples without replacement. So a pair that collided on
+    #: ``(date, amount)`` while keeping distinct tails would still be separable by
+    #: exhaustive narration matching -- the flag would not test the capability its name
+    #: claims, and ``resolvable=False`` would be a false statement about the data. Sharing
+    #: the UTR is what makes every available strategy see a tie.
+    #:
+    #: Two rather than one, so the ``correct_abstention`` denominator is never 1 -- a rate
+    #: of 1/1 is indistinguishable from a coincidence.
+    dup_pairs: int = 2
+
     def __post_init__(self) -> None:
         # Refuse a flag whose data generation does not exist yet. This lives here
         # rather than in the CLI on purpose: constructing GenConfig directly -- from a
@@ -294,6 +321,34 @@ class GenConfig:
                     f"stay the capture date and value_date would stay equal to settled_on. "
                     f"Pass --settlement-delay to make the magnitude take effect."
                 )
+        # The same class of check as the delay magnitudes above: a number that is read only
+        # under a flag, moved while that flag is off, would be accepted, ignored, and then
+        # described in ``run_manifest.json`` as though it had taken effect.
+        if not self.flags.dup_amounts:
+            if self.dup_pairs != next(
+                f.default for f in fields(self) if f.name == "dup_pairs"
+            ):
+                raise ValueError(
+                    f"--dup-pairs was set to {self.dup_pairs}, but --dup-amounts is off, so "
+                    f"nothing reads it: no pair would be planted and every credit would "
+                    f"stay resolvable. Pass --dup-amounts to make the count take effect."
+                )
+        else:
+            if self.dup_pairs < 1:
+                raise ValueError(
+                    f"--dup-pairs must be at least 1 when --dup-amounts is on, got "
+                    f"{self.dup_pairs} -- a run that plants nothing while claiming to plant "
+                    f"is the mislabelled-data failure MessFlags.IMPLEMENTED exists to prevent."
+                )
+            # Each pair consumes two payments, and a pair is only a pair if both members
+            # exist. Refused here rather than raising an opaque ``sample larger than
+            # population`` from ``random.sample`` deep inside the build.
+            if 2 * self.dup_pairs > self.n:
+                raise ValueError(
+                    f"--dup-pairs {self.dup_pairs} needs {2 * self.dup_pairs} payments to "
+                    f"plant {self.dup_pairs} colliding pair(s), but --n is {self.n}. "
+                    f"Raise --n or lower --dup-pairs."
+                )
         if not 1 <= self.narration_styles <= len(NARRATION_TEMPLATES):
             raise ValueError(
                 f"--narration-styles must be 1..{len(NARRATION_TEMPLATES)}, "
@@ -330,6 +385,17 @@ class GenConfig:
         """
         return self.posting_lag_days if self.flags.settlement_delay else 0
 
+    @property
+    def planted_pairs(self) -> int:
+        """Colliding pairs actually planted -- **0 unless ``--dup-amounts`` is on**.
+
+        Same gate-at-the-property shape as ``delay_days``, and for a sharper reason: this
+        number is the *denominator* of the ``correct_abstention`` rate, which is the cell
+        carrying this project's central claim. Reporting the declared 2 on a run that
+        planted nothing would describe an answer key that does not exist.
+        """
+        return self.dup_pairs if self.flags.dup_amounts else 0
+
     def resolved(self) -> dict[str, object]:
         """The resolved-config echo.
 
@@ -350,6 +416,10 @@ class GenConfig:
             # run_manifest.json and Phase 11's report header quote verbatim.
             "settlement_delay_days": self.delay_days,
             "posting_lag_days": self.lag_days,
+            # Effective, for the same reason as the delays: 0 on any run that planted
+            # nothing. This is the correct_abstention denominator, so a reader comparing
+            # two runs' exception lists needs it stated rather than inferred.
+            "planted_pairs": self.planted_pairs,
             "flags_enabled": self.flags.enabled(),
             "flags": self.flags.as_dict(),
         }

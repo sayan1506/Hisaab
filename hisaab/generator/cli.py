@@ -46,7 +46,7 @@ FLAG_HELP: dict[str, str] = {
     "tds": "tax deducted at source (Phase 6)",
     "noise_rows": "bank rows unrelated to the gateway, which must be ignored (Phase 7)",
     "unsettled": "payments captured but never paid out (Phase 7)",
-    "dup_amounts": "identical date and amount, genuinely unresolvable (Phase 8)",
+    "dup_amounts": "identical date, amount and UTR, genuinely unresolvable (Phase 4b)",
     "fx": "rate moves between capture and settlement (Phase 8)",
     "rounding_edge": "amounts where fee x GST lands on a half-paisa (Phase 8)",
     "settlement_report_late": "withhold settlement_items.csv, forcing subset-sum (Phase 8)",
@@ -122,6 +122,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="business days from settlement to the bank credit landing (default: 1). "
              "This is the delay the matcher's --window has to cover",
     )
+    # Same shape as the delays above, and for the same reason: a magnitude that only one
+    # flag reads. GenConfig refuses it when --dup-amounts is off rather than accepting a
+    # number nothing acts on and then describing the run with it in run_manifest.json.
+    planted = p.add_argument_group(
+        "planted unresolvables",
+        "Takes effect only with --dup-amounts.",
+    )
+    planted.add_argument(
+        "--dup-pairs", type=int, default=2, metavar="N",
+        help="colliding (date, amount, utr) pairs to plant (default: 2). Each pair costs "
+             "two payments and yields two credits whose only correct verdict is an "
+             "abstention. Two rather than one so the correct_abstention denominator is "
+             "never 1",
+    )
     p.add_argument("--quiet", action="store_true",
                    help="print only the resolved-config JSON line")
 
@@ -180,6 +194,7 @@ def config_from_args(args: argparse.Namespace) -> GenConfig:
         flags=flags,
         settlement_delay_days=args.settlement_delay_days,
         posting_lag_days=args.posting_lag_days,
+        dup_pairs=args.dup_pairs,
     )
 
 

@@ -41,6 +41,7 @@ from datetime import date
 
 from ..common import ids
 from ..common.bizdays import BusinessCalendar
+from ..common.reasons import Reason
 from .config import GenConfig, MessFlags
 from .model import (
     BANK_HEADER,
@@ -602,6 +603,77 @@ def check_story(
             ),
         )
 
+    # I12 — the successor to the check --dup-amounts suspends.
+    #
+    # ``I3.unique_date_amount`` stands down under this flag because the collision is the
+    # *intent*. A suspension that is merely announced still leaves the run less checked than
+    # it looks: with I3 off, a planting bug that collided three rows, or zero, or that
+    # collided the amounts while leaving the UTRs distinct, would pass everything. So the
+    # flag brings its own invariant, and it is stricter than the one it replaces -- it
+    # asserts the collision is exactly what was ordered.
+    #
+    # The UTR clause is the load-bearing one, and it is why this check exists rather than a
+    # comment. Measured before the flag was built, re-run by gate 11 (tools/acceptance.py): a
+    # tail-only strategy reading no date and no amount resolves 60/60, 200/200 and 1000/1000
+    # credits *correctly* on every dev seed, because tails are drawn without replacement. A
+    # pair colliding on (date, amount) with distinct tails is therefore still separable by
+    # exhaustive narration matching -- ``resolvable=False`` would be a false statement about
+    # the data, and the flag would not test the capability its name claims. That is finrecon's
+    # recorded failure: its showcase tier fell to narration enumeration, 200/200.
+    if cfg.flags.dup_amounts:
+        key_counts = Counter((c.value_date, c.amount_paise) for c in credits)
+        groups = sorted(k for k, count in key_counts.items() if count > 1)
+        _require(
+            len(groups) == cfg.dup_pairs,
+            "I12",
+            f"--dup-amounts asked for {cfg.dup_pairs} planted pair(s) but the data holds "
+            f"{len(groups)} colliding (date, amount) group(s). The planted count is the "
+            f"denominator of the correct_abstention rate, so a wrong count silently "
+            f"rescales this project's central claim.",
+        )
+        utr_of = {s.settlement_id: s.utr for s in settlements}
+        unresolvable = [c for c in credits if not c.resolvable]
+        for key in groups:
+            members = [c for c in credits if (c.value_date, c.amount_paise) == key]
+            _require(
+                len(members) == 2,
+                "I12",
+                f"planted group {key} has {len(members)} members, not 2. Three credits "
+                f"sharing a (date, amount) is a different and harder case than the pair "
+                f"this flag documents, and it would be scored as though it were the pair.",
+            )
+            utrs = {utr_of[sid] for c in members for sid in c.settlement_ids}
+            _require(
+                len(utrs) == 1,
+                "I12",
+                f"planted group {key} spans {len(utrs)} distinct UTRs ({sorted(utrs)}). "
+                f"The UTR tail reaches the bank narration and resolves 100% of rows on its "
+                f"own, so a pair with distinct tails is still separable by exhaustive "
+                f"narration matching -- it is NOT unresolvable, and marking it "
+                f"resolvable=false would be a false statement about the data.\n"
+                f"  Do not fix this by removing the UTR from the narration: that is "
+                f"--utr-patchy's job (Phase 8) and it would make absence-of-tail a tell "
+                f"unique to planted rows.",
+            )
+            for c in members:
+                _require(
+                    not c.resolvable
+                    and c.reason == str(Reason.AMBIGUOUS_DUPLICATE_AMOUNT),
+                    "I12",
+                    f"{c.credit_id} shares a (date, amount, utr) with another credit but "
+                    f"truth marks it resolvable={c.resolvable} reason={c.reason!r}. An "
+                    f"indistinguishable row recorded as resolvable would score an honest "
+                    f"abstention as a MISS.",
+                )
+        _require(
+            len(unresolvable) == 2 * cfg.dup_pairs,
+            "I12",
+            f"{len(unresolvable)} credit(s) are marked unresolvable but "
+            f"{2 * cfg.dup_pairs} were planted. A row marked unresolvable outside a planted "
+            f"group inflates the correct_abstention denominator with a row the matcher "
+            f"could in fact have resolved.",
+        )
+
     # I8a — the ID numbering carries no information
     pay_index = {p.payment_id: i for i, p in enumerate(payments)}
     setl_index = {s.settlement_id: i for i, s in enumerate(settlements)}
@@ -791,8 +863,13 @@ if __name__ == "__main__":
     # I3: a duplicate (date, amount) pair.
     # Cloning only the credit's amount would change the credited total and trip I4
     # first, so the whole chain behind it is rewritten -- payment gross, settlement
-    # net, credit amount, decomposition. That is also exactly what --dup-amounts
-    # will construct in Phase 8, so this negative case doubles as a rehearsal.
+    # net, credit amount, decomposition.
+    #
+    # Phase 4b made the real thing available, and this hand-built story is now more useful
+    # as the *wrong* plant than as a rehearsal for the right one: it collides one pair while
+    # the config asks for two, it leaves the two settlements holding **distinct UTRs**, and
+    # it leaves both credits marked ``resolvable=True``. All three are what I12 exists to
+    # reject, so it serves below as I12's negative probe while remaining I3's.
     a, b = story.credits[0], story.credits[1]
     a_pid, b_pid = a.payment_ids[0], b.payment_ids[0]
     a_sid, b_sid = a.settlement_ids[0], b.settlement_ids[0]
@@ -831,34 +908,55 @@ if __name__ == "__main__":
     must_fail("I3", dup_story)
 
     # --- step 1: suspension works, and only the right flag does it ------------
-    # dup_story genuinely contains two credits sharing (date, amount), so it is the
-    # ideal probe: a check that stands down must stand down on data that really does
-    # violate it. Uses the same IMPLEMENTED seam a real phase will use.
-    _orig = MessFlags.IMPLEMENTED
-    try:
-        # Additive, not a replacement: assigning a bare literal here would *un*-implement
-        # whatever a landed phase had added (step 3's ``settlement_delay``), so the probe
-        # would silently test a configuration that cannot occur.
-        MessFlags.IMPLEMENTED = _orig | {"dup_amounts", "fees"}
+    # A *genuinely* built --dup-amounts story: the duplicate is the intent, so
+    # I3.unique_date_amount is suspended -- and the report says so, rather than quietly
+    # running one check fewer. I12 must pass here, on data the generator really produces.
+    dup_cfg = GenConfig(seed=42, n=60, flags=MessFlags(dup_amounts=True))
+    real_dup = build(dup_cfg)
+    rep = check_story(real_dup, dup_cfg)
+    assert rep["checks_skipped"] == {"I3.unique_date_amount": ["dup_amounts"]}, rep
 
-        # --dup-amounts: the duplicate is the *intent*, so the check is suspended --
-        # and the report says so, rather than quietly running one check fewer.
-        dup_cfg = GenConfig(seed=42, n=60, flags=MessFlags(dup_amounts=True))
-        rep = check_story(dup_story, dup_cfg)
-        assert rep["checks_skipped"] == {"I3.unique_date_amount": ["dup_amounts"]}, rep
+    # --- I12: the successor check must reject every wrong plant ----------------
+    # Three ways to plant badly, and I12 exists because a suspension that is only
+    # *announced* leaves all three passing. Each is probed on its own, because a check that
+    # fires for the wrong reason is indistinguishable from one that works.
+    #
+    # (i) the wrong *count*. dup_story collides one pair; the config asks for two.
+    must_fail("I12", dup_story, dup_cfg)
 
-        # --fees must NOT excuse it. This is the exact conflation the old clean_mode
-        # gate made: fees change amounts, so they raise collision pressure, but a
-        # collision is a finding to record (ASSUMPTIONS.md #24) and not a check to
-        # switch off. Under the old gate this story passed silently.
-        fees_cfg = GenConfig(seed=42, n=60, flags=MessFlags(fees=True))
-        must_fail("I3", dup_story, fees_cfg)
-        assert check_story(story, fees_cfg)["checks_skipped"] == {}, (
-            "--fees must suspend nothing at all"
-        )
-    finally:
-        MessFlags.IMPLEMENTED = _orig
-    assert MessFlags.IMPLEMENTED == _orig, "the probe must not leak"
+    # (ii) distinct UTRs -- the load-bearing clause. Same fixture, but with the count
+    # reconciled so the first clause passes and this one is what fires. dup_story leaves the
+    # two settlements holding their original, distinct tails, which is precisely the plant
+    # that measured as *still separable* by a tail-only strategy (60/60, 200/200, 1000/1000
+    # correct) before this flag was built.
+    one_pair_cfg = GenConfig(seed=42, n=60, flags=MessFlags(dup_amounts=True), dup_pairs=1)
+    must_fail("I12", dup_story, one_pair_cfg)
+
+    # (iii) a planted row recorded as resolvable. Truth would then score an honest
+    # abstention as a MISS, and the correct_abstention denominator would be wrong in the
+    # direction that flatters the matcher.
+    _planted_ids = [c.credit_id for c in real_dup.credits if not c.resolvable]
+    assert len(_planted_ids) == 2 * dup_cfg.dup_pairs, _planted_ids
+    mismarked = dataclasses.replace(
+        real_dup,
+        credits=[
+            dataclasses.replace(c, resolvable=True, reason=None, note=None)
+            if c.credit_id == _planted_ids[0]
+            else c
+            for c in real_dup.credits
+        ],
+    )
+    must_fail("I12", mismarked, dup_cfg)
+
+    # --fees must NOT excuse a collision. This is the exact conflation the old clean_mode
+    # gate made: fees change amounts, so they raise collision pressure, but a collision is a
+    # finding to record (ASSUMPTIONS.md #24) and not a check to switch off. Under the old
+    # gate this story passed silently.
+    fees_cfg = GenConfig(seed=42, n=60, flags=MessFlags(fees=True))
+    must_fail("I3", dup_story, fees_cfg)
+    assert check_story(story, fees_cfg)["checks_skipped"] == {}, (
+        "--fees must suspend nothing at all"
+    )
 
     # I8a: settlements ordered and numbered in payment order (what skipping the
     # shuffle in step 7 would produce). Renaming must propagate to the credits, or

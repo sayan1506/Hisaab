@@ -28,11 +28,13 @@ told apart.
 
 from __future__ import annotations
 
+import dataclasses
 import random
 from datetime import date, datetime
 
 from ..common import ids
 from ..common.bizdays import BusinessCalendar
+from ..common.reasons import Reason
 from .config import (
     AMOUNT_BANDS,
     BANK_CHANNELS,
@@ -173,14 +175,66 @@ def _unique_amount(taken: set[tuple[date, int]], day: date, amount: int) -> int:
     payments sharing a date *and* an amount would be genuinely indistinguishable
     from date+amount alone, so the honest verdict would be an abstention and clean
     mode could not reach 100%. That case is real and it is planted deliberately by
-    ``--dup-amounts`` in Phase 8; it must not appear here by accident.
+    ``--dup-amounts`` in Phase 4b; it must not appear here by accident.
 
     A nudge rather than a redraw, so the draw count per record stays fixed.
+
+    **This function is also what guarantees a planted pair is exactly a pair.** Because
+    every drafted ``(date, gross)`` is unique when ``_plant_dup_pairs`` overwrites one
+    member, no third payment can be holding the value it copies -- so the collision it
+    creates has cardinality 2, and the invariant that counts planted pairs can assert it.
     """
     while (day, amount) in taken:
         amount += 1
     taken.add((day, amount))
     return amount
+
+
+def _plant_dup_pairs(
+    rng: random.Random, drafts: list[tuple[datetime, int, str]], pairs: int
+) -> set[tuple[date, int]]:
+    """``--dup-amounts``: force ``pairs`` disjoint draft pairs to collide. Mutates ``drafts``.
+
+    Returns the ``(capture_date, gross_paise)`` keys it made collide, so ``build`` can find
+    the planted rows **by value** rather than by tracking indices through the settlement
+    shuffle. Every returned key has exactly two holders, per ``_unique_amount``.
+
+    Each pair's second member copies the first's **capture date, gross and method**. Those
+    three carry the collision all the way down: the same capture date gives both settlements
+    the same ``settled_on``, and the same gross with the same method derives the same fee, so
+    both settlements land on one ``net_paise`` and both credits on one
+    ``(value_date, amount_paise)``.
+
+    **The time of day is deliberately not copied.** What the matcher sees is the credit's
+    date, which comes from the IST calendar date; copying the whole timestamp would make the
+    two payments byte-identical but for their ids, which is a stronger and less realistic
+    claim than this flag needs. Two customers buying the same item on the same afternoon is
+    ordinary; two doing it in the same second is a coincidence a reader would query.
+
+    Drawn from the ``dup`` substream, so planting perturbs none of the Phase 1 streams and
+    the clean-vs-dup diff at one seed stays readable -- the property that made
+    ASSUMPTIONS.md #24b's cross-run comparison valid.
+
+    Sharing the UTR is the other half of the job and cannot happen here, because tails are
+    assigned to settlements. ``build`` does it, and ``config.dup_pairs`` records why it is
+    the load-bearing half.
+    """
+    chosen = rng.sample(range(len(drafts)), 2 * pairs)
+    planted: set[tuple[date, int]] = set()
+    for i in range(pairs):
+        source, target = chosen[2 * i], chosen[2 * i + 1]
+        captured_at, gross, method = drafts[source]
+        keep = drafts[target][0]
+        drafts[target] = (
+            datetime(
+                captured_at.year, captured_at.month, captured_at.day,
+                keep.hour, keep.minute, keep.second, tzinfo=captured_at.tzinfo,
+            ),
+            gross,
+            method,
+        )
+        planted.add((captured_at.date(), gross))
+    return planted
 
 
 def _draw_tails(rng: random.Random, n: int) -> list[int]:
@@ -215,6 +269,7 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     rng_narration = substream(cfg.seed, "narration")
     rng_settlements = substream(cfg.seed, "settlement_order")
     rng_bank = substream(cfg.seed, "bank_order")
+    rng_dup = substream(cfg.seed, "dup")
 
     # --- Step 4: invent the payments -------------------------------------
     # Drawn first, then sorted by capture time, then numbered -- a real gateway
@@ -228,6 +283,15 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         method = weighted_choice(rng_methods, PAYMENT_METHODS)
         gross = _unique_amount(taken, captured_at.date(), gross)
         drafts.append((captured_at, gross, method))
+
+    # --- Step 4b: --dup-amounts plants the collisions ---------------------
+    # After every draw, so planting consumes no Phase 1 randomness and the clean-vs-dup
+    # diff at one seed stays readable. Before the sort, so the two members are ordered by
+    # their own capture times like any other pair -- they keep their own times of day, so
+    # they do not land adjacent in payments.csv and their ids are not consecutive.
+    planted_keys: set[tuple[date, int]] = set()
+    if cfg.flags.dup_amounts:
+        planted_keys = _plant_dup_pairs(rng_dup, drafts, cfg.dup_pairs)
 
     drafts.sort(key=lambda d: (d[0], d[1], d[2]))
     payments = [
@@ -272,19 +336,69 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
             )
         )
 
+    # --- Step 5b: --dup-amounts shares one UTR across each planted pair ---
+    # The load-bearing half of the flag, and the reason it is not "generator-side only" in
+    # the trivial sense. Measured before it was written, and re-run on every acceptance
+    # run by gate 11 of ``tools/acceptance.py``: a tail-only strategy reading no date and no
+    # amount resolves 60/60, 200/200 and 1000/1000 credits *correctly* on every dev seed,
+    # because ``_draw_tails`` samples without replacement. So a pair colliding on
+    # ``(date, amount)`` with distinct tails stays separable by exhaustive narration
+    # matching -- the flag would not test the capability its name claims, and
+    # ``resolvable=False`` would be a false statement about the data. This is finrecon's
+    # recorded failure exactly: its "AI showcase" tier fell to narration enumeration.
+    #
+    # Iterating ``settlements`` in list order rather than iterating ``planted_keys``:
+    # ``date.__hash__`` goes through ``bytes``, which PYTHONHASHSEED randomises, so a set
+    # of ``(date, int)`` has no stable iteration order and ``tools/repro_check.py`` would
+    # catch it as a cross-process byte difference. The set is only ever *looked up*.
+    planted_settlement_ids: set[str] = set()
+    if planted_keys:
+        first_utr: dict[tuple[date, int], str] = {}
+        for i, s in enumerate(settlements):
+            p = payments[order[i]]
+            key = (p.business_date, p.gross_paise)
+            if key not in planted_keys:
+                continue
+            if key in first_utr:
+                settlements[i] = dataclasses.replace(s, utr=first_utr[key])
+            else:
+                first_utr[key] = s.utr
+            planted_settlement_ids.add(settlements[i].settlement_id)
+
     # --- Step 6: derive bank credits, 1:1 --------------------------------
     # Same date, same amount, and a narration assembled from parts. Four fields
     # reach the CSV; the linkage below exists only in memory and in truth.json.
     by_payment = {p.payment_id: p for p in payments}
     spare_tails = iter(tails[cfg.n:])
+    # The echo fixup has to be *memoised*, or step 5b's work is undone here: a planted pair
+    # shares a tail and a net, so if that tail echoes the amount both members enter the loop
+    # below and each would draw its own spare -- handing the pair two different narration
+    # tails and separating it again. Keyed on ``(tail, net)`` because that pair is what the
+    # decision depends on. Clean mode is byte-identical: every tail is distinct there, so
+    # every lookup misses and the loop runs exactly as before.
+    fixed_tails: dict[tuple[int, int], int] = {}
     drafted_credits: list[tuple[date, int, float, Settlement, str]] = []
     for s in settlements:
-        tail = int(s.utr.removeprefix("XXXX"))
-        # A tail that happens to equal its own credit's rupee figure would put the
-        # amount into the narration, handing the matcher a free join. Swap it for
-        # an unused tail rather than let invariant I7 fail on a rare seed.
-        while _tail_echoes_amount(tail, s.net_paise):
-            tail = next(spare_tails)
+        original = int(s.utr.removeprefix("XXXX"))
+        cached = fixed_tails.get((original, s.net_paise))
+        if cached is None:
+            tail = original
+            # A tail that happens to equal its own credit's rupee figure would put the
+            # amount into the narration, handing the matcher a free join. Swap it for
+            # an unused tail rather than let invariant I7 fail on a rare seed.
+            while _tail_echoes_amount(tail, s.net_paise):
+                tail = next(spare_tails)
+            fixed_tails[(original, s.net_paise)] = tail
+        else:
+            tail = cached
+        # The narration template and channel are still drawn per credit, so a planted pair's
+        # two rows agree on their parsed ``ref_tail`` and **may or may not** be byte-identical
+        # overall: measured across seeds 1/2/3/42 x n=60/200, the two rows come out identical
+        # in roughly half of runs and differ by template or channel in the rest. Both
+        # outcomes are correct and neither is tuned for. What makes the pair unresolvable is
+        # that the two *settlements* agree on every field that could link a credit to one of
+        # them -- date, amount and UTR -- so a byte-identical pair is merely the same
+        # ambiguity with less surface texture, not a stronger or weaker plant.
         narration = _narration(rng_narration, tail, cfg.narration_styles)
         # ``value_date`` is sourced from ``settled_on``, **not** from the payment's
         # capture date. Until Phase 4 this read ``p.business_date``, which was an
@@ -316,6 +430,19 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # fails before anything reaches disk rather than becoming a truth file that
         # disagrees with its own CSVs.
         gross_total = sum(by_payment[pid].gross_paise for pid in s.payment_ids)
+        # A planted row is unresolvable *from the inputs*, and the answer key says so. The
+        # reason comes from ``common.reasons.Reason`` rather than a hand-typed literal: the
+        # generator's intent and the matcher's verdict have to be drawn from one vocabulary,
+        # or "correct abstention" becomes a judgement call instead of a count
+        # (``reasons.py``'s opening docstring).
+        #
+        # Truth still records *which* settlement really paid this credit. That is not a
+        # contradiction: the answer key may know things the inputs do not contain, and it is
+        # what lets the scorer tell an honest abstention from a lucky guess -- a matcher that
+        # commits to one member has even odds of naming the right set, and
+        # ``metrics._classify`` grades that as LUCKY_GUESS rather than CORRECT precisely
+        # because the inputs could not have justified it.
+        planted = s.settlement_id in planted_settlement_ids
         credits.append(
             Credit(
                 credit_id=ids.credit_id(seq),
@@ -331,9 +458,17 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
                 ),
                 refunds_netted=[],
                 reserve_held_paise=0,
-                resolvable=True,
-                reason=None,
-                note=None,
+                resolvable=not planted,
+                reason=str(Reason.AMBIGUOUS_DUPLICATE_AMOUNT) if planted else None,
+                note=(
+                    f"planted unresolvable: another credit shares this value_date "
+                    f"({value_date.isoformat()}), this amount ({amount}p) and this UTR "
+                    f"({s.utr}), so no field in the three input files separates them. "
+                    f"Resolving it requires information outside these files; the only "
+                    f"correct verdict is an abstention."
+                    if planted
+                    else None
+                ),
             )
         )
 

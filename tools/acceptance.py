@@ -39,7 +39,9 @@ module owns gates 0, 3 and 7, and sequences the rest.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -735,6 +737,330 @@ def gate_10_mess(sizes: tuple[int, ...] = (60, 200)) -> None:
         print("    determinism holds with both wedges on, outside timing/")
 
 
+#: Phase 4b: pairs ``--dup-amounts`` plants by default (``GenConfig.dup_pairs``). Two rather
+#: than one, so the ``correct_abstention`` denominator is never 1 -- a rate of 1/1 cannot be
+#: told apart from a coincidence.
+DUP_PAIRS = 2
+
+#: A UTR tail as it reaches a bank narration. ``settlements.csv`` carries the masked form
+#: (``XXXX8928``); the narration carries the bare four digits, in any of the four templates
+#: (``NEFT-RZRPAY-8104``, ``IMPS CR/RAZORPAY SOFTWARE/4451``). I7 already guarantees no
+#: amount is echoed into a narration, and every narration in the generated data was measured
+#: to hold exactly one run of digits, exactly four long -- so this pattern cannot pick up a
+#: date fragment or an amount by accident.
+TAIL_RE = re.compile(r"\d{4}")
+
+
+def _csv_rows(path: Path) -> list[dict[str, str]]:
+    """One CSV as a list of dicts. Gate-local: gates read files, they do not import loaders."""
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _tail_of(narration: str) -> str | None:
+    runs = TAIL_RE.findall(narration)
+    return runs[-1] if runs else None
+
+
+def gate_11_planted(sizes: tuple[int, ...] = (60, 200)) -> None:
+    """Phase 4b: the exception list is **measured**, not asserted.
+
+    Every earlier gate scores a run in which every row is resolvable, so
+    ``correct_abstention`` has never held a number -- it printed as 0/0 while carrying this
+    project's central claim, that the honest-abstention count is a measurement rather than a
+    promise. This gate is where that cell gets a denominator, and it is why ``--dup-amounts``
+    was pulled out of Phase 8 into a phase of its own.
+
+    **The load-bearing assertion is the UTR one, and it is not the obvious one.** Before this
+    flag was built, a tail-only strategy -- reading no date and no amount, joining the bank
+    narration straight onto ``settlements.csv``'s ``utr`` column -- was measured resolving
+    60/60, 200/200 and 1000/1000 credits *correctly* on every dev seed, clean and under both
+    wedges alike, because tails are drawn without replacement. So a pair colliding on
+    ``(date, amount)`` while keeping distinct tails is **still separable**, by a strategy no
+    more sophisticated than exhaustive string matching. Marking such a pair
+    ``resolvable=false`` would be a false statement about the data, and every
+    ``correct_abstention`` counted on it would be counting a fiction.
+
+    That is not a hypothetical: it is the failure a comparable Track 04 build recorded
+    against itself, when the tier it had designed as its AI showcase fell to enumeration of
+    narration substrings -- 200/200, zero wrong. So this gate re-runs that cheap attack on
+    every planted row and requires it to come back *ambiguous*. A flag that survives only
+    because nobody tried the cheap attack is not testing the capability its name claims.
+
+    What it asserts, per dev seed and size, with all three implemented flags on:
+
+      * ``planted_pairs`` in the manifest, and ``2 x`` that many unresolvable rows in truth,
+        each carrying ``AMBIGUOUS_DUPLICATE_AMOUNT``. The count is the *denominator*, so a
+        wrong one silently rescales the claim rather than failing it.
+      * ``I3.unique_date_amount`` suspended and **named** in the manifest, and nothing else
+        suspended. An unannounced skip is what made the old ``clean_mode`` gate dangerous.
+      * each planted pair shares one ``(value_date, amount_paise)`` **and one UTR**, and its
+        two narrations parse to the same tail.
+      * the tail-only join is ambiguous on every planted row and still resolves every other
+        row -- so the plant is doing the work, and the file has not simply been degraded.
+      * the matcher abstains on both members with that same code, and ``correct_abstention``
+        equals the planted count exactly.
+      * ``lucky_guess`` is 0. A matcher that commits to one member of a pair has even odds of
+        naming the right payment set, and crediting that would reward guessing over
+        abstaining -- the inversion the scorer exists to prevent.
+      * correctness 100% and 0 wrong matches, **unconditionally**, exactly as in gate 10.
+      * a negative control: the same seed and size *without* the flag must report 0 planted
+        and ``correct_abstention`` 0. A rate is only attributable to a cause if the run
+        without that cause reads zero.
+
+    A coverage shortfall beyond the planted rows is permitted, for gate 10's reason: with
+    I3's uniqueness check suspended a *natural* collision may also occur, and abstaining
+    there is correct behaviour that the scorer records as ``MISSED``.
+
+    What a pass does **not** prove: that a planted pair is unresolvable by every conceivable
+    strategy -- only that it defeats the two this data supports (date+amount, and the UTR
+    tail) plus the amount arithmetic. It also says nothing about three-way collisions, which
+    I12 refuses at generation time rather than scoring.
+    """
+    print(
+        f"\ngate 11 -- Phase 4b: {DUP_PAIRS} planted unresolvable pair(s), "
+        f"seeds {list(DEV_SEEDS)}"
+    )
+    with tempfile.TemporaryDirectory(prefix="hisaab-planted-") as tmp:
+        root = Path(tmp)
+        for seed in DEV_SEEDS:
+            for n in sizes:
+                base = root / f"s{seed}n{n}"
+                data, truth = base / "data", base / "truth"
+                _run(
+                    [
+                        sys.executable, "-m", "hisaab.generator",
+                        "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                        "--out", str(data), "--truth", str(truth), "--quiet",
+                        "--fees", "--settlement-delay", "--dup-amounts",
+                    ],
+                    f"generator with --dup-amounts at seed {seed}, n={n}",
+                )
+
+                manifest = json.loads(
+                    (truth / "run_manifest.json").read_text(encoding="utf-8")
+                )
+                stated = manifest["config"]["planted_pairs"]
+                if stated != DUP_PAIRS:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: run_manifest states planted_pairs={stated}, "
+                        f"expected {DUP_PAIRS}. This number is the correct_abstention "
+                        f"denominator, and the run describes its own answer key with it."
+                    )
+                skipped = manifest["invariants"]["checks_skipped"]
+                if skipped != {"I3.unique_date_amount": ["dup_amounts"]}:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: expected exactly I3.unique_date_amount to be "
+                        f"suspended and named in the manifest, got {skipped}. A check that "
+                        f"stands down invisibly is what made the old clean_mode gate "
+                        f"dangerous -- the checks vanished and the output looked identical."
+                    )
+
+                # --- truth's side of the plant --------------------------------------
+                truth_doc = json.loads((truth / "truth.json").read_text(encoding="utf-8"))
+                planted = [c for c in truth_doc["credits"] if not c["resolvable"]]
+                if len(planted) != 2 * DUP_PAIRS:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: truth marks {len(planted)} credit(s) "
+                        f"unresolvable, expected {2 * DUP_PAIRS} ({DUP_PAIRS} pair(s) x 2). "
+                        f"A miscount rescales the central claim instead of failing it."
+                    )
+                for c in planted:
+                    if c["reason"] != "AMBIGUOUS_DUPLICATE_AMOUNT":
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: planted {c['credit_id']} carries reason "
+                            f"{c['reason']!r}. The generator's intent and the matcher's "
+                            f"verdict must come from one vocabulary, or 'correct abstention' "
+                            f"is a judgement call rather than a count."
+                        )
+
+                # --- the pair must be identical on every field that could link it ----
+                # Joined through the CSVs rather than read off truth: truth.json carries no
+                # value_date and no amount_paise per credit, because the answer key does not
+                # duplicate the bank statement. The linkage is what it adds.
+                bank = {r["row_id"]: r for r in _csv_rows(data / "bank_statement.csv")}
+                utr_of = {
+                    r["settlement_id"]: r["utr"]
+                    for r in _csv_rows(data / "settlements.csv")
+                }
+                groups: dict[tuple[str, str], list[dict]] = {}
+                for c in planted:
+                    row = bank[c["credit_id"]]
+                    groups.setdefault((row["value_date"], row["amount_paise"]), []).append(c)
+                if len(groups) != DUP_PAIRS:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: the {len(planted)} planted rows form "
+                        f"{len(groups)} (date, amount) group(s), expected {DUP_PAIRS}. Three "
+                        f"credits sharing a key is a harder case than the pair this flag "
+                        f"documents, and it would be scored as though it were the pair."
+                    )
+                for key, members in sorted(groups.items()):
+                    if len(members) != 2:
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: planted group {key} has {len(members)} "
+                            f"members, not 2."
+                        )
+                    utrs = {utr_of[sid] for c in members for sid in c["settlement_ids"]}
+                    if len(utrs) != 1:
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: planted group {key} spans {len(utrs)} "
+                            f"distinct UTRs {sorted(utrs)}. The tail reaches the bank "
+                            f"narration and resolves 100% of rows on its own, so this pair "
+                            f"is still separable by exhaustive narration matching -- it is "
+                            f"NOT unresolvable, and truth calling it so is a false statement "
+                            f"about the data."
+                        )
+                    tails = {_tail_of(bank[c["credit_id"]]["narration"]) for c in members}
+                    if len(tails) != 1 or None in tails:
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: planted group {key}'s two narrations parse "
+                            f"to tails {sorted(str(t) for t in tails)} despite one shared "
+                            f"UTR. story.build's echo fixup must be memoised, or each member "
+                            f"draws its own spare tail and the pair is separated again."
+                        )
+
+                # --- the brute-force attack, actually run rather than argued away ----
+                by_tail: dict[str, list[str]] = {}
+                for sid, utr in utr_of.items():
+                    by_tail.setdefault(utr.removeprefix("XXXX"), []).append(sid)
+                planted_ids = {c["credit_id"] for c in planted}
+                separated: list[str] = []
+                ambiguous = 0
+                for cid, row in bank.items():
+                    tail = _tail_of(row["narration"])
+                    hits = by_tail.get(tail or "", [])
+                    if len(hits) == 1:
+                        if cid in planted_ids:
+                            separated.append(cid)
+                    else:
+                        ambiguous += 1
+                if separated:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: a tail-only strategy -- no date, no amount, "
+                        f"just the narration joined onto settlements.csv -- uniquely resolves "
+                        f"planted row(s) {sorted(separated)}. The plant is separable by brute "
+                        f"force, so it does not test the capability its name claims and "
+                        f"resolvable=false is false for those rows."
+                    )
+                if ambiguous != len(planted):
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: the tail-only join is ambiguous on {ambiguous} "
+                        f"row(s) but only {len(planted)} were planted. The file has been "
+                        f"degraded beyond the plant -- a tail missing or colliding elsewhere "
+                        f"is --utr-patchy's job in Phase 8, not this flag's."
+                    )
+
+                # --- and now the number this whole phase exists to produce -----------
+                out = base / "matches.json"
+                doc = _matcher_and_score(
+                    data, truth, out, seed, extra=["--window", str(MESS_WINDOW_DAYS)],
+                )
+                cells = doc["cells"]  # type: ignore[index]
+                rates = doc["rates"]  # type: ignore[index]
+                totals = doc["totals"]  # type: ignore[index]
+                wrong = (
+                    cells["wrong_match"] + cells["wrong_match_invented"]
+                    + cells["lucky_guess"]
+                )
+                if wrong or rates["correctness"] != 1.0:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: correctness {rates['correctness']}, {wrong} "
+                        f"wrong match(es). This line never bends -- and a lucky_guess here "
+                        f"means the matcher committed on a row the inputs cannot separate, "
+                        f"which is either a guess or a leak.\n  cells: {cells}"
+                    )
+                if totals["planted_unresolvable"] != 2 * DUP_PAIRS:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: the scorer read "
+                        f"{totals['planted_unresolvable']} planted unresolvable row(s), "
+                        f"expected {2 * DUP_PAIRS}."
+                    )
+                if cells["correct_abstention"] != 2 * DUP_PAIRS:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: correct_abstention is "
+                        f"{cells['correct_abstention']}, expected {2 * DUP_PAIRS}. Every "
+                        f"planted row must be abstained on: this cell IS the claim that the "
+                        f"exception list is measured rather than asserted.\n"
+                        f"  cells: {cells}"
+                    )
+
+                verdicts = json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+                by_id = {v["credit_id"]: v for v in verdicts}
+                for cid in sorted(planted_ids):
+                    v = by_id[cid]
+                    if (
+                        v["outcome"] != "EXCEPTION"
+                        or v["reason"] != "AMBIGUOUS_DUPLICATE_AMOUNT"
+                    ):
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: planted {cid} got "
+                            f"{v['outcome']}/{v['reason']}, expected an EXCEPTION carrying "
+                            f"AMBIGUOUS_DUPLICATE_AMOUNT. Truth and the matcher agree on the "
+                            f"vocabulary, or the count means nothing."
+                        )
+                bad = [
+                    v for v in verdicts
+                    if v["outcome"] != "RESOLVED"
+                    and v.get("reason") not in ABSTENTION_REASONS
+                ]
+                if bad:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(bad)} row(s) failed for a reason that is "
+                        f"not an honest abstention: "
+                        f"{sorted({str(v.get('reason')) for v in bad})}"
+                    )
+                natural = cells["missed"]
+                print(
+                    f"    seed {seed}, n={n:<4} coverage {rates['coverage']:>7.2%}  "
+                    f"correct abstentions {cells['correct_abstention']}/"
+                    f"{totals['planted_unresolvable']}  wrong 0  lucky 0  "
+                    f"tail-join blind on all {len(planted)} planted"
+                    + (f"  (+{natural} natural collision)" if natural else "")
+                )
+
+        # --- the negative control -------------------------------------------------
+        # Without it, "correct_abstention is 4" could be reporting something the flag had no
+        # part in. A rate is attributable only if the run without the cause reads zero.
+        seed, n = DEV_SEEDS[0], sizes[0]
+        base = root / "control"
+        data, truth = base / "data", base / "truth"
+        _run(
+            [
+                sys.executable, "-m", "hisaab.generator",
+                "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                "--out", str(data), "--truth", str(truth), "--quiet",
+                "--fees", "--settlement-delay",
+            ],
+            "generator without --dup-amounts (the negative control)",
+        )
+        control = _matcher_and_score(
+            data, truth, base / "matches.json", seed,
+            extra=["--window", str(MESS_WINDOW_DAYS)],
+        )
+        if (
+            control["totals"]["planted_unresolvable"]  # type: ignore[index]
+            or control["cells"]["correct_abstention"]  # type: ignore[index]
+        ):
+            raise GateFailure(
+                f"without --dup-amounts the run still reports "
+                f"{control['totals']['planted_unresolvable']} planted unresolvable row(s) "  # type: ignore[index]
+                f"and correct_abstention {control['cells']['correct_abstention']}. Then the "  # type: ignore[index]
+                f"flagged run's count is not attributable to the flag."
+            )
+        control_manifest = json.loads(
+            (truth / "run_manifest.json").read_text(encoding="utf-8")
+        )
+        if control_manifest["config"]["planted_pairs"] != 0:
+            raise GateFailure(
+                "a run without --dup-amounts reports a non-zero planted_pairs, which "
+                "describes an answer key it does not have"
+            )
+        print(
+            "    control: the same seed and size without --dup-amounts reports 0 planted "
+            "and correct_abstention 0 -- the count above is the flag's"
+        )
+
+
 def gate_7_assumptions() -> None:
     """ASSUMPTIONS.md must exist and cover every topic the write-up has to state."""
     print("\ngate 7 -- ASSUMPTIONS.md")
@@ -760,9 +1086,9 @@ def gate_7_assumptions() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-3).")
+    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-4b).")
     p.add_argument("--skip-slow", action="store_true",
-                   help="skip the n=200 sweeps in gates 3, 6 and 9")
+                   help="skip the n=200 sweeps in gates 3, 6, 9, 10 and 11")
     args = p.parse_args(argv)
 
     print("Acceptance -- generator (clean mode) + scoring harness + matcher\n" + "=" * 62)
@@ -776,6 +1102,7 @@ def main(argv: list[str] | None = None) -> int:
         gate_8_fixtures,
         lambda: gate_9_matcher((60,) if args.skip_slow else (60, 200)),
         lambda: gate_10_mess((60,) if args.skip_slow else (60, 200)),
+        lambda: gate_11_planted((60,) if args.skip_slow else (60, 200)),
     ]
     try:
         for gate in gates:
@@ -785,7 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all ten gates pass -- Phases 1 through 4 are complete")
+    print("all eleven gates pass -- Phases 1 through 4b are complete")
     print("\nClean mode still resolves at 100/100/0 (gate 9), and the first two rows of the")
     print("mess dial are on: --fees wedges gross against net, --settlement-delay moves the")
     print("dates, and the matcher holds 100% correctness with 0 wrong matches while proving")
@@ -810,13 +1137,40 @@ def main(argv: list[str] | None = None) -> int:
     print("The zero-rated rail moved to POS UPI, which the pricing page actually verifies.")
     print("That cut the share of rows settling at their gross from 36% to ~6%, so --fees is")
     print("a materially sharper test than the flag alone suggests.")
+    print("\nPhase 4b gave correct_abstention a denominator. For three phases that cell")
+    print("printed 0/0 while carrying this project's central claim -- that the exception list")
+    print("is measured rather than asserted -- because every row in every scored run was")
+    print("resolvable. Gate 11 plants two genuinely indistinguishable pairs and reads 4/4 on")
+    print("all three dev seeds at both n=60 and n=200, with 0 lucky guesses.")
+    print("\n  And the plant nearly did not work. Before it was built, a tail-only strategy")
+    print("  -- reading no date and no amount, joining the four digits in the bank narration")
+    print("  straight onto the utr column of settlements.csv -- was measured resolving 60/60,")
+    print("  200/200 and 1000/1000 credits correctly, on every dev seed, clean and under both")
+    print("  wedges alike, because tails are drawn without replacement. So a pair colliding")
+    print("  on (date, amount) while keeping distinct UTRs is still separable, by a strategy")
+    print("  no more sophisticated than exhaustive string matching: marking it unresolvable")
+    print("  would have been a false statement about the data, and every abstention counted")
+    print("  on it a fiction. Each planted pair now shares one UTR, and gate 11 re-runs that")
+    print("  cheap attack on every planted row and requires it to come back ambiguous.")
+    print("\n  The coverage shortfall is exactly the plant and nothing else: 56/60 and")
+    print("  196/200. Seed 3 at n=200 reads 195/200 because it also throws the natural")
+    print("  collision gate 10 found, and that row lands in MISSED while correct_abstention")
+    print("  stays 4/4 -- a coincidental ambiguity cannot inflate the planted count. The same")
+    print("  seed and size without the flag reports 0 planted and 0 abstentions, so the")
+    print("  number is attributable to the flag and not to the fixture.")
     print("\nWhat this still does NOT prove: the business-day calendar is exercised only by")
-    print("its own unit test, the narration parser is not on the match path at all (gated,")
-    print("deliberately), and every settlement is still one payment -- subset-sum is Phase 5.")
-    print("\nNext (.plan/phase4.md as amended): Phase 4b, --dup-amounts. It plants a genuinely")
-    print("indistinguishable (date, amount) pair on purpose, which is the case seed 3 just")
-    print("produced by accident -- so the abstention path above gets tested deliberately")
-    print("rather than by luck, and I3 must be suspended for that flag alone.")
+    print("its own unit test, the narration parser is still not on the match path at all")
+    print("(gated, deliberately -- gate 11 reads narrations to attack the data, never to")
+    print("resolve it), and every settlement is still one payment. A planted pair is shown")
+    print("to defeat the two strategies this data supports -- date-plus-amount and the UTR")
+    print("tail -- plus the amount arithmetic, not every conceivable one; and three-way")
+    print("collisions are refused by I12 at generation time rather than scored.")
+    print("\nNext (.plan/phase5.md): Phase 5, --batching, many payments to one bank credit.")
+    print("The measurement that shaped the plan: --batching alone does NOT force subset-sum,")
+    print("because settlement_items.csv declares membership and turns the search into a")
+    print("lookup. So --settlement-report-late moves forward from Phase 8 and is withheld")
+    print("partially -- partially, because total withholding makes the tier distribution a")
+    print("swap and would hide a Tier 1 regression behind a Tier 2 success.")
     return 0
 
 

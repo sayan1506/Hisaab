@@ -132,21 +132,32 @@ python -m hisaab.generator --seed 42 --n 60   # if you have not already
 python tools/acceptance.py
 ```
 
-Ten gates, one command, exit code is the verdict. Byte-identical output at a fixed
+Eleven gates, one command, exit code is the verdict. Byte-identical output at a fixed
 seed across two processes; invariants on three seeds in memory and again re-read from
 disk; the leak audit; truth isolation; throughput; the assumptions file; the four
 known-answer fixtures; the matcher at 100/100/0 across three seeds × two sizes, including
-the check that blanking every bank narration changes no decision; and gate 10, which turns
-on the first two rows of the difficulty dial and proves the arithmetic per row.
+the check that blanking every bank narration changes no decision; gate 10, which turns
+on the first two rows of the difficulty dial and proves the arithmetic per row; and gate
+11, which plants pairs that genuinely cannot be resolved and reads the abstention count.
 
 Gate 10 is the one worth reading the source of, because of what it declines to assert. The
 plan called for a flat 100/100/0 under `--fees --settlement-delay`; measurement said the
 plan was wrong, and the gate now permits coverage to fall **only** onto an honest
 abstention, while correctness and the wrong-match count never bend.
 
+Gate 11 is where `correct_abstention` stops being a promise. For three phases it printed
+0/0, because every row in every scored run was resolvable; it now reads **4/4** on three
+seeds × two sizes. The assertion that took the work is not the obvious one: before the
+flag existed, a strategy reading **no date and no amount** — just the four digits in the
+bank narration, joined onto the `utr` column — resolved 60/60, 200/200 and 1000/1000
+credits *correctly*, because tails are drawn without replacement. So a pair colliding on
+`(date, amount)` while keeping distinct UTRs is still separable by exhaustive string
+matching, and calling it unresolvable would have been a false statement about the data.
+Each planted pair now shares one UTR, and the gate re-runs that attack every time.
+
 ---
 
-## Current state — Phase 4 of 13
+## Current state — Phase 4b of 13
 
 | | Phase | State |
 |---|---|---|
@@ -154,8 +165,8 @@ abstention, while correctness and the wrong-match count never bend.
 | ✅ | **2. Scoring harness** | Done. Coverage/correctness, the exception queue, four known-answer fixtures |
 | ✅ | **3. Matcher, Tier 1** | Done. Exact `(value_date, net_paise)` join, 100/100/0 on clean mode |
 | ✅ | **4. Fees and the settlement delay** | Done. The residual **gates**, the decomposition is published per row and checked term by term, the window is proved load-bearing |
-| ⬜ | 4b. Planted unresolvables (`--dup-amounts`) | Next. Plants deliberately what seed 3 produced by accident |
-| ⬜ | 5–8. Batching, adjustments, orphans, FX | The rest of the difficulty dial, one flag at a time |
+| ✅ | **4b. Planted unresolvables (`--dup-amounts`)** | Done. Each pair shares a date, an amount **and a UTR** — the last one because a tail-only join resolved 100% without either of the others |
+| ⬜ | 5–8. Batching, adjustments, orphans, FX | Next. The rest of the difficulty dial, one flag at a time |
 | ⬜ | 9–13. Exception ranking, LLM layer, HTML report, holdout, write-up | |
 
 The scorer was built **before** the matcher on purpose. Building it second means spending

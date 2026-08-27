@@ -49,7 +49,7 @@ RESERVED_STREAMS = (
     "tds",        # Phase 6  --tds
     "noise",      # Phase 7  --noise-rows
     "unsettled",  # Phase 7  --unsettled
-    "dup",        # Phase 8  --dup-amounts
+    "dup",        # Phase 4b --dup-amounts
     "fx",         # Phase 8  --fx
     "utr_patchy",  # Phase 8  --utr-patchy
 )
