@@ -18,12 +18,27 @@ done" is a claim with a check behind it rather than a feeling.
   9. the matcher scores 100/100/0 across seeds and sizes, without the UTR shortcut  [Phase 3]
  10. --fees and --settlement-delay: correctness holds, the arithmetic is proved per row
      against truth term by term, and the window is shown to be load-bearing  [Phase 4]
+ 11. planted unresolvable pairs abstain, and the cheap UTR-tail attack is re-run on
+     every planted row and required to come back ambiguous  [Phase 4b]
+ 12. both tiers carry rows, so a Tier 1 regression cannot hide behind a Tier 2
+     success -- and the subset search's bound refuses rather than guessing  [Phase 5]
+ 13. all seven implemented flags at once: the three new deduction terms are non-zero
+     and re-derived, and the reserve is diagnosed but never resolved  [Phase 6]
 
 **This file grows a gate per phase; it never turns over.** Gates 0-7 are Phase 1's and
 still run, because row 1 of the mess dial is the regression check -- "if clean mode is
 not 100%, the code is broken" only works if clean mode keeps being measured. Gate 8
 arrived with Phase 2's scoring harness, gate 9 with Phase 3's matcher, gate 10 with
-Phase 4's fee model and date wedge.
+Phase 4's fee model and date wedge, gate 11 with Phase 4b's plants, gate 12 with
+Phase 5's batching and subset search, gate 13 with Phase 6's three new terms.
+
+**Gate 13 is the argument for that no-turnover rule, in one gate.** It is the first
+thing here to run ``--netted-refunds`` alongside ``--batching`` and
+``--settlement-report-late``, and it found three defects sitting in already-green code
+-- including two wrong matches per run at n=1000, the one number this project says never
+moves. Every earlier gate passed throughout. A suite that had replaced its old gates
+with new ones would have had no way to notice, because the failures live in the
+*interaction* between flags rather than in any single one.
 
 Note what gate 10 does **not** assert: a flat 100% coverage. The plan asked for it, and
 measurement said the plan was wrong -- one credit on one seed is genuinely ambiguous, and
@@ -502,6 +517,24 @@ ABSTENTION_REASONS: frozenset[str] = frozenset(
         # ``Reason.AMBIGUOUS_ADJUSTMENT``); a code that is unreachable today and *not*
         # listed would turn into a spurious gate failure the first time a rate is re-pointed.
         "AMBIGUOUS_ADJUSTMENT",
+        # Phase 6 steps 6 and 7, and both were **missing until gate 13 was written** -- worth
+        # recording, because the reason they went unnoticed is structural rather than careless.
+        # No gate before 13 runs ``--netted-refunds`` or ``--reserve``, so the reason-code
+        # check at the bottom of this file had no run that could emit either one. A vocabulary
+        # this list does not know about does not fail loudly; it fails the first time a gate
+        # exercises the flag, which is exactly what gate 13 is for.
+        #
+        # ``REFUND_UNLINKED``: a refund whose payment is outside this month's file. Its amount
+        # *is* declared in ``refunds.csv``, so the row is resolvable in principle -- the
+        # abstention scores as a MISSED, not a correct abstention, and truth marks the holder
+        # ``resolvable: true`` for precisely that reason.
+        "REFUND_UNLINKED",
+        # ``PARTIAL_SETTLEMENT_PENDING``: a credit short of a settlement's net by a plausible
+        # rolling reserve. The held amount is declared in **no input file at all**, so the
+        # arithmetic cannot be closed from the inputs -- while the payment set remains
+        # recoverable from the untouched UTR, which is why these rows are also
+        # ``resolvable: true`` and also score as misses.
+        "PARTIAL_SETTLEMENT_PENDING",
     }
 )
 
@@ -1418,6 +1451,477 @@ def gate_12_tier_mix(sizes: tuple[int, ...] = (60, 200)) -> None:
         print(_gate_12_cap_probe(root))
 
 
+def _half_up_bps(amount_paise: int, bps: int) -> int:
+    """``amount_paise * bps / 10_000``, rounded half-up at the paisa.
+
+    Deliberately **re-implemented** here rather than imported from ``hisaab.common.money``.
+    Gate 13 re-derives the TDS term to check the generator's arithmetic, and calling the
+    generator's own rounding helper would make that a comparison of a function with itself:
+    the two would agree on any rounding bug they shared, which is precisely the bug worth
+    catching. One line of integer arithmetic is a cheap price for an independent witness.
+
+    ``floor(x + 1/2)`` on ``x = a*b/10_000``, done in integers as
+    ``(2ab + 10_000) // 20_000``. The track spec's worked example: a fee of 2,222p at 18%
+    GST is 399.96p, which must land on 400.
+    """
+    assert amount_paise >= 0 and bps >= 0, (amount_paise, bps)
+    return (2 * amount_paise * bps + 10_000) // 20_000
+
+
+def _orphan_bearing_undeclared(data: Path, credits: list[dict[str, object]]) -> set[str]:
+    """Credits that net an **orphan** refund *and* whose settlement membership is withheld.
+
+    The one shape on a Phase 6 run where ``NO_CANDIDATE`` is the honest answer, and it needs
+    both halves at once:
+
+      * An *orphan* refund cites a payment outside this month's ``payments.csv``, so the
+        matcher cannot attribute it -- ``refunds_by_payment`` rightly excludes it, and no
+        per-member reading can price it.
+      * With membership **declared**, that is not fatal: the settlement is matched on amount
+        and the gap is named, which is ``REFUND_UNLINKED`` -- an honest abstention.
+      * With membership **withheld**, the subset search's target is short by an amount nothing
+        in the inputs explains, so the true set is not in the search space at all. The search
+        looked and found nothing: ``NO_CANDIDATE``, meaning "a deduction is unmodelled", which
+        is exactly what its note says.
+
+    Returned as an identity set rather than admitted as a reason code, because widening
+    ``ABSTENTION_REASONS`` to include ``NO_CANDIDATE`` would let *every* failure to find a
+    candidate score as an honest refusal -- and telling a gateway credit it cannot explain from
+    a non-gateway row is Phase 7's entire job. Gate 13 asserts containment in this set, so a
+    second ``NO_CANDIDATE`` arriving for any other reason still fails the suite.
+    """
+    known = {row["payment_id"] for row in _rows(data / "payments.csv")}
+    orphan_refund_ids = {
+        row["refund_id"] for row in _rows(data / "refunds.csv")
+        if row["payment_id"] not in known
+    }
+    declared = {row["settlement_id"] for row in _rows(data / "settlement_items.csv")}
+    return {
+        str(c["credit_id"]) for c in credits
+        if set(c.get("refunds_netted") or ()) & orphan_refund_ids  # type: ignore[arg-type]
+        and not (set(c["settlement_ids"]) & declared)  # type: ignore[arg-type]
+    }
+
+
+def _rows(path: Path) -> list[dict[str, str]]:
+    """Every row of a CSV as a dict. An absent file reads as no rows, never as an error."""
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _gross_by_payment(data: Path) -> dict[str, int]:
+    """``payment_id -> gross_paise``, read from ``payments.csv``.
+
+    From the *inputs* rather than from truth, which is the whole point: it makes the TDS
+    re-derivation a comparison between truth's declared term and the file the matcher
+    reads. Taking both sides out of truth would pass a generator that wrote a wrong gross
+    and a TDS that agreed with it.
+    """
+    with (data / "payments.csv").open("r", encoding="utf-8", newline="") as f:
+        return {row["payment_id"]: int(row["gross_paise"]) for row in csv.DictReader(f)}
+
+
+#: Phase 6's full flag set. ``--dup-amounts`` is deliberately absent and cannot be added:
+#: ``GenConfig`` refuses it alongside either ``--netted-refunds`` or ``--reserve``, because
+#: moving one member of a planted pair's credit away from its partner's makes the pair separable
+#: and turns truth's ``resolvable: false`` into a false statement. Gate 11 owns the planted rows.
+PHASE6_FLAGS: tuple[str, ...] = (
+    "--fees", "--settlement-delay", "--batching", "--settlement-report-late",
+    "--netted-refunds", "--tds", "--reserve",
+)
+
+#: The TDS rate the generator withholds, in basis points. §194-O was cut from 1% to 0.1%
+#: effective 2024-10-01 (ASSUMPTIONS #9); the gate re-derives the term rather than trusting it.
+PHASE6_TDS_BPS = 10
+
+
+def _reserve_failure(
+    verdicts: list[dict[str, object]],
+    reserved_ids: set[str],
+    label: str,
+) -> str | None:
+    """Gate 13's predicate: did the reserve land as a *diagnosis* and never as a match?
+
+    Returns a complaint or ``None``. Separate from the data for the reason
+    ``_gate_12_self_check`` records: a predicate that cannot go green is a ``raise`` wearing a
+    gate's clothes, so ``_gate_13_self_check`` runs this against a healthy shape and against
+    every failing shape before the gate reads a real run.
+
+    Three things, and the middle one is the regression test the plan's correction (c) asked for:
+
+      * **No resolved row carries a non-zero ``reserve_paise``.** Decision 4: the reserve is not
+        modelled, because a deduction with a free magnitude closes every gap by construction --
+        it would convert ``UNEXPLAINED_RESIDUAL`` rows into resolved ones while every arithmetic
+        gate stayed green. This is the assertion that would catch someone "improving" coverage by
+        fitting the shortfall.
+      * **Every reserved credit abstains as ``PARTIAL_SETTLEMENT_PENDING``, never
+        ``NO_CANDIDATE``.** A reserved credit is short of its settlement's net, so at an exact
+        amount band it reaches blocking and finds nothing -- indistinguishable from a
+        non-gateway row, which is exactly the distinction Phase 7 exists to make. So Phase 6
+        owes Phase 7 a ``NO_CANDIDATE`` that is not silently carrying reserved rows.
+      * **No reserved credit is resolved at all.** The held amount is declared in no input file,
+        so committing to a settlement means fitting a magnitude nothing can verify.
+    """
+    by_id = {str(v.get("credit_id")): v for v in verdicts}
+
+    fitted = [
+        str(v.get("credit_id")) for v in verdicts
+        if v.get("outcome") == "RESOLVED"
+        and int((v.get("decomposition") or {}).get("reserve_paise", 0) or 0)  # type: ignore[union-attr]
+    ]
+    if fitted:
+        return (
+            f"{label}: {len(fitted)} resolved row(s) carry a non-zero reserve_paise "
+            f"(e.g. {fitted[:3]}). The reserve is deliberately NOT modelled (decision 4): its "
+            f"magnitude is declared in no input file, so a rule that fits it closes every gap "
+            f"by construction and turns unexplained residuals into confident matches while "
+            f"every arithmetic gate stays green"
+        )
+
+    resolved_reserved = sorted(
+        cid for cid in reserved_ids
+        if by_id.get(cid, {}).get("outcome") == "RESOLVED"
+    )
+    if resolved_reserved:
+        return (
+            f"{label}: {len(resolved_reserved)} reserved credit(s) were RESOLVED "
+            f"(e.g. {resolved_reserved[:3]}). The held amount appears in no input file, so "
+            f"committing to a settlement here means fitting a magnitude nothing can verify"
+        )
+
+    miscoded = sorted(
+        (cid, str(by_id.get(cid, {}).get("reason")))
+        for cid in reserved_ids
+        if str(by_id.get(cid, {}).get("reason")) != "PARTIAL_SETTLEMENT_PENDING"
+    )
+    if miscoded:
+        no_candidate = [cid for cid, reason in miscoded if reason == "NO_CANDIDATE"]
+        return (
+            f"{label}: {len(miscoded)} reserved credit(s) abstain with the wrong reason "
+            f"(e.g. {miscoded[:3]})."
+            + (
+                f" {len(no_candidate)} came back NO_CANDIDATE, which is the specific failure "
+                f"this assertion exists for: a reserved row hiding inside NO_CANDIDATE is "
+                f"indistinguishable from a non-gateway credit, and telling those two apart is "
+                f"Phase 7's entire job."
+                if no_candidate
+                else ""
+            )
+        )
+    return None
+
+
+def _gate_13_self_check() -> None:
+    """Prove ``_reserve_failure`` is satisfiable, and rejects each shape it claims to.
+
+    Same discipline as ``_gate_12_self_check`` and for the same reason: gate 13's value is
+    entirely in what it refuses, so the predicate is exercised against a known-good input and
+    against every known-bad one before a single real run is read.
+    """
+    def row(cid: str, outcome: str, reason: str | None = None,
+            reserve: int = 0) -> dict[str, object]:
+        v: dict[str, object] = {"credit_id": cid, "outcome": outcome, "reason": reason}
+        if outcome == "RESOLVED":
+            v["decomposition"] = {"reserve_paise": reserve}
+        return v
+
+    healthy = [
+        row("C0001", "RESOLVED"),
+        row("C0002", "RESOLVED"),
+        row("C0003", "EXCEPTION", "PARTIAL_SETTLEMENT_PENDING"),
+        # An unrelated abstention must not be read as a reserve failure.
+        row("C0004", "EXCEPTION", "AMBIGUOUS_MULTI_SUBSET"),
+    ]
+    if (got := _reserve_failure(healthy, {"C0003"}, "probe")) is not None:
+        raise GateFailure(
+            f"gate 13's predicate rejects a healthy reserved run, so the failure it reports "
+            f"below would be unconditional and would prove nothing: {got}"
+        )
+    # No reserved rows at all (every gate before this one) must also be clean, or the gate
+    # cannot be run on an unreserved control.
+    if _reserve_failure(healthy[:2], set(), "probe") is not None:
+        raise GateFailure("gate 13's predicate fails on a run with no reserve at all")
+
+    for bad, reserved, want in (
+        # Decision 4's trap: a resolved row that priced the reserve.
+        ([row("C0001", "RESOLVED", reserve=500)], set(), "non-zero reserve_paise"),
+        # A reserved row resolved anyway.
+        ([row("C0003", "RESOLVED")], {"C0003"}, "were RESOLVED"),
+        # Correction (c)'s regression: the reserved row hid inside NO_CANDIDATE.
+        ([row("C0003", "EXCEPTION", "NO_CANDIDATE")], {"C0003"}, "NO_CANDIDATE"),
+        # ...or any other wrong code.
+        ([row("C0003", "EXCEPTION", "UNEXPLAINED_RESIDUAL")], {"C0003"}, "wrong reason"),
+    ):
+        got = _reserve_failure(bad, reserved, "probe")
+        if got is None or want not in got:
+            raise GateFailure(
+                f"gate 13's predicate failed to reject a bad shape: expected a complaint "
+                f"containing {want!r}, got {got!r}"
+            )
+
+
+def gate_13_phase6(sizes: tuple[int, ...] = (200, 1000)) -> None:
+    """Phase 6: three new deduction terms, and the one that must never be resolved.
+
+    Every gate before this one scores runs where the whole gross/net wedge is fee and GST. This
+    gate turns on all seven implemented flags at once and asserts the properties Phase 6's three
+    terms are supposed to have -- two of which are *arithmetic* and one of which is a refusal.
+
+    **It runs at n=1000, and that size is not incidental.** Phase 6 step 5 swept the amount band
+    and found its coverage cost severe and asymmetric with size: free up to 1,000p at n=200,
+    while at n=1000 even 100p costs 6 rows and 1,000p costs 41. A property justified only at
+    n=200 is justified on the size where it cannot fail.
+
+    What it asserts, per size:
+
+      * **All three new terms are non-zero somewhere**, and TDS on *every* settlement. At 10 bps
+        against a floor of ₹100 the smallest drawable TDS is 10p, so a zero term is unreachable
+        -- which inverts the plan's weaker "some row carries each term" into "no row escapes
+        the TDS term". Re-derived at ``PHASE6_TDS_BPS`` rather than trusted, so a rate change in
+        the generator cannot quietly agree with itself.
+      * **The reserve is diagnosed and never resolved** -- ``_reserve_failure``, above, whose
+        three clauses carry their own reasoning.
+      * **Every resolved row names the rule that closed it.** A decomposition without a rule is
+        a number that balances for unstated reasons, and Phase 6 adds two more ways for that to
+        happen.
+      * **Correctness 100% and 0 wrong matches, unconditionally**, plus decomposition agreement
+        1.0 over a denominator equal to the correct-cell count -- gate 12's argument for why a
+        ratio needs its denominator pinned applies unchanged.
+      * **Every coverage shortfall is an honest abstention** from ``ABSTENTION_REASONS``. Both
+        Phase 6 codes had to be *added* to that set to write this gate, which is the gate
+        earning its keep before it ever ran: no earlier gate exercises these flags, so an
+        unknown code would have failed silently until something looked.
+      * **A negative control**: the same seed and size with no flags at all resolves everything
+        and diagnoses no reserve. A rate is only attributable to a cause if the run without the
+        cause reads zero.
+
+    What a pass does **not** prove: that a reserved row *should* have abstained rather than
+    resolved. With the held amount in no input file there is nothing to check against but
+    truth's own record, so this gate can show the matcher declined to guess -- not that
+    declining was the only available answer. That is a genuine limit of design B and it belongs
+    in the write-up rather than in a reviewer's notes.
+    """
+    print(f"\ngate 13 -- Phase 6: all seven flags, seeds {list(DEV_SEEDS)}")
+    _gate_13_self_check()
+
+    with tempfile.TemporaryDirectory(prefix="hisaab-phase6-") as tmp:
+        root = Path(tmp)
+        for seed in DEV_SEEDS:
+            for n in sizes:
+                base = root / f"s{seed}n{n}"
+                data, truth = base / "data", base / "truth"
+                _run(
+                    [
+                        sys.executable, "-m", "hisaab.generator",
+                        "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                        "--out", str(data), "--truth", str(truth), "--quiet", *PHASE6_FLAGS,
+                    ],
+                    f"generator with all Phase 6 flags at seed {seed}, n={n}",
+                )
+                out = base / "matches.json"
+                doc = _matcher_and_score(
+                    data, truth, out, seed, extra=["--window", str(MESS_WINDOW_DAYS)],
+                )
+                verdicts = json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+                truth_doc = json.loads((truth / "truth.json").read_text(encoding="utf-8"))
+                credits = truth_doc["credits"]
+
+                # --- the three terms exist, and TDS is re-derived rather than trusted ----
+                terms = {
+                    name: sum(int(c["decomposition"][f"{name}_paise"]) for c in credits)
+                    for name in ("tds", "refunds", "reserve")
+                }
+                for name, total in sorted(terms.items()):
+                    if not total:
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: the {name} term is zero across every credit "
+                            f"while its flag is on -- the run is labelled with a mess it does "
+                            f"not have, which is the mislabelling MessFlags.IMPLEMENTED exists "
+                            f"to prevent arriving by a different door"
+                        )
+                gross_of = _gross_by_payment(data)
+                zero_tds = [
+                    c["credit_id"] for c in credits
+                    if not int(c["decomposition"]["tds_paise"])
+                ]
+                if zero_tds:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(zero_tds)} credit(s) carry a zero TDS term "
+                        f"(e.g. {zero_tds[:3]}). At {PHASE6_TDS_BPS}bps against a ₹100 floor "
+                        f"the smallest reachable TDS is 10p, so a zero term means the rate "
+                        f"moved or the amount floor did -- and --tds would be a no-op on those "
+                        f"rows while the flag claimed otherwise"
+                    )
+                # Re-derived per credit, exactly, from the members' own grosses in
+                # payments.csv. Per credit rather than in total because two rows wrong in
+                # opposite directions sum correctly -- the same reason I15 compares refunds
+                # term by term.
+                #
+                # A *batch's* term is the sum of its members' terms, never a rate on the
+                # batch total, and the two genuinely differ: three ₹104 members each round
+                # 10.4p down to 10p for 30p, while the same rate on the ₹312 total is 31p.
+                # So this re-derivation has to walk the members, and asserting anything about
+                # ``decomposition.gross_paise`` alone would either be wrong on batches or
+                # loose enough to prove nothing.
+                for c in credits:
+                    got_tds = int(c["decomposition"]["tds_paise"])
+                    members = [str(pid) for pid in c["payment_ids"]]
+                    missing = [pid for pid in members if pid not in gross_of]
+                    if missing:
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: {c['credit_id']} names payment(s) "
+                            f"{missing[:3]} that payments.csv does not contain"
+                        )
+                    want = sum(_half_up_bps(gross_of[pid], PHASE6_TDS_BPS) for pid in members)
+                    if got_tds != want:
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: {c['credit_id']} declares tds_paise="
+                            f"{got_tds}, but {PHASE6_TDS_BPS}bps half-up on each of its "
+                            f"{len(members)} member gross(es) sums to {want}p. Either the "
+                            f"rate is not what ASSUMPTIONS #9 states, or the term is being "
+                            f"taken on the batch total rather than member by member"
+                        )
+
+                # --- the reserve is diagnosed, never resolved ---------------------------
+                reserved_ids = {
+                    str(c["credit_id"]) for c in credits
+                    if int(c["decomposition"]["reserve_paise"])
+                }
+                if not reserved_ids:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: --reserve held nothing back, so the refusal this "
+                        f"gate exists to check has no row to fire on"
+                    )
+                if problem := _reserve_failure(verdicts, reserved_ids, f"seed {seed}, n={n}"):
+                    raise GateFailure(problem)
+
+                # --- every resolved row names its rule ----------------------------------
+                unruled = [
+                    str(v.get("credit_id")) for v in verdicts
+                    if v.get("outcome") == "RESOLVED"
+                    and not (v.get("decomposition") or {}).get("rule")  # type: ignore[union-attr]
+                ]
+                if unruled:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(unruled)} resolved row(s) publish no rule "
+                        f"(e.g. {unruled[:3]}). A decomposition that balances without naming "
+                        f"what closed it is a number a reader cannot audit, and Phase 6 adds "
+                        f"two more terms that could be doing the closing"
+                    )
+
+                # --- the lines that never bend ------------------------------------------
+                cells, rates = doc["cells"], doc["rates"]  # type: ignore[index]
+                wrong = (
+                    cells["wrong_match"] + cells["wrong_match_invented"]  # type: ignore[index]
+                    + cells["lucky_guess"]  # type: ignore[index]
+                )
+                if wrong or rates["correctness"] != 1.0:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: correctness "
+                        f"{rates['correctness']}, {wrong} wrong match(es). "  # type: ignore[index]
+                        f"This line never bends -- and with three new deduction terms in play "
+                        f"a wrong match most likely means one of them closed a gap it had no "
+                        f"business closing.\n  cells: {cells}"
+                    )
+                dec = doc["decomposition"]  # type: ignore[index]
+                if rates["decomposition_agreement"] != 1.0:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: decomposition agreement "
+                        f"{rates['decomposition_agreement']} with "  # type: ignore[index]
+                        f"{dec['mismatches']} mismatch(es). Six terms now, and the "  # type: ignore[index]
+                        f"comparison is term by term precisely because a fee too high and a "
+                        f"TDS too low land on the same total"
+                    )
+                if dec["checked"] != cells["correct"]:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: agreement is 1.0 over only "
+                        f"{dec['checked']} of {cells['correct']} correct row(s) -- "  # type: ignore[index]
+                        f"a ratio is satisfied by not looking"
+                    )
+                unresolved = [v for v in verdicts if v.get("outcome") != "RESOLVED"]
+                # One exemption, and it is an **identity** rather than a reason code: the
+                # credit netting an orphan refund whose settlement membership is withheld.
+                # ``_orphan_bearing_undeclared`` carries the reasoning for why
+                # ``NO_CANDIDATE`` is the honest answer on that row, and why admitting the
+                # code into ABSTENTION_REASONS would be the wrong fix -- it would let every
+                # failure to find a candidate score as an honest refusal, and separating a
+                # gateway credit the matcher cannot explain from a non-gateway row is
+                # Phase 7's entire job. Asserted as containment, so a second NO_CANDIDATE
+                # arriving for any other reason still fails the suite.
+                exempt = _orphan_bearing_undeclared(data, credits)
+                dishonest = [
+                    str(v.get("credit_id")) for v in unresolved
+                    if str(v.get("reason")) not in ABSTENTION_REASONS
+                    and not (
+                        str(v.get("reason")) == "NO_CANDIDATE"
+                        and str(v.get("credit_id")) in exempt
+                    )
+                ]
+                if dishonest:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(dishonest)} unresolved row(s) carry a "
+                        f"reason outside ABSTENTION_REASONS (e.g. {dishonest[:3]}). A "
+                        f"coverage shortfall is only acceptable as an honest abstention. The "
+                        f"only NO_CANDIDATE this gate tolerates is the orphan-refund row whose "
+                        f"membership is withheld ({sorted(exempt) or 'none in this run'}), and "
+                        f"it is named by identity rather than by admitting the code.\n"
+                        f"  reasons seen: "
+                        f"{dict(sorted(collections.Counter(str(v.get('reason')) for v in unresolved).items()))}"
+                    )
+
+                by_reason = collections.Counter(
+                    str(v.get("reason")) for v in unresolved
+                )
+                print(
+                    f"    seed {seed}, n={n:<5} resolved={cells['correct']:<5} "  # type: ignore[index]
+                    f"reserved={len(reserved_ids):<4} "
+                    f"tds={terms['tds']}p refunds={terms['refunds']}p "
+                    f"reserve={terms['reserve']}p"
+                )
+                print(f"      abstentions: {dict(sorted(by_reason.items()))}")
+
+        # --- the negative control -------------------------------------------------
+        # A rate is only attributable to a cause if the run without that cause reads zero.
+        # Same seed, same size, no flags: everything resolves and no reserve is diagnosed.
+        seed, n = DEV_SEEDS[0], sizes[0]
+        base = root / "control"
+        data, truth = base / "data", base / "truth"
+        _run(
+            [
+                sys.executable, "-m", "hisaab.generator",
+                "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                "--out", str(data), "--truth", str(truth), "--quiet",
+            ],
+            f"clean-mode control at seed {seed}, n={n}",
+        )
+        out = base / "matches.json"
+        doc = _matcher_and_score(data, truth, out, seed)
+        verdicts = json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+        cells, rates = doc["cells"], doc["rates"]  # type: ignore[index]
+        if rates["coverage"] != 1.0 or rates["correctness"] != 1.0 or cells["missed"]:  # type: ignore[index]
+            raise GateFailure(
+                f"the clean-mode control at seed {seed}, n={n} no longer scores 100/100/0: "
+                f"coverage {rates['coverage']}, correctness "  # type: ignore[index]
+                f"{rates['correctness']}, {cells['missed']} missed. "  # type: ignore[index]
+                f"Phase 6's reserve probe runs on every abstaining row, so a clean-mode "
+                f"regression here would mean it is firing where nothing was held"
+            )
+        diagnosed = [
+            str(v.get("credit_id")) for v in verdicts
+            if str(v.get("reason")) == "PARTIAL_SETTLEMENT_PENDING"
+        ]
+        if diagnosed:
+            raise GateFailure(
+                f"the clean-mode control diagnosed {len(diagnosed)} reserve(s) "
+                f"(e.g. {diagnosed[:3]}) on a run where nothing was held back. The probe's "
+                f"plausibility floor is what should prevent this, so it is either too low or "
+                f"being applied to the wrong base"
+            )
+        print(f"    control  seed {seed}, n={n}: 100/100/0, 0 reserves diagnosed")
+
+
 def gate_7_assumptions() -> None:
     """ASSUMPTIONS.md must exist and cover every topic the write-up has to state."""
     print("\ngate 7 -- ASSUMPTIONS.md")
@@ -1443,9 +1947,10 @@ def gate_7_assumptions() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-5).")
+    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-6).")
     p.add_argument("--skip-slow", action="store_true",
-                   help="skip the n=200 sweeps in gates 3, 6, 9, 10 and 11")
+                   help="skip the n=200 sweeps in gates 3, 6, 9, 10, 11 and 12. Gate 13 "
+                        "ignores this flag: its wrong-match assertion is invisible at n=200")
     args = p.parse_args(argv)
 
     print("Acceptance -- generator (clean mode) + scoring harness + matcher\n" + "=" * 62)
@@ -1461,6 +1966,16 @@ def main(argv: list[str] | None = None) -> int:
         lambda: gate_10_mess((60,) if args.skip_slow else (60, 200)),
         lambda: gate_11_planted((60,) if args.skip_slow else (60, 200)),
         lambda: gate_12_tier_mix((60,) if args.skip_slow else (60, 200)),
+        # **n=1000 even under --skip-slow, and this is the one gate that ignores the flag.**
+        # Not a preference: the wrong-match defect this gate was written to catch is invisible
+        # at n=200. Before the Tier 2 refund fix, seeds 1 and 2 at n=1000 each resolved two
+        # credits to the wrong payment set (correctness 0.9962) while the *same seeds at n=200
+        # read 1.0000 with zero wrong matches* -- the coincidental-subset rate scales with the
+        # candidate pool, so the small size cannot see it. A --skip-slow run that dropped
+        # n=1000 would report Phase 6 green while blind to its only correctness failure.
+        # Measured cost of keeping it: 2.2s -> 23.5s, and the slow half is the matcher rather
+        # than the generator (n=1000 generates in ~0.5s).
+        lambda: gate_13_phase6((200, 1000)),
     ]
     try:
         for gate in gates:
@@ -1470,7 +1985,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all twelve gates pass -- Phases 1 through 5 are complete")
+    print("all thirteen gates pass -- Phases 1 through 6 are complete")
     print("\nClean mode still resolves at 100/100/0 (gate 9), and the first two rows of the")
     print("mess dial are on: --fees wedges gross against net, --settlement-delay moves the")
     print("dates, and the matcher holds 100% correctness with 0 wrong matches while proving")
@@ -1516,19 +2031,60 @@ def main(argv: list[str] | None = None) -> int:
     print("  stays 4/4 -- a coincidental ambiguity cannot inflate the planted count. The same")
     print("  seed and size without the flag reports 0 planted and 0 abstentions, so the")
     print("  number is attributable to the flag and not to the fixture.")
+    print("\nPhase 6 turned on the three remaining deduction terms -- TDS, netted refunds and")
+    print("a withheld reserve -- and gate 13 is the first thing in this suite to run all seven")
+    print("implemented flags at once. It found three defects that had been sitting in the code,")
+    print("and the reason all three hid is the same: no gate before it ran --netted-refunds")
+    print("alongside --batching and --settlement-report-late.")
+    print("\n  The serious one was a wrong match, which is the single number this project says")
+    print("  never moves. With membership withheld, Tier 2 searches for a subset of payments")
+    print("  summing to the credit, pricing each member at its gross, net of fee, or net of")
+    print("  TDS -- and never net of its refund. So on a refunded settlement the true subset")
+    print("  was not in the search space at all, and the search saw only coincidences. Usually")
+    print("  none, and the row abstained as NO_CANDIDATE: 22 of them on seed 1 at n=1000.")
+    print("  Occasionally one unrelated subset hit the shrunken target exactly and the row")
+    print("  resolved WRONGLY -- two per run on seeds 1 and 2, correctness 0.9962. The fix is")
+    print("  a lookup rather than a fifth hypothesis: refunds.csv names the payment each")
+    print("  refund cites, so the term is declared and subtracts in every reading. Correctness")
+    print("  is back to 1.0000 with 0 wrong matches, and coverage rose with it (549 correct on")
+    print("  seed 1 at n=1000, up from 530).")
+    print("\n  It was invisible at n=200, which is why gate 13 ignores --skip-slow. The same")
+    print("  two seeds that read 0.9962 at n=1000 read a clean 1.0000 with zero wrong matches")
+    print("  at n=200: coincidental subsets scale with the candidate pool, so the small size")
+    print("  cannot see the failure. A fast run that dropped n=1000 would have reported Phase 6")
+    print("  green while blind to its only correctness defect.")
+    print("\n  The second was a crash, and it is the good kind. --netted-refunds --batching at")
+    print("  seed 3 and seed 7, n=200 died before writing a byte, on an assertion that had")
+    print("  predicted the failure in its own message: the linked and planted refunds were")
+    print("  drawn disjoint on *payments*, and batching put both into one settlement, whose")
+    print("  single refunds_paise term would then have been partly attributable. The draw now")
+    print("  excludes whole settlements. An assumption instead of an assertion would have")
+    print("  shipped an incoherent refund term in silence.")
+    print("\n  One NO_CANDIDATE survives, and gate 13 permits it by identity rather than by")
+    print("  admitting the code: the credit that nets the orphan refund AND has its membership")
+    print("  withheld. An orphan refund cites a payment outside this month's file, so nothing")
+    print("  can price it; with membership declared that is REFUND_UNLINKED, an honest")
+    print("  abstention, and with membership withheld the true set is simply unreachable.")
+    print("  Admitting NO_CANDIDATE to ABSTENTION_REASONS would let every failed search score")
+    print("  as an honest refusal, and separating those two is Phase 7's whole job.")
+    print("\n  The reserve is the one term deliberately left unmodelled. Its magnitude appears")
+    print("  in no input file, so a rule that fitted it would close every gap by construction;")
+    print("  gate 13 asserts no resolved row carries a reserve term and that all ~50 reserved")
+    print("  credits abstain as PARTIAL_SETTLEMENT_PENDING rather than vanishing into")
+    print("  NO_CANDIDATE. What a pass does NOT prove is that abstaining was the only available")
+    print("  answer there -- with the held amount in no input, nothing but truth's own record")
+    print("  could say otherwise, and that limit belongs in the write-up.")
     print("\nWhat this still does NOT prove: the business-day calendar is exercised only by")
-    print("its own unit test, the narration parser is still not on the match path at all")
+    print("its own unit test, and the narration parser is still not on the match path at all")
     print("(gated, deliberately -- gate 11 reads narrations to attack the data, never to")
-    print("resolve it), and every settlement is still one payment. A planted pair is shown")
-    print("to defeat the two strategies this data supports -- date-plus-amount and the UTR")
-    print("tail -- plus the amount arithmetic, not every conceivable one; and three-way")
-    print("collisions are refused by I12 at generation time rather than scored.")
-    print("\nNext (.plan/phase5.md): Phase 5, --batching, many payments to one bank credit.")
-    print("The measurement that shaped the plan: --batching alone does NOT force subset-sum,")
-    print("because settlement_items.csv declares membership and turns the search into a")
-    print("lookup. So --settlement-report-late moves forward from Phase 8 and is withheld")
-    print("partially -- partially, because total withholding makes the tier distribution a")
-    print("swap and would hide a Tier 1 regression behind a Tier 2 success.")
+    print("resolve it). A planted pair is shown to defeat the two strategies this data")
+    print("supports -- date-plus-amount and the UTR tail -- plus the amount arithmetic, not")
+    print("every conceivable one; and three-way collisions are refused by I12 at generation")
+    print("time rather than scored.")
+    print("\nNext: Phase 7, --noise-rows and --unsettled -- bank rows that are not gateway")
+    print("credits, and payments that never pay out. Phase 6 leaves it a debt it can now")
+    print("collect: NO_CANDIDATE still means 'nothing plausibly matches', carrying exactly one")
+    print("characterised row rather than a silent pile of reserved and refunded ones.")
     return 0
 
 

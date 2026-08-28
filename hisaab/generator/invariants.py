@@ -112,9 +112,25 @@ from ..common.money import RUPEE
 SUSPENDED_BY: dict[str, tuple[str, ...]] = {
     "I3.cardinality":                ("batching", "noise_rows", "unsettled"),
     "I3.no_refunds":                 ("netted_refunds",),
-    "I3.no_orphans":                 ("unsettled", "reserve", "noise_rows"),
+    # **``reserve`` was removed from the next two entries in Phase 6 step 7, and the removal is
+    # the correction rather than an omission.** Both listed it as a *prediction*, written phases
+    # before any reserve code existed, and building the flag falsified both. Under design B the
+    # reserve is held outside ``net_paise``: the settlement declares its full net and the credit
+    # arrives short, so every settlement still **has** its credit (merely a short one) and no
+    # settlement, payment or bank row becomes an orphan. Both checks pass on a reserved run
+    # untouched, and ``invariants.py``'s self-check now asserts ``checks_skipped == {}`` there --
+    # which is strictly stronger than the suspensions were, because the checks actually run.
+    #
+    # Left in place they would have been the footgun this docstring warns about: two checks
+    # standing down on every reserved run, announced but unnecessary, and the one that catches a
+    # generator dropping a credit outright is exactly the check ``--reserve`` most needs kept.
+    # (I4's precondition comment carried the same wrong prediction and is corrected in place.)
+    # What ``--reserve`` genuinely does break is Strategy D in ``tools/verify_output.py``, which
+    # was *strengthened* into an equality on identities rather than added to that file's
+    # suspension list. Three checks touched, none of them the two predicted here.
+    "I3.no_orphans":                 ("unsettled", "noise_rows"),
     "I2.every_payment_settled":      ("unsettled",),
-    "I2.every_settlement_credited":  ("reserve", "unsettled"),
+    "I2.every_settlement_credited":  ("unsettled",),
     "I6.all_payments_cited":         ("unsettled", "noise_rows"),
     "I3.unique_date_amount":         ("dup_amounts",),
 }
@@ -265,19 +281,41 @@ def check_totals(
     credit_total: int,
     fee_cells: list[int],
     tds_cells: list[int],
+    refund_cells: list[int],
+    reserve_cells: list[int],
     *,
     fees_on: bool = False,
     tds_on: bool = False,
+    refunds_on: bool = False,
+    reserve_on: bool = False,
 ) -> None:
     """I4 — the money adds up in aggregate, and deductions exist only when asked for.
 
-    Four assertions, and only the last two are conditional:
+    Six assertions, and only the last four are conditional:
 
-      * ``net_total == credit_total`` -- every settled paisa reached the bank.
-      * ``gross_total - (every fee/gst/tds cell) == net_total`` -- the wedge between
+      * ``net_total - reserve == credit_total`` -- every settled paisa reached the bank
+        except what was deliberately held back.
+      * ``gross_total - (every fee/gst/tds/refund cell) == net_total`` -- the wedge between
         gross and net is *exactly* the declared deductions and nothing else.
       * with ``--fees`` off, every fee and GST cell is zero.
       * with ``--tds`` off, every TDS cell is zero.
+      * with ``--netted-refunds`` off, every refund cell is zero.
+      * with ``--reserve`` off, every reserve cell is zero.
+
+    Note which assertion ``reserve_cells`` appears in and which it does not: it is subtracted
+    in the *first* and absent from the *second*. See the ``--reserve`` paragraph at the end of
+    this docstring -- that asymmetry is design B stated as arithmetic, and swapping it would
+    make the reserve invisible.
+
+    **``refund_cells`` is Phase 6 step 6, and extending this function is the treatment the
+    plan pre-committed to rather than the one that was tempting.** A refund inside
+    ``net_paise`` makes the four-term wedge false, and the cheap fix -- listing I4 in
+    ``SUSPENDED_BY`` under ``netted_refunds`` -- is exactly the footgun the ``SUSPENDED_BY``
+    docstring describes: the check would stand down at the moment the arithmetic it guards
+    started moving. Measured before this parameter existed: at seed 42, n=60 the flag failed
+    I4 with "+716363 paise unaccounted for", which *is* the run's refund total. So the
+    invariant caught the new term on the first run, which is the behaviour that makes
+    strengthening the right move -- a suspension would have written the file silently.
 
     **The last two were one assertion until Phase 6, and splitting them fixed a false
     refusal and a hole at the same time.** The old form gated all three columns on
@@ -323,17 +361,30 @@ def check_totals(
     ``fee_cells`` is every fee and GST cell and ``tds_cells`` every TDS cell, so the two
     sums together are the whole wedge.
 
-    Precondition, and Phase 7 is where it breaks: every payment sits in exactly one
-    settlement, so summing gross over payments and net over settlements counts the same
-    money. ``--unsettled`` and ``--reserve`` void that and belong in ``SUSPENDED_BY``
-    when they land; neither is implemented yet, so neither is listed there today.
+    Precondition: every payment sits in exactly one settlement, so summing gross over
+    payments and net over settlements counts the same money. ``--unsettled`` voids that and
+    belongs in ``SUSPENDED_BY`` when it lands (Phase 7).
+
+    **This docstring previously named ``--reserve`` alongside it, and building the flag showed
+    that prediction was wrong -- worth keeping rather than quietly deleting, since it is the
+    second wrong guess in this cluster.** A reserve does *not* void the precondition and does
+    not belong in ``SUSPENDED_BY``, because it is held back **outside** ``net_paise``: the
+    settlement still declares its full net, every payment still sits in exactly one
+    settlement, and the gross/net wedge below is untouched. What it breaks is only the *first*
+    assertion, ``net_total == credit_total`` -- money genuinely was settled and did not reach
+    the bank, which is the entire mess. So the fix is ``reserve_cells``, subtracted from the
+    net in that one assertion and **deliberately absent from ``deducted``** in the next.
+    That asymmetry between the two assertions *is* design B, expressed as arithmetic: the
+    reserve sits between net and credit, never between gross and net.
     """
-    deducted = sum(fee_cells) + sum(tds_cells)
+    deducted = sum(fee_cells) + sum(tds_cells) + sum(refund_cells)
+    held = sum(reserve_cells)
     _require(
-        net_total == credit_total,
+        net_total - held == credit_total,
         "I4",
-        f"settled and credited disagree: net={net_total} credited={credit_total} "
-        f"({net_total - credit_total:+d} paise never reached the bank)",
+        f"settled and credited disagree: net={net_total} - reserve={held} = "
+        f"{net_total - held} credited={credit_total} "
+        f"({net_total - held - credit_total:+d} paise never reached the bank)",
     )
     _require(
         gross_total - deducted == net_total,
@@ -345,6 +396,8 @@ def check_totals(
     for label, cells, on in (
         ("fee/gst", fee_cells, fees_on),
         ("tds", tds_cells, tds_on),
+        ("refund", refund_cells, refunds_on),
+        ("reserve", reserve_cells, reserve_on),
     ):
         if on:
             continue
@@ -357,10 +410,19 @@ def check_totals(
         )
 
 
-def check_settlement_arithmetic(rows: list[tuple[str, int, int, int, int, int]]) -> None:
-    """I4 — per settlement: ``net == gross - fee - gst - tds``, and GST sits on the fee.
+def check_settlement_arithmetic(
+    rows: list[tuple[str, int, int, int, int, int]] | list[tuple[str, int, int, int, int, int, int]],
+) -> None:
+    """I4 — per settlement: ``net == gross - fee - gst - tds - refunds``, GST sits on the fee.
 
-    ``rows`` is ``(settlement_id, gross_of_members, net, fee, gst, tds)``.
+    ``rows`` is ``(settlement_id, gross_of_members, net, fee, gst, tds)`` with an optional
+    seventh element for the refunds netted off that settlement. **Optional rather than
+    required**, which is the opposite of the choice ``check_totals`` makes one function up, and
+    the asymmetry is deliberate: that function takes whole columns and a caller omitting one
+    would under-count the wedge silently, while here a missing seventh element is a row that
+    says "no refunds" -- and at zero refunds the assertion is character-for-character the
+    five-term one Phase 6 step 2 left behind. Every pre-Phase-6 fixture in this file therefore
+    keeps testing exactly what it tested before.
 
     The per-row companion to ``check_totals``, and it earns its keep for a reason the
     aggregate cannot cover: totals that agree in sum can still be wrong row by row, and
@@ -382,12 +444,14 @@ def check_settlement_arithmetic(rows: list[tuple[str, int, int, int, int, int]])
     generator agrees with itself. The independent re-derivation is the *matcher's* job,
     and the residual closing to zero is what proves the two sides agree.
     """
-    for sid, gross, net, fee, gst, tds in rows:
+    for row in rows:
+        sid, gross, net, fee, gst, tds = row[:6]
+        refunds = row[6] if len(row) > 6 else 0
         _require(
-            net == gross - fee - gst - tds,
+            net == gross - fee - gst - tds - refunds,
             "I4",
             f"{sid}: net {net} != gross {gross} - fee {fee} - gst {gst} - tds {tds} "
-            f"= {gross - fee - gst - tds}",
+            f"- refunds {refunds} = {gross - fee - gst - tds - refunds}",
         )
         _require(
             gst <= fee,
@@ -395,6 +459,285 @@ def check_settlement_arithmetic(rows: list[tuple[str, int, int, int, int, int]])
             f"{sid}: gst {gst} exceeds fee {fee} -- GST is charged on the fee, not on "
             f"the gross, so this is the two rates applied to the same base",
         )
+
+
+def check_refunds(story: Story, cfg: GenConfig) -> None:
+    """I15 — every refund is netted exactly once, against the settlement truth says.
+
+    **The successor to ``I3.no_refunds``**, which asserted only that no refund existed. That
+    check is suspended under ``--netted-refunds`` (``SUSPENDED_BY``), and a suspension with no
+    successor is how a flag switches off the checks that would have caught its own bugs. Four
+    assertions, and the third is the one the plan singled out:
+
+      * every refund cites a payment in ``payments.csv``, **or** truth records it as
+        out-of-scope -- the planted unlinked refund is the second case, and it is legitimate
+        precisely because truth says so rather than because the check is lenient.
+      * every refund in the file is netted off exactly one credit, and every id a credit cites
+        exists. An emitted refund that reduces nobody's net is money that vanished from the
+        books; a cited id that is not in the file is an answer key describing data it does not
+        have.
+      * **term by term, never in total.** Each credit's ``refunds_paise`` must equal the sum of
+        the refunds it actually cites. A run-wide total would pass while two refunds were
+        attributed to each other's settlements -- the aggregate is identical and every
+        settlement's arithmetic is wrong, which is exactly the failure ``.plan/phase6.md`` step
+        6 names. (Same reasoning as ASSUMPTIONS.md #25 grading a decomposition per term, and as
+        ``adjustments.py`` comparing fee and GST separately.)
+      * no refund is netted twice. Double-counting is the one error that *strengthens* the
+        arithmetic's appearance -- I4's wedge still closes if a refund is subtracted twice and
+        another term absorbs it -- so it needs naming on its own.
+
+    ``cfg`` is read only to decide whether the flag is on, so a clean-mode story reaches this
+    function and leaves it having asserted the honest thing: there are no refunds and nothing
+    claims any.
+    """
+    refunds_by_id = {r.refund_id: r for r in story.refunds}
+    payment_ids = {p.payment_id for p in story.payments}
+
+    if not cfg.flags.netted_refunds:
+        # Not merely skipped. With the flag off the file has no refunds and no credit may claim
+        # one, which is the same statement I3.no_refunds makes -- asserted here too so that
+        # this function is a total check rather than one that only runs on the messy path.
+        _require(not story.refunds, "I15", "refunds emitted without --netted-refunds")
+        claimed = [c.credit_id for c in story.credits if c.refunds_netted]
+        _require(
+            not claimed,
+            "I15",
+            f"credits claim netted refunds without --netted-refunds: {claimed[:5]}",
+        )
+        return
+
+    _require(bool(story.refunds), "I15", "--netted-refunds emitted no refunds at all")
+
+    # Assertion 1: every refund is either linked or declared out-of-scope by truth.
+    #
+    # "Truth records it as out-of-scope" is read off the credit that nets it: the note names
+    # the orphan, and the payment it cites is absent by construction. What is checked here is
+    # the *pairing* -- an unlinked refund must be netted off a credit whose truth entry says so
+    # -- because an orphan refund with no such note would be an answer key that cannot explain
+    # its own data.
+    netted_at: dict[str, str] = {}
+    for c in story.credits:
+        for rid in c.refunds_netted:
+            _require(
+                rid in refunds_by_id,
+                "I15",
+                f"{c.credit_id} cites refund {rid}, which is not in refunds.csv",
+            )
+            # Assertion 4, and it is checked here rather than by counting at the end so the
+            # failure names both claimants instead of only a total.
+            _require(
+                rid not in netted_at,
+                "I15",
+                f"{rid} is netted off both {netted_at.get(rid)} and {c.credit_id} -- a refund "
+                f"subtracted twice can still leave I4's wedge closed, so it is named here",
+            )
+            netted_at[rid] = c.credit_id
+
+    # Assertion 2: nothing in the file is netted off nobody.
+    orphaned = sorted(set(refunds_by_id) - set(netted_at))
+    _require(
+        not orphaned,
+        "I15",
+        f"{len(orphaned)} refund(s) in refunds.csv reduce no credit's net: {orphaned[:5]}. "
+        f"An emitted refund that nets against nothing is money missing from the books.",
+    )
+
+    by_credit_id = {c.credit_id: c for c in story.credits}
+    for r in story.refunds:
+        if r.payment_id in payment_ids:
+            continue
+        # Assertion 1's second branch. Every refund is netted somewhere (assertion 2, above),
+        # so this lookup cannot miss -- and the note must **name the payment it cites**, not
+        # merely be non-empty. A note that exists but describes something else would satisfy a
+        # bare "is not None" while leaving the orphan unexplained, and the whole reason an
+        # out-of-scope refund is admissible is that truth accounts for it.
+        holder = by_credit_id[netted_at[r.refund_id]]
+        _require(
+            holder.note is not None and r.payment_id in holder.note,
+            "I15",
+            f"{r.refund_id} cites {r.payment_id}, which is not in payments.csv, and "
+            f"{holder.credit_id}'s truth note does not name it -- an orphan refund the answer "
+            f"key cannot explain is a generator bug, not a mess",
+        )
+        # And it stays **resolvable**, which is the Phase 4b standard rather than a preference:
+        # the refund's amount is declared in ``refunds.csv``, so the residual identifies it and
+        # an unbounded matcher could attribute it. Truth may not claim otherwise. Pinned here
+        # because it is the assertion that would fail if a later phase "fixed" these rows by
+        # marking them unresolvable -- which would move a real miss into the correct-abstention
+        # cell and inflate the headline.
+        _require(
+            holder.resolvable,
+            "I15",
+            f"{holder.credit_id} nets an out-of-scope refund and is marked unresolvable -- "
+            f"the refund's amount is declared, so the row is resolvable in principle and an "
+            f"exhaustive matcher would refute the claim (Phase 4b's standard)",
+        )
+
+    # Assertion 3: term by term.
+    for c in story.credits:
+        cited = sum(refunds_by_id[rid].amount_paise for rid in c.refunds_netted)
+        _require(
+            c.decomposition.refunds_paise == cited,
+            "I15",
+            f"{c.credit_id} declares refunds_paise={c.decomposition.refunds_paise} but the "
+            f"{len(c.refunds_netted)} refund(s) it cites sum to {cited} -- compared per credit "
+            f"rather than in total, because a run-wide total is identical when two refunds are "
+            f"attributed to each other's settlements",
+        )
+
+
+def check_reserves(story: Story, cfg: GenConfig) -> None:
+    """I16 — the held-back reserve, the one deduction no input file declares.
+
+    **A strengthening of ``I2.every_settlement_credited``, not a successor to it, and that
+    correction is the point of reading a check before standing it down.**
+    ``.plan/phase6.md`` step 7 called for a successor because ``SUSPENDED_BY`` listed
+    ``I2.every_settlement_credited`` under ``reserve`` -- an entry written in an earlier phase
+    as a *prediction*, before any reserve code existed. The prediction is wrong. That check
+    asserts every settlement is **cited by some credit** (``invariants.py``'s I2 block), and
+    under design B a reserved settlement still has its credit; the credit is merely *short*.
+    So it passes untouched, and ``I3.no_orphans`` -- which gates on
+    ``settlements_without_credit`` -- passes for the same reason.
+
+    **Both entries are therefore deleted rather than left in place, and the self-check asserts
+    ``checks_skipped == {}`` on a reserved run.** That assertion is what caught the first draft
+    of this docstring, which claimed the two checks "run for real" while the entries were still
+    listed -- they stood down and were recorded as skipped. Deleting them is strictly stronger
+    than keeping them: a suspension that is unnecessary is two checks standing down on every
+    reserved run, and the one that catches a generator dropping a credit outright is precisely
+    the check ``--reserve`` most needs kept.
+
+    The plan's **third case** goes with it: "a truth record saying the settlement is uncredited
+    in this window" exists only to justify that suspension, and honouring it would have handed
+    ``--reserve`` a settlement with no credit at all -- which is ``--unsettled``'s mess in
+    Phase 7, arriving early and under the wrong flag's name. Two named cases, below.
+
+    Six assertions:
+
+      * **Case 1, unreserved:** the credit equals its settlement's net exactly.
+      * **Case 2, reserved:** the credit is short of its settlement's net by *exactly* the
+        amount truth records as held. Not "approximately", and not "by some amount" -- the
+        held figure is the only record of this money anywhere, so if it disagreed with the
+        shortfall then nothing in the universe would say what was withheld.
+      * ``Credit.reserve_held_paise`` and ``Decomposition.reserve_paise`` agree. Two fields
+        carry this one fact and a reader may consult either.
+      * **The reserved credit's amount equals no settlement's net at all.** This is the
+        wrong-match guard, re-derived here rather than trusted from
+        ``story._separate_reserved_amounts``, and it is the assertion this invariant most
+        earns its keep for. A reserved credit is the only row whose true settlement is absent
+        from an exact-band candidate pool, so an amount clash gives the matcher **one**
+        confident wrong answer instead of two candidates and an honest abstention -- a
+        ``WRONG_MATCH`` on the line this project says never bends. Checked against every net
+        in the run rather than same-date nets only, because the date window is a matcher-side
+        parameter this generator does not know.
+      * **Partial:** at least one settlement reserved and at least one not, whenever the flag
+        is on. Otherwise "the reserved rows" and "every row" are the same set, and no
+        downstream comparison could tell a reserve-aware matcher from one that widened its
+        tolerance until everything fit.
+      * **Reserved credits stay ``resolvable: true``.** The mirror of I15's pin, and the
+        assertion that would fail if a later phase "fixed" these rows by marking them
+        unresolvable. It would look like a fix and it would be a false statement about the
+        data: a reserve leaves the settlement's UTR alone, so the narration tail still
+        identifies it uniquely (measured: a tail-only join resolves 100% of gateway credits at
+        n=200 and n=1000 under every implemented flag combination). Marking them unresolvable
+        would inflate ``correct_abstention`` with separable rows and make ``LUCKY_GUESS`` --
+        the leak detector -- fire on a matcher that got the answer right.
+    """
+    held_by_settlement = {
+        sid: c.decomposition.reserve_paise
+        for c in story.credits
+        for sid in c.settlement_ids
+    }
+    if not cfg.flags.reserve:
+        # The zero case is asserted by ``check_totals``' cell gate; this is the per-credit
+        # companion, which catches a reserve attributed to a *credit* the aggregate would
+        # net out against a missing one elsewhere.
+        for c in story.credits:
+            _require(
+                c.decomposition.reserve_paise == 0 and c.reserve_held_paise == 0,
+                "I16",
+                f"{c.credit_id} carries a reserve "
+                f"({c.decomposition.reserve_paise}p/{c.reserve_held_paise}p) while "
+                f"--reserve is off",
+            )
+        return
+
+    net_of = {s.settlement_id: s.net_paise for s in story.settlements}
+    all_nets = {s.net_paise for s in story.settlements}
+    reserved = 0
+
+    for c in story.credits:
+        held = c.decomposition.reserve_paise
+        _require(
+            c.reserve_held_paise == held,
+            "I16",
+            f"{c.credit_id} records reserve_held_paise={c.reserve_held_paise} but its "
+            f"decomposition says {held} -- two fields carry this fact and a reader may "
+            f"consult either, so they may not disagree",
+        )
+        # A credit cites one settlement in every phase up to here; summing keeps this honest
+        # if a later phase makes a credit span several.
+        net_total = sum(net_of[sid] for sid in c.settlement_ids)
+        if held == 0:
+            _require(
+                c.amount_paise == net_total,
+                "I16",
+                f"{c.credit_id} holds no reserve but its {c.amount_paise}p does not equal "
+                f"the {net_total}p net of {', '.join(c.settlement_ids)} -- case 1 of I16",
+            )
+            continue
+
+        reserved += 1
+        _require(
+            c.amount_paise == net_total - held,
+            "I16",
+            f"{c.credit_id} is short of its {net_total}p net by "
+            f"{net_total - c.amount_paise}p, but truth records {held}p as held -- case 2 of "
+            f"I16. The held figure is the only record of this money in existence; if it "
+            f"disagrees with the shortfall then nothing anywhere says what was withheld",
+        )
+        _require(
+            0 < held < net_total,
+            "I16",
+            f"{c.credit_id} holds {held}p of a {net_total}p net -- a reserve of nothing is a "
+            f"row truth calls reserved whose credit equals its net, and one at or above the "
+            f"net makes the credit zero or negative",
+        )
+        _require(
+            c.amount_paise not in all_nets,
+            "I16",
+            f"{c.credit_id}'s short amount {c.amount_paise}p equals some settlement's net. "
+            f"Its own settlement is invisible to an exact-amount lookup, so the matcher finds "
+            f"exactly one candidate -- the WRONG one -- with arithmetic that closes perfectly, "
+            f"and resolves it confidently. That is a silent wrong match, not an abstention. "
+            f"story._separate_reserved_amounts exists to nudge the held amount clear of every "
+            f"net in the run; this is the independent re-derivation of that work",
+        )
+        _require(
+            c.resolvable,
+            "I16",
+            f"{c.credit_id} is reserved and marked unresolvable -- the reserve leaves this "
+            f"settlement's UTR untouched, so the narration tail still identifies it uniquely "
+            f"and an unbounded matcher recovers the payment set (measured: a tail-only join "
+            f"resolves 100% of gateway credits). resolvable=false would be a false statement "
+            f"about the data (Phase 4b's standard), would inflate correct_abstention with "
+            f"separable rows, and would make LUCKY_GUESS fire on a correct answer",
+        )
+
+    _require(
+        reserved > 0,
+        "I16",
+        "--reserve is on but no credit is short -- the run is labelled with a mess it does "
+        "not have",
+    )
+    _require(
+        reserved < len(story.credits),
+        "I16",
+        f"every one of {len(story.credits)} credits is reserved, so the term is not partial "
+        f"-- 'the reserved rows' and 'every row' become the same set, and nothing downstream "
+        f"can tell a reserve-aware matcher from one that widened its tolerance until "
+        f"everything fit",
+    )
 
 
 def check_int_money(values: dict[str, object]) -> None:
@@ -563,15 +906,50 @@ def check_story(
 
     # I4 — the money adds up, in aggregate and then per settlement
     gross_of = {p.payment_id: p.gross_paise for p in payments}
+    # The refund term comes from **truth's decomposition**, not from a settlement column:
+    # ``settlements.csv``'s header is frozen by I9, so a netted refund is visible only through
+    # ``refunds.csv``. Summing the credits' ``refunds_paise`` is therefore the only aggregate
+    # available -- and it is the right one, because it is the number truth publishes and
+    # therefore the number a scorer will hold the matcher to.
+    refund_cells = [c.decomposition.refunds_paise for c in credits]
+    # The reserve term, from the same source and for the same reason as the refunds: no
+    # settlement column declares it (I9 freezes that header, and unlike a refund it has no
+    # ``refunds.csv`` either -- it is declared *nowhere* in the inputs), so truth's
+    # decomposition is the only place it exists. I16 independently checks these terms against
+    # the per-credit shortfall, so this sum cannot quietly agree with a wrong attribution.
+    reserve_cells = [c.decomposition.reserve_paise for c in credits]
     check_totals(
         story.total_gross_paise(),
         story.total_net_paise(),
         story.total_credited_paise(),
         [x for s in settlements for x in (s.fee_paise, s.gst_paise)],
         [s.tds_paise for s in settlements],
+        refund_cells,
+        reserve_cells,
         fees_on=cfg.flags.fees,
         tds_on=cfg.flags.tds,
+        refunds_on=cfg.flags.netted_refunds,
+        reserve_on=cfg.flags.reserve,
     )
+    # I15 — the refund term is not merely *a* number that balances: every refund in the file
+    # is accounted for exactly once, and each settlement's term equals the refunds truly
+    # netted off it. The successor to ``I3.no_refunds``, which only asserted refunds were
+    # absent; see ``check_refunds``.
+    check_refunds(story, cfg)
+    # I16 — the reserve term, which is the only deduction in this model that **no input file
+    # declares**. See ``check_reserves``: it is a strengthening of
+    # ``I2.every_settlement_credited`` rather than a successor to it, because that check turns
+    # out to survive ``--reserve`` untouched.
+    check_reserves(story, cfg)
+    # Per settlement, the refund term truth attributes to it. Sourced from the credits rather
+    # than from a settlement column because ``settlements.csv``'s header is frozen (I9): a
+    # netted refund is declared in ``refunds.csv`` and attributed by truth, which is exactly
+    # the position the matcher is in. I15 independently checks that these terms equal the
+    # refunds each credit cites, so this sum cannot quietly agree with a wrong attribution.
+    refunds_of_settlement: dict[str, int] = defaultdict(int)
+    for c in credits:
+        for sid in c.settlement_ids:
+            refunds_of_settlement[sid] += c.decomposition.refunds_paise
     check_settlement_arithmetic(
         [
             (
@@ -581,6 +959,7 @@ def check_story(
                 s.fee_paise,
                 s.gst_paise,
                 s.tds_paise,
+                refunds_of_settlement[s.settlement_id],
             )
             for s in settlements
         ]
@@ -1034,18 +1413,18 @@ if __name__ == "__main__":
         "I4",
         "wedge is not the deductions",
         lambda: check_totals(
-            1_000_000, 976_400, 976_400, [20_000, 3_500], [0], fees_on=True
+            1_000_000, 976_400, 976_400, [20_000, 3_500], [0], [0], [0], fees_on=True
         ),
     )
     must_raise(
         "I4",
         "settled but never credited",
         lambda: check_totals(
-            1_000_000, 976_400, 976_399, [20_000, 3_600], [0], fees_on=True
+            1_000_000, 976_400, 976_399, [20_000, 3_600], [0], [0], [0], fees_on=True
         ),
     )
-    check_totals(1_000_000, 976_400, 976_400, [20_000, 3_600], [0], fees_on=True)
-    check_totals(1_000_000, 1_000_000, 1_000_000, [0, 0], [0])
+    check_totals(1_000_000, 976_400, 976_400, [20_000, 3_600], [0], [0], [0], fees_on=True)
+    check_totals(1_000_000, 1_000_000, 1_000_000, [0, 0], [0], [0], [0])
 
     # Phase 6: the per-column zero gate, probed in **both** directions. Until this phase all
     # three columns were gated on ``fees_on``, and both of these were measured against the old
@@ -1054,7 +1433,7 @@ if __name__ == "__main__":
     # A legal ``--tds`` run without ``--fees``: TDS cells are non-zero, fee and GST are not.
     # The old single gate reported "1 non-zero fee/gst/tds cells while --fees is off" and
     # refused a run this generator is required to support.
-    check_totals(10_000, 9_990, 9_990, [0, 0], [10], fees_on=False, tds_on=True)
+    check_totals(10_000, 9_990, 9_990, [0, 0], [10], [0], [0], fees_on=False, tds_on=True)
     # ...and the hole, which is the half that mattered. A TDS cell on a run that never asked
     # for one: with ``fees_on`` true the old gate stood down for all three columns at once, so
     # this passed. A deduction appearing from nowhere is exactly what I4's zero clause exists
@@ -1063,7 +1442,7 @@ if __name__ == "__main__":
         "I4",
         "a TDS cell while --tds is off",
         lambda: check_totals(
-            10_000, 9_990, 9_990, [0, 0], [10], fees_on=True, tds_on=False
+            10_000, 9_990, 9_990, [0, 0], [10], [0], [0], fees_on=True, tds_on=False
         ),
     )
     # The converse, for symmetry: a fee cell while --fees is off, with --tds legitimately on.
@@ -1072,7 +1451,95 @@ if __name__ == "__main__":
         "I4",
         "a fee cell while --fees is off",
         lambda: check_totals(
-            10_000, 9_800, 9_800, [200, 0], [0], fees_on=False, tds_on=True
+            10_000, 9_800, 9_800, [200, 0], [0], [0], [0], fees_on=False, tds_on=True
+        ),
+    )
+
+    # --- Phase 6 step 6: the refund column, probed in both directions ---------
+    # Same shape as the TDS pair above, because the same reasoning applies to a third column:
+    # a legal run must not be refused, and a term appearing on a run that never asked for one
+    # must not pass. Written as a pair rather than one assertion for the reason the TDS pair
+    # records -- a single gate covering N columns fails in both directions at once.
+    #
+    # A legal ``--netted-refunds`` run: a 1,000p refund inside the net, no fee and no tax.
+    check_totals(10_000, 9_000, 9_000, [0, 0], [0], [1_000], [0], refunds_on=True)
+    # And the hole: the same refund on a run with the flag off. Before ``refund_cells`` existed
+    # this was not merely unchecked, it was *unrepresentable* -- the wedge simply did not
+    # include the term, so a refund had nowhere to be declared and I4 reported it as
+    # unaccounted-for money (measured: "+716363 paise unaccounted for" at seed 42, n=60).
+    must_raise(
+        "I4",
+        "a refund cell while --netted-refunds is off",
+        lambda: check_totals(
+            10_000, 9_000, 9_000, [0, 0], [0], [1_000], [0], refunds_on=False
+        ),
+    )
+    # The full six-term wedge, every flag on: fee 200p, GST 36p, TDS 10p, refund 1,000p.
+    # Present so that the terms are proved to compose rather than merely to exist one at a
+    # time -- four columns that each pass alone can still be summed wrongly.
+    check_totals(
+        10_000, 8_754, 8_754, [200, 36], [10], [1_000], [0],
+        fees_on=True, tds_on=True, refunds_on=True,
+    )
+
+    # --- Phase 6 step 7: the reserve column, and the asymmetry that defines it ------
+    # A legal ``--reserve`` run with no other deduction at all: the whole 10,000p is settled,
+    # 1,000p is held back, and 9,000p reaches the bank. Note what this fixture asserts that
+    # none of the four above can: ``net_total != credit_total`` and the run is still valid.
+    # Every earlier fixture has those two equal, so this is the first case where the first
+    # assertion does real work.
+    check_totals(10_000, 10_000, 9_000, [0, 0], [0], [0], [1_000], reserve_on=True)
+    # **The asymmetry probe, and it is the one fixture here worth reading twice.** The reserve
+    # is subtracted in the *first* assertion and deliberately absent from the *second*, because
+    # it sits between net and credit rather than between gross and net -- that is design B
+    # expressed as arithmetic. The fixture above would still pass if someone "tidied" the
+    # implementation by folding ``reserve_cells`` into ``deducted``... no it would not, and this
+    # comment is the proof: with the reserve in ``deducted`` the wedge reads
+    # 10,000 - 1,000 = 9,000 against a declared net of 10,000 and raises. So the fixture above
+    # *is* the regression test for the mis-wiring, and this is the case that says why it is one.
+    # Kept as a comment rather than a second call because inverting the check would mean
+    # asserting that a correct implementation fails.
+    #
+    # And the hole, the same shape as the TDS and refund pairs above: a held amount on a run
+    # that never asked for one. Without the cell gate a reserve could appear from nowhere and
+    # the aggregate would absorb it silently, since the first assertion would simply balance.
+    must_raise(
+        "I4",
+        "a reserve cell while --reserve is off",
+        lambda: check_totals(
+            10_000, 10_000, 9_000, [0, 0], [0], [0], [1_000], reserve_on=False
+        ),
+    )
+    # A shortfall the held amount does not account for: 1,000p held but 1,500p missing. This is
+    # the reserved-run form of "settled but never credited", and it is the assertion that stops
+    # ``--reserve`` becoming a licence for money to vanish -- which is exactly what suspending
+    # I4 under the flag would have done.
+    must_raise(
+        "I4",
+        "settled but never credited",
+        lambda: check_totals(
+            10_000, 10_000, 8_500, [0, 0], [0], [0], [1_000], reserve_on=True
+        ),
+    )
+    # The full seven-term case, every flag on: fee 200p, GST 36p, TDS 10p, refund 1,000p inside
+    # the net, then 500p held back outside it. Present for the reason the six-term case above
+    # is: terms that each pass alone can still be composed wrongly, and this is the only
+    # fixture where both sides of the net carry a deduction at once.
+    check_totals(
+        10_000, 8_754, 8_254, [200, 36], [10], [1_000], [500],
+        fees_on=True, tds_on=True, refunds_on=True, reserve_on=True,
+    )
+
+    # I4 per settlement, with the refund term. The seventh element is optional, so the two
+    # calls above this block still describe five-term rows -- what is checked here is that the
+    # term is *subtracted* when present, and that a row omitting it is unchanged.
+    check_settlement_arithmetic([("setl_x", 1_000_000, 976_400, 20_000, 3_600, 0, 0)])
+    check_settlement_arithmetic([("setl_x", 1_000_000, 876_400, 20_000, 3_600, 0, 100_000)])
+    must_raise(
+        "I4",
+        "a refund the net does not reflect",
+        lambda: check_settlement_arithmetic(
+            [("setl_x", 1_000_000, 976_400, 20_000, 3_600, 0, 100_000)]
         ),
     )
 
@@ -1345,6 +1812,197 @@ if __name__ == "__main__":
         "I14",
         dataclasses.replace(bat, settlements=_contig_settlements, credits=_contig_credits),
         bat_cfg,
+    )
+
+    # --- Phase 6 step 6: I15 must fire, not merely exist ----------------------
+    # I15 landed in step 6 with no negative case at all, which by this file's own standard
+    # makes it decoration -- every other check here is mutant-tested. Added with step 7.
+    ref_cfg = GenConfig(seed=42, n=60, flags=MessFlags(netted_refunds=True))
+    ref = build(ref_cfg)
+    ref_rep = check_story(ref, ref_cfg)
+    assert ref_rep["checks_skipped"] == {"I3.no_refunds": ["netted_refunds"]}, ref_rep
+    assert ref.refunds, "--netted-refunds emitted no refunds"
+
+    # **Cross-attribution: two credits swap the refund ids they cite, keeping every
+    # ``refunds_paise`` term exactly where it was.** This is the mutant I15 was built for and
+    # the one nothing else in this file can see: the run-wide refund total is unchanged, every
+    # settlement's net is unchanged, and I4 passes in full -- both in aggregate and per
+    # settlement -- while truth now says the wrong refund paid for the wrong credit. A total
+    # cannot detect it, which is precisely why I15 compares term by term.
+    _cited = [c for c in ref.credits if c.refunds_netted]
+    assert len(_cited) >= 2, f"need two refund-citing credits to swap, got {len(_cited)}"
+    _a, _b = _cited[0], _cited[1]
+    must_fail(
+        "I15",
+        dataclasses.replace(
+            ref,
+            credits=[
+                dataclasses.replace(_a, refunds_netted=list(_b.refunds_netted))
+                if c is _a
+                else dataclasses.replace(_b, refunds_netted=list(_a.refunds_netted))
+                if c is _b
+                else c
+                for c in ref.credits
+            ],
+        ),
+        ref_cfg,
+    )
+    # And the orphan-holder pin: marking that row unresolvable is the "fix" a later phase would
+    # reach for, and it would move a real miss into the correct-abstention cell.
+    _orphan_holder = next(
+        (c for c in ref.credits if c.note and "not in this month's payments.csv" in c.note),
+        None,
+    )
+    assert _orphan_holder is not None, "the --netted-refunds run planted no orphan refund"
+    must_fail(
+        "I15",
+        dataclasses.replace(
+            ref,
+            credits=[
+                dataclasses.replace(c, resolvable=False, reason=str(Reason.REFUND_UNLINKED))
+                if c is _orphan_holder
+                else c
+                for c in ref.credits
+            ],
+        ),
+        ref_cfg,
+    )
+
+    # --- Phase 6 step 7: the reserve, and I16's four mutants ------------------
+    res_cfg = GenConfig(seed=42, n=60, flags=MessFlags(reserve=True))
+    res = build(res_cfg)
+    res_rep = check_story(res, res_cfg)
+    # **No suspension at all, which is the correction step 7 is built on.** ``SUSPENDED_BY``
+    # lists ``I2.every_settlement_credited`` and ``I3.no_orphans`` under ``reserve`` -- both
+    # written in earlier phases as predictions, before any reserve code existed, and both
+    # wrong: under design B a reserved settlement still has its credit, merely a short one.
+    # This assertion is what would fail if a future edit made the flag start dropping credits,
+    # and it is stronger than the entries it supersedes because those checks now *run*.
+    assert res_rep["checks_skipped"] == {}, (
+        f"--reserve is expected to suspend nothing -- design B keeps every settlement "
+        f"credited and every per-settlement wedge intact: {res_rep['checks_skipped']}"
+    )
+    _res_held = [c for c in res.credits if c.decomposition.reserve_paise]
+    assert _res_held, "--reserve held nothing back"
+    assert len(_res_held) < len(res.credits), "--reserve held from every credit, not partially"
+    # The aggregate really is short, or the flag is a no-op that the invariants happen to pass.
+    assert res.total_net_paise() > res.total_credited_paise(), (
+        "--reserve left the credited total equal to the net -- nothing was held"
+    )
+
+    _net_by_sid = {s.settlement_id: s for s in res.settlements}
+    _held_credit = _res_held[0]
+    _own_net = _net_by_sid[_held_credit.settlement_ids[0]].net_paise
+
+    # Mutant 1 -- **the silent wrong match, and the reason I16 exists at all.** The reserved
+    # credit's short amount is moved onto *another settlement's net*, with the held figure
+    # adjusted so the arithmetic still closes perfectly. I4 cannot see this: ``expected ==
+    # amount`` holds, the aggregate holds, every per-settlement wedge holds. But a matcher now
+    # finds exactly one candidate for this row -- the wrong settlement -- with a gap of zero,
+    # and resolves it with total confidence. That is a WRONG_MATCH on the line this project
+    # says never bends, and it is invisible to every check that existed before I16.
+    _other_net = min(s.net_paise for s in res.settlements)
+    assert _other_net < _own_net, "need a smaller net to collide with"
+    _collide = _own_net - _other_net
+    must_fail(
+        "I16",
+        dataclasses.replace(
+            res,
+            credits=[
+                dataclasses.replace(
+                    c,
+                    amount_paise=_other_net,
+                    reserve_held_paise=_collide,
+                    decomposition=dataclasses.replace(
+                        c.decomposition, reserve_paise=_collide
+                    ),
+                )
+                if c is _held_credit
+                else c
+                for c in res.credits
+            ],
+        ),
+        res_cfg,
+    )
+
+    # Mutant 2 -- a reserved row marked unresolvable. The mirror of I15's orphan pin, and the
+    # "fix" that looks most like an improvement: it would inflate correct_abstention with rows
+    # a tail-only join separates, and make LUCKY_GUESS fire on a matcher that got it right.
+    must_fail(
+        "I16",
+        dataclasses.replace(
+            res,
+            credits=[
+                dataclasses.replace(
+                    c, resolvable=False, reason=str(Reason.PARTIAL_SETTLEMENT_PENDING)
+                )
+                if c is _held_credit
+                else c
+                for c in res.credits
+            ],
+        ),
+        res_cfg,
+    )
+
+    # Mutant 3 -- the two fields that carry this one fact disagree. A reader may consult
+    # either, so a divergence makes the answer key self-contradictory about the only record of
+    # this money that exists anywhere.
+    must_fail(
+        "I16",
+        dataclasses.replace(
+            res,
+            credits=[
+                dataclasses.replace(c, reserve_held_paise=c.reserve_held_paise + 1)
+                if c is _held_credit
+                else c
+                for c in res.credits
+            ],
+        ),
+        res_cfg,
+    )
+
+    # Mutant 4 -- the flag is on and nothing is held. Every reserve is zeroed and every credit
+    # restored to its net, so I4 passes in full and the run is arithmetically perfect -- it is
+    # simply not the run it says it is. A dataset labelled with a mess it does not contain is
+    # the mislabelling ``MessFlags.IMPLEMENTED`` exists to prevent, arriving by a different
+    # door.
+    must_fail(
+        "I16",
+        dataclasses.replace(
+            res,
+            credits=[
+                dataclasses.replace(
+                    c,
+                    amount_paise=_net_by_sid[c.settlement_ids[0]].net_paise,
+                    reserve_held_paise=0,
+                    decomposition=dataclasses.replace(c.decomposition, reserve_paise=0),
+                )
+                for c in res.credits
+            ],
+        ),
+        res_cfg,
+    )
+
+    # Mutant 5 -- a held reserve recorded on a run with the flag off.
+    #
+    # **Mutated via ``reserve_held_paise`` rather than the decomposition, and the reason is a
+    # measurement worth keeping.** The obvious version sets ``decomposition.reserve_paise=1``,
+    # and that fires **I4**, not I16: ``check_totals`` runs first and the aggregate no longer
+    # balances ("net=55982339 - reserve=1 = 55982338 credited=55982339"). Two independent checks
+    # catching one corruption is defence in depth and exactly what should happen -- but it means
+    # that mutant cannot demonstrate I16's own zero gate, since the story dies before reaching
+    # it. ``reserve_held_paise`` is the field **no other check reads** (it is absent from
+    # ``expected_credit_paise`` and from every wedge), so it is the one that isolates this
+    # branch: nothing else in the file can tell that this credit claims a reserve.
+    must_fail(
+        "I16",
+        dataclasses.replace(
+            story,
+            credits=[
+                dataclasses.replace(story.credits[0], reserve_held_paise=1),
+                *story.credits[1:],
+            ],
+        ),
     )
 
     # Counted, not written down: the literal "6" here went stale the moment Phase 4

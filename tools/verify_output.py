@@ -254,6 +254,8 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     # three columns both refused a legal ``--tds`` run and hid a stray TDS cell on a
     # ``--fees`` run -- see ``invariants.check_totals``.
     tds_on = flags.get("tds", False)
+    refunds_on = flags.get("netted_refunds", False)
+    reserve_on = flags.get("reserve", False)
     late_on = flags.get("settlement_report_late", False)
     #: settlement -> payments, as the *answer key* declares it. Used only to stand in for the
     #: rows ``--settlement-report-late`` withholds from settlement_items.csv, so that the
@@ -271,14 +273,38 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     skipped: dict[str, list[str]] = {}
 
     # --- I4: the money adds up, in aggregate --------------------------------
+    # Phase 6 step 6: the refund cells come from **truth's decomposition**, not from a
+    # settlement column, because ``settlements.csv``'s header is frozen by I9 -- a netted
+    # refund is declared in ``refunds.csv`` and attributed by the answer key. That makes this
+    # pass read the same number a scorer will hold the matcher to. The per-settlement map below
+    # is built the same way, and ``check_refunds`` on the in-memory side independently checks
+    # these terms against the refund rows each credit cites, so a wrong attribution cannot
+    # quietly balance here.
+    refund_cells = [c.decomposition.refunds_paise for c in truth.credits]
+    refunds_of_settlement: dict[str, int] = {sid: 0 for sid in net_by_settlement}
+    for c in truth.credits:
+        for sid in c.settlement_ids:
+            if sid in refunds_of_settlement:
+                refunds_of_settlement[sid] += c.decomposition.refunds_paise
+    # Phase 6 step 7. Same sourcing as the refunds and one step further: a refund at least has
+    # ``refunds.csv``, while the reserve is declared in **no input file at all**, so truth's
+    # decomposition is its only record anywhere. Note what this term is *not* fed into --
+    # ``check_settlement_arithmetic`` below is left alone, because the reserve sits between the
+    # net and the credit rather than between the gross and the net. That is design B, and
+    # adding it there would assert the settlement declared a smaller payout than it did.
+    reserve_cells = [c.decomposition.reserve_paise for c in truth.credits]
     check_totals(
         sum(gross_by_payment.values()),
         sum(net_by_settlement.values()),
         sum(amount_by_credit.values()),
         fee_cells,
         tds_cells,
+        refund_cells,
+        reserve_cells,
         fees_on=fees_on,
         tds_on=tds_on,
+        refunds_on=refunds_on,
+        reserve_on=reserve_on,
     )
 
     # --- I3: cardinality, per flag rather than per clean_mode ----------------
@@ -385,7 +411,7 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     check_settlement_arithmetic(
         [
             (sid, sum(gross_by_payment[p] for p in effective_members[sid]),
-             net_by_settlement[sid], *deductions[sid])
+             net_by_settlement[sid], *deductions[sid], refunds_of_settlement[sid])
             for sid in sorted(net_by_settlement)
         ]
     )
@@ -512,10 +538,16 @@ def leak_audit(
     for r in settlements:
         key_of_settlement[(r["settled_on"], r["net_paise"])].append(r["settlement_id"])
     arithmetic_hits = 0
+    #: Which rows the legitimate join failed to resolve, not merely how many. Phase 6 step 7
+    #: needs the identities: ``--reserve`` makes this strategy fail on a known, nameable set of
+    #: rows, and asserting *which* ones is what turns a suspension into a strengthening.
+    arithmetic_missed: list[str] = []
     for r in bank:
         candidates = key_of_settlement.get((r["value_date"], r["amount_paise"]), [])
         if len(candidates) == 1 and truth_sid.get(r["row_id"]) == candidates[0]:
             arithmetic_hits += 1
+        else:
+            arithmetic_missed.append(r["row_id"])
 
     # The three structural strategies must not resolve the dataset.
     if narration_hits:
@@ -538,8 +570,41 @@ def leak_audit(
     # the 100% baseline the whole ramp is measured against. Gated per flag rather than on
     # ``clean_mode``, so ``--fees`` and ``--batching`` are held to it too.
     audit_flags = {k: bool(v) for k, v in truth.flags.items()}  # type: ignore[attr-defined]
+    #: Phase 6 step 7. ``--reserve`` genuinely breaks this strategy -- a reserved credit is
+    #: short of its settlement's net, so the exact ``(date, amount)`` key finds **zero**
+    #: candidates for it -- and that break is the mess itself rather than a defect. Measured on
+    #: the first ``--reserve`` run: 55/60 at seed 42, n=60, where 60 x RESERVE_SHARE = 5.
+    #:
+    #: **So this is the third check the flag touches, and none of the three were the two
+    #: ``SUSPENDED_BY`` predicted.** The cheap response is a fourth ``DISK_SUSPENDED_BY`` entry.
+    #: It is refused here for the reason that file's own docstring gives: a check that stands
+    #: down exactly when the thing it guards starts moving is the footgun. And suspension is
+    #: strictly worse than available here, because the shortfall is *predictable* -- the rows
+    #: this strategy loses are exactly the rows truth records a reserve against. So the check
+    #: is **strengthened into an equality on identities** rather than relaxed into a count: it
+    #: now catches a reserved row that resolves anyway (which would mean
+    #: ``story._separate_reserved_amounts`` failed to clear some net, the silent-wrong-match
+    #: hazard I16 also guards) *and* an unreserved row that stopped resolving, which a
+    #: suspension would have hidden completely.
+    reserved_ids = {
+        c.credit_id for c in truth.credits  # type: ignore[attr-defined]
+        if c.decomposition.reserve_paise
+    }
     if suspended_by := _disk_suspended(audit_flags, "I3.date_amount_resolves"):
         pass  # named in the returned report, never silently dropped
+    elif reserved_ids:
+        if set(arithmetic_missed) != reserved_ids:
+            only_missed = sorted(set(arithmetic_missed) - reserved_ids)
+            still_resolving = sorted(reserved_ids - set(arithmetic_missed))
+            raise InvariantError(
+                f"I3: date+amount resolves {arithmetic_hits}/{n} credits, but the rows it "
+                f"fails on are not exactly the {len(reserved_ids)} reserved one(s). "
+                f"Unreserved rows that stopped resolving: {only_missed[:5] or 'none'}. "
+                f"Reserved rows that resolved anyway: {still_resolving[:5] or 'none'} -- a "
+                f"reserved credit whose short amount still hits a settlement's net gives the "
+                f"matcher exactly one candidate, the WRONG one, with arithmetic that closes "
+                f"perfectly; see story._separate_reserved_amounts and I16"
+            )
     elif arithmetic_hits != n:
         raise InvariantError(
             f"I3: date+amount resolves only {arithmetic_hits}/{n} credits while every flag "

@@ -132,13 +132,16 @@ python -m hisaab.generator --seed 42 --n 60   # if you have not already
 python tools/acceptance.py
 ```
 
-Eleven gates, one command, exit code is the verdict. Byte-identical output at a fixed
+Thirteen gates, one command, exit code is the verdict. Byte-identical output at a fixed
 seed across two processes; invariants on three seeds in memory and again re-read from
 disk; the leak audit; truth isolation; throughput; the assumptions file; the four
 known-answer fixtures; the matcher at 100/100/0 across three seeds × two sizes, including
 the check that blanking every bank narration changes no decision; gate 10, which turns
-on the first two rows of the difficulty dial and proves the arithmetic per row; and gate
-11, which plants pairs that genuinely cannot be resolved and reads the abstention count.
+on the first two rows of the difficulty dial and proves the arithmetic per row; gate
+11, which plants pairs that genuinely cannot be resolved and reads the abstention count;
+gate 12, which requires both matcher tiers to carry rows so a Tier 1 regression cannot
+hide behind a Tier 2 success; and gate 13, which turns on all seven implemented flags at
+once.
 
 Gate 10 is the one worth reading the source of, because of what it declines to assert. The
 plan called for a flat 100/100/0 under `--fees --settlement-delay`; measurement said the
@@ -155,9 +158,26 @@ credits *correctly*, because tails are drawn without replacement. So a pair coll
 matching, and calling it unresolvable would have been a false statement about the data.
 Each planted pair now shares one UTR, and the gate re-runs that attack every time.
 
+Gate 13 is the argument for never retiring an old gate. It is the first thing in the suite
+to run `--netted-refunds` alongside `--batching` and `--settlement-report-late`, and it
+found three defects sitting in code that thirteen module self-checks and twelve gates had
+all called green — including **two wrong matches per run** at n=1000, the one number this
+project says never moves. Tier 2's subset search priced each candidate payment at its
+gross, net of fee, or net of tax, and never net of its *refund*; on a refunded settlement
+whose membership was withheld, the true answer was therefore not in the search space at
+all, and the search saw only coincidences. Usually none, and the row abstained. Twice per
+run, one unrelated subset hit the shrunken target exactly and the row resolved wrongly.
+
+Every earlier gate passed throughout, because all three defects live in the *interaction*
+between flags rather than in any single one. Gate 13 also runs at n=1000 even under
+`--skip-slow`, alone among the gates: the same two seeds that read 0.9962 at n=1000 read a
+clean 1.0000 with zero wrong matches at n=200, since coincidental subsets scale with the
+candidate pool. A fast run that dropped the large size would have reported the phase green
+while blind to its only correctness failure.
+
 ---
 
-## Current state — Phase 4b of 13
+## Current state — Phase 6 of 13
 
 | | Phase | State |
 |---|---|---|
@@ -166,7 +186,9 @@ Each planted pair now shares one UTR, and the gate re-runs that attack every tim
 | ✅ | **3. Matcher, Tier 1** | Done. Exact `(value_date, net_paise)` join, 100/100/0 on clean mode |
 | ✅ | **4. Fees and the settlement delay** | Done. The residual **gates**, the decomposition is published per row and checked term by term, the window is proved load-bearing |
 | ✅ | **4b. Planted unresolvables (`--dup-amounts`)** | Done. Each pair shares a date, an amount **and a UTR** — the last one because a tail-only join resolved 100% without either of the others |
-| ⬜ | 5–8. Batching, adjustments, orphans, FX | Next. The rest of the difficulty dial, one flag at a time |
+| ✅ | **5. Batching and the Tier 2 subset search (`--batching`)** | Done. Many payments settle as one credit; membership is withheld partially, so the search is a **counted** subset-sum with a bound that refuses rather than guesses |
+| ✅ | **6. Adjustments (`--tds`, `--netted-refunds`, `--reserve`)** | Done. Three more deduction terms. TDS and refunds net inside the settlement; the **reserve deliberately does not** — its magnitude appears in no input file, so the matcher diagnoses it and never resolves it |
+| ⬜ | 7–8. Orphans, noise rows, FX | Next. The rest of the difficulty dial, one flag at a time |
 | ⬜ | 9–13. Exception ranking, LLM layer, HTML report, holdout, write-up | |
 
 The scorer was built **before** the matcher on purpose. Building it second means spending
@@ -243,10 +265,16 @@ off, and it stays in the test set permanently as the regression check: *if it ca
 python -m hisaab.generator --help     # the flags, in difficulty order
 ```
 
-**Two are now live: `--fees` and `--settlement-delay`.** The remaining eleven are declared
-and **refused by name** rather than silently ignored — passing one exits non-zero instead of
-returning unchanged data labelled as having fees, which is how Phase 1 originally behaved
-and is a quietly dangerous default for a tool whose whole output is a claim about data.
+**Eight are now live**, in difficulty order: `--fees`, `--settlement-delay`, `--dup-amounts`,
+`--batching`, `--settlement-report-late`, `--tds`, `--netted-refunds` and `--reserve`. The
+remaining five are declared and **refused by name** rather than silently ignored — passing one
+exits non-zero instead of returning unchanged data labelled as having fees, which is how
+Phase 1 originally behaved and is a quietly dangerous default for a tool whose whole output is
+a claim about data.
+
+Turning them all on at once is what gate 13 does, and it is the only thing in the suite that
+does: three defects had been sitting in code that every individual flag's own tests called
+green, because they lived in the interaction rather than in any one flag.
 
 Each invariant also declares *which* flags it survives, rather than standing down for any of
 the thirteen. The earlier design gated on "clean mode", meaning all thirteen off — so

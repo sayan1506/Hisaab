@@ -100,6 +100,56 @@ AMOUNT_BANDS: tuple[tuple[int, int, int], ...] = (
 #: for an empty ``refunds.csv``).
 LATE_REPORT_SHARE = 0.30
 
+#: ``--netted-refunds``: the share of payments that carry a refund netted off the settlement
+#: their payment belongs to. Phase 6 step 6.
+#:
+#: **A refund reduces the settlement holding its own payment**, which is the modelling
+#: simplification worth stating rather than hiding: a real gateway nets a refund against
+#: whatever payout is open when the refund clears, which is usually a *later* one. The plan
+#: settles this by extending I4 to six terms **per settlement**
+#: (``net == gross - fee - gst - tds - refunds``), and that arithmetic only closes if the
+#: refund sits on the settlement whose gross it is deducted from. Cross-settlement netting is
+#: a different mess -- it would need truth to carry a refund-to-settlement map the CSVs do not
+#: have -- and it belongs to a later phase if it is ever wanted.
+REFUND_SHARE = 0.10
+
+#: Refund magnitude, as basis points of the refunded payment's gross, drawn uniformly in
+#: ``[lo, hi]``. **Partial, never full**, and the bound is load-bearing rather than tidy:
+#: ``Settlement.__post_init__`` asserts ``net_paise > 0``, so a refund at or near 100% of a
+#: singleton settlement's gross would drive its net to zero or below and fail before anything
+#: reached disk. Capped well under 10,000 bps so a singleton batch always keeps a positive net
+#: after the fee, GST and TDS have already been taken out.
+REFUND_BPS_BAND: tuple[int, int] = (2_000, 6_000)
+
+#: What fraction of settlements have part of their payout **held back** (``--reserve``).
+#:
+#: A rolling reserve is a real gateway practice: a percentage of each payout is retained
+#: against future chargebacks and released after a fixed period. Modelled here as design B --
+#: the reserve stays **outside** ``net_paise``, so the settlement declares its full net and the
+#: bank credit arrives *short*. See ``story._draw_reserves`` for why that is the only shape
+#: that makes the mess exist at all, and ``.plan/phase6.md`` decision 4.
+#:
+#: Partial for the reason every other share in this file is partial: a run must contain both
+#: reserved and unreserved settlements, or "the reserved rows" and "every row" are the same set
+#: and nothing downstream can tell a reserve-aware matcher from one that widened its tolerance
+#: until everything fit.
+RESERVE_SHARE = 0.08
+
+#: Reserve magnitude, as basis points of the settlement's **net**, drawn uniformly in
+#: ``[lo, hi]``. 5%-20%, which brackets the rolling-reserve rates gateways actually publish.
+#:
+#: The lower bound is the load-bearing one, and it is not about realism. The diagnostic in
+#: ``matcher.tier1`` distinguishes "money was held back" from "the fee rates assumed here are
+#: wrong" by the *size* of the shortfall, so a reserve has to be unmistakably larger than any
+#: rounding or rate discrepancy. The largest rate-model error this data can produce is the
+#: fee's own rounding divergence -- a few paise on a batch -- so 500 bps clears it by orders of
+#: magnitude. A reserve of a few paise would be indistinguishable from a rounding bug, and
+#: truth would be asserting a mess the inputs cannot support.
+#:
+#: The upper bound keeps the credit positive: ``Credit.__post_init__`` asserts
+#: ``amount_paise > 0``, and at 20% of net the remaining 80% is comfortably positive.
+RESERVE_BPS_BAND: tuple[int, int] = (500, 2_000)
+
 DEFAULT_N = 60
 DEFAULT_N_BATCHED = 200
 
@@ -196,9 +246,21 @@ class MessFlags:
     #: above. It is the first implemented flag that **draws no randomness at all** -- a
     #: withholding at a declared rate on a declared gross is fully derived, so there is
     #: nothing to draw and the reserved ``tds`` stream stays unused (see ``story._tds``).
+    #: Phase 6 step 6 added ``netted_refunds``: ``story._draw_refunds`` draws the refunded
+    #: payments and their frozen magnitudes, ``build`` materialises ``refunds.csv`` and nets
+    #: each refund off the settlement holding its payment, and ``_batch_net`` counts the term
+    #: so the net-uniqueness nudge protects the value the file actually carries. Added *after*
+    #: that code existed, per the paragraph above.
+    #:
+    #: **It nets inside ``net_paise``, so it moves no join** -- the same property ``--tds`` has
+    #: and for the same reason: the credit still equals the net, so blocking and the amount band
+    #: are untouched. What makes it a different test from ``--tds`` is that the term is **not
+    #: derivable from any rate**: it is declared in ``refunds.csv`` and has to be *looked up*
+    #: through the payment it cites. ``settlements.csv`` gains no column for it, because I9
+    #: freezes that header.
     IMPLEMENTED: ClassVar[frozenset[str]] = frozenset(
         {"settlement_delay", "fees", "dup_amounts", "batching", "settlement_report_late",
-         "tds"}
+         "tds", "netted_refunds", "reserve"}
     )
 
     @classmethod
@@ -465,6 +527,69 @@ class GenConfig:
         # settlement. Small ``n`` *with* batching can also land on one settlement as a matter
         # of the draw (measured: n=2 on 1 of 60 seeds), which no config-time check can see --
         # ``story.build`` carries the backstop for that.
+        # ``--netted-refunds`` needs three payments to say what it claims: one carrying an
+        # attributable refund, one carrying the planted unattributable one, and one carrying
+        # none at all so the term stays *partial*. At n=2 the clamp in ``_draw_refunds`` would
+        # refund every payment, and "the refund term" and "every row" would be the same set --
+        # at which point nothing downstream can tell a refund-aware matcher from one that
+        # absorbed the term into its fee model. Refused here rather than silently dropping the
+        # plant, which is the mislabelled-data failure ``MessFlags.IMPLEMENTED`` prevents.
+        if self.flags.netted_refunds and self.n < 3:
+            raise ValueError(
+                f"--netted-refunds needs at least 3 payments -- one refunded, one carrying "
+                f"the planted unlinked refund, and one left alone so the term is partial -- "
+                f"but --n is {self.n}. Raise --n."
+            )
+        # Refused for the reason ``--dup-amounts`` and ``--batching`` are refused together,
+        # and the mechanism is identical. A planted pair is unresolvable because two
+        # settlements share one net, one date and one UTR. Netting a refund off one member
+        # moves that member's net and the two diverge -- the pair becomes separable and
+        # ``resolvable=false`` turns into a false statement about the data.
+        #
+        # Deliberately **not** fixed by excluding planted payments from the refund draw: the
+        # refunded set would then correlate with plantedness, handing a matcher "the settlements
+        # with no refund are the ambiguous ones" as a structural tell. That is the same
+        # self-inflicted leak the batching refusal rejects, and a combined run buys nothing --
+        # gate 11 covers the planted rows and gate 13 covers the refunds.
+        if self.flags.dup_amounts and self.flags.netted_refunds:
+            raise ValueError(
+                "--dup-amounts and --netted-refunds cannot be combined: netting a refund off "
+                "one member of a planted pair moves its net away from its partner's, so the "
+                "pair stops sharing an amount and stops being unresolvable -- truth would then "
+                "claim resolvable=false about data that is separable. Run them separately; "
+                "gate 11 covers the planted rows and gate 13 covers the refunds."
+            )
+        # ``--reserve`` needs two settlements to say what it claims: one whose payout is held
+        # back and one left whole, so the term stays *partial*. At n=1 the clamp in
+        # ``_draw_reserves`` would reserve the only settlement, and "the reserved rows" and
+        # "every row" would be the same set -- at which point nothing downstream can tell a
+        # reserve-aware matcher from one that widened its tolerance until everything fit. I16
+        # asserts the partiality; this refuses the ``n`` that cannot deliver it.
+        if self.flags.reserve and self.n < 2:
+            raise ValueError(
+                f"--reserve needs at least 2 payments -- one settlement reserved and one left "
+                f"whole so the term is partial -- but --n is {self.n}. Raise --n."
+            )
+        # Refused for the reason ``--dup-amounts`` is refused with ``--batching`` and with
+        # ``--netted-refunds``, and the mechanism is the same one a third time. A planted pair
+        # is unresolvable because two settlements share one net, one date and one UTR, so the
+        # two *credits* share an amount. Holding a reserve back from one member moves that
+        # member's credit away from its partner's, the pair becomes separable on amount alone,
+        # and ``resolvable=false`` turns into a false statement about the data.
+        #
+        # Deliberately **not** fixed by excluding planted settlements from the reserve draw:
+        # the reserved set would then correlate with plantedness, handing a matcher "the
+        # settlements with no reserve are the ambiguous ones" as a structural tell. Same
+        # self-inflicted leak the other two refusals reject, and a combined run buys nothing --
+        # gate 11 covers the planted rows and gate 13 covers the reserve.
+        if self.flags.dup_amounts and self.flags.reserve:
+            raise ValueError(
+                "--dup-amounts and --reserve cannot be combined: holding a reserve back from "
+                "one member of a planted pair moves its credit away from its partner's, so the "
+                "pair stops sharing an amount and stops being unresolvable -- truth would then "
+                "claim resolvable=false about data that is separable. Run them separately; "
+                "gate 11 covers the planted rows and gate 13 covers the reserve."
+            )
         if self.flags.settlement_report_late and self.n < 2:
             raise ValueError(
                 f"--settlement-report-late needs at least 2 settlements so that the "
@@ -571,8 +696,12 @@ if __name__ == "__main__":
     # off ``unimplemented()`` rather than a hand-written list is what makes it inverting
     # automatically instead of going stale.
     assert MessFlags().declared_but_inert() == []
-    assert MessFlags(netted_refunds=True).declared_but_inert() == ["netted_refunds"]
-    for _landed in ("settlement_delay", "fees", "dup_amounts", "batching"):
+    # Phase 6 step 6 landed ``netted_refunds``, so the inert probe moved to a Phase 7 flag.
+    # Moved rather than deleted, for the reason the seam probe below carries: the moment this
+    # names a flag that *is* implemented, it asserts nothing.
+    assert MessFlags(noise_rows=True).declared_but_inert() == ["noise_rows"]
+    for _landed in ("settlement_delay", "fees", "dup_amounts", "batching",
+                    "settlement_report_late", "tds", "netted_refunds", "reserve"):
         assert _landed not in MessFlags.unimplemented()
         assert MessFlags(**{_landed: True}).declared_but_inert() == [], (
             f"{_landed} is implemented, so it must not be reported inert"
@@ -670,15 +799,16 @@ if __name__ == "__main__":
     # flag it tests nothing. Move it again, do not delete it, when Phase 6 lands.
     _original = MessFlags.IMPLEMENTED
     try:
-        MessFlags.IMPLEMENTED = _original | {"netted_refunds"}
-        assert MessFlags(netted_refunds=True).declared_but_inert() == []
-        assert GenConfig(flags=MessFlags(netted_refunds=True)).resolved()["flags_enabled"] == [
-            "netted_refunds"
+        MessFlags.IMPLEMENTED = _original | {"noise_rows"}
+        assert MessFlags(noise_rows=True).declared_but_inert() == []
+        assert GenConfig(flags=MessFlags(noise_rows=True)).resolved()["flags_enabled"] == [
+            "noise_rows"
         ]
     finally:
         MessFlags.IMPLEMENTED = _original
     assert MessFlags.IMPLEMENTED == _original, "the probe must not leak"
-    assert "netted_refunds" in MessFlags.unimplemented(), "netted_refunds lands in Phase 6"
+    assert "noise_rows" in MessFlags.unimplemented(), "noise_rows lands in Phase 7"
+    assert "netted_refunds" in MessFlags.IMPLEMENTED, "Phase 6 step 6 implements netted_refunds"
     assert "batching" in MessFlags.IMPLEMENTED, "Phase 5 step 1 implements batching"
     assert MessFlags.unimplemented(), (
         "no flag is unimplemented any more -- the seam above is testing nothing, and the "
@@ -715,6 +845,72 @@ if __name__ == "__main__":
     # Each flag alone stays legal, or the refusal above is too broad.
     assert GenConfig(flags=MessFlags(dup_amounts=True)).planted_pairs == 2
     assert GenConfig(flags=MessFlags(batching=True)).planted_pairs == 0
+
+    # --- Phase 6 step 7: the reserve ------------------------------------------
+    # Shape, not the exact values, for the same reason as BATCH_SIZE_WEIGHTS above: these are
+    # tuning choices and pinning them would make this a test to edit. What must hold is that
+    # the share is a genuine fraction (partiality is what I16 asserts and what stops "the
+    # reserved rows" and "every row" being one set) and that the band is ordered, positive and
+    # well under 100% of a net -- a reserve at or above the net would drive a credit to zero
+    # or below, which ``Credit.__post_init__`` refuses.
+    assert 0 < RESERVE_SHARE < 1, "the reserve share must be a genuine fraction"
+    _rlo, _rhi = RESERVE_BPS_BAND
+    assert 0 < _rlo <= _rhi < 10_000, RESERVE_BPS_BAND
+    # The lower bound is load-bearing rather than cosmetic, and this assertion is what says
+    # so. ``matcher.tier1`` tells "money was held back" from "the fee rates assumed here are
+    # wrong" by the *size* of the shortfall, so a reserve must be unmistakably larger than any
+    # rounding or rate discrepancy this data can produce -- the largest of which is the fee's
+    # own rounding divergence, a few paise on a batch. A reserve of a few paise would be
+    # indistinguishable from a rounding bug, and truth would be asserting a mess the inputs
+    # cannot support. 100 bps is a floor on the floor, well below the declared 500.
+    assert _rlo >= 100, (
+        "a reserve below 1% of net risks being indistinguishable from fee rounding drift, "
+        "which is what tier1's PARTIAL_SETTLEMENT_PENDING diagnostic separates it from"
+    )
+    _reserved = GenConfig(flags=MessFlags(reserve=True))
+    assert not _reserved.clean_mode
+    assert _reserved.resolved()["flags_enabled"] == ["reserve"]
+    # --reserve moves no date: it changes one amount, the credit's. Same
+    # one-variable-at-a-time discipline that put --settlement-delay before --fees.
+    assert (_reserved.delay_days, _reserved.lag_days) == (0, 0), "--reserve must move no date"
+    assert _reserved.planted_pairs == 0, "--reserve plants no unresolvable pair"
+    # n < 2 is refused rather than silently reserving the only settlement, which would make
+    # the term total instead of partial.
+    try:
+        GenConfig(n=1, flags=MessFlags(reserve=True))
+    except ValueError as e:
+        assert "--reserve" in str(e), f"the refusal must name the flag: {e}"
+    else:
+        raise AssertionError("GenConfig accepted --reserve at n=1")
+    # --dup-amounts + --reserve is refused: holding a reserve back from one member of a
+    # planted pair moves its credit away from its partner's, so the pair stops sharing an
+    # amount and truth's resolvable=false becomes a false statement about the data.
+    try:
+        GenConfig(flags=MessFlags(dup_amounts=True, reserve=True))
+    except ValueError as e:
+        assert "dup-amounts" in str(e) and "reserve" in str(e), (
+            f"the refusal must name both flags: {e}"
+        )
+    else:
+        raise AssertionError("GenConfig accepted --dup-amounts with --reserve")
+    # And the combination the flag is *designed* to be run in stays legal, or the refusals
+    # above have quietly made the deliverable command unrunnable.
+    assert GenConfig(
+        n=200,
+        flags=MessFlags(
+            fees=True, settlement_delay=True, batching=True,
+            settlement_report_late=True, netted_refunds=True, tds=True, reserve=True,
+        ),
+    # Compared as a *set*: ``enabled()`` returns field-declaration order, which is incidental
+    # to what this asserts (all seven land, and the combination is legal). Pinning the order
+    # would make this a test to edit the next time a flag is declared.
+    ).flags.enabled() == sorted(
+        [
+            "settlement_delay", "fees", "batching", "settlement_report_late",
+            "netted_refunds", "tds", "reserve",
+        ],
+        key=MessFlags.names().index,
+    )
 
     assert sum(w for *_, w in AMOUNT_BANDS) == 100, "amount band weights must sum to 100"
     assert len(NARRATION_TEMPLATES) == 4

@@ -253,10 +253,17 @@ def main(argv: list[str] | None = None) -> int:
         f"\n{counts['payments']} records, {mode}, seed {cfg.seed}, {cfg.month_label} "
         f"-- generated in {total * 1000:.0f} ms"
     )
+    # Phase 6 step 7: under ``--reserve`` the net and the credited total are **not** equal, so
+    # the ``=`` between them would be a printed falsehood -- the one place this summary could
+    # state something the invariants had just disproved. The held total is named instead, which
+    # is also the only place a reader sees the reserve in a run summary at all (it appears in no
+    # CSV by design). Every other run prints exactly what it printed before.
+    _held = sum(c.decomposition.reserve_paise for c in story.credits)
     print(
         f"  gross {fmt(story.total_gross_paise())}  =  "
-        f"net {fmt(story.total_net_paise())}  =  "
-        f"credited {fmt(story.total_credited_paise())}"
+        f"net {fmt(story.total_net_paise())}"
+        + (f"  -  reserve {fmt(_held)}  =  " if _held else "  =  ")
+        + f"credited {fmt(story.total_credited_paise())}"
     )
     print(
         f"  invariants pass: {report['date_blocks']} date blocks, "

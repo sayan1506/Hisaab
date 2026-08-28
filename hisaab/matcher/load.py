@@ -137,6 +137,46 @@ class Dataset:
         """
         return {p.payment_id: p for p in self.payments}
 
+    def refunds_by_payment(self) -> dict[str, int]:
+        """Payment id -> the refunds citing it, summed in paise. Phase 6 step 6.
+
+        **A lookup, never a search** (decision 9). ``refunds.csv`` states which payment each
+        refund belongs to, so the link is *given*; searching for it would multiply the subset
+        search's hypothesis count by the refund power set to recover information the file
+        already carries.
+
+        Summed rather than returned per refund because a payment may be refunded more than
+        once and the arithmetic only cares about the total. The ids stay available through
+        ``refunds`` for a caller that needs to name them.
+
+        Only payments that appear in ``payments.csv`` are keyed here; a refund citing anything
+        else is an orphan and belongs to ``orphan_refunds`` below, because summing the two
+        together is precisely the mistake that would let unattributable money close a gap.
+        """
+        known = {p.payment_id for p in self.payments}
+        totals: dict[str, int] = {}
+        for r in self.refunds:
+            if r.payment_id in known:
+                totals[r.payment_id] = totals.get(r.payment_id, 0) + r.amount_paise
+        return totals
+
+    def orphan_refunds(self) -> tuple[Refund, ...]:
+        """Refunds citing a payment that is not in this month's ``payments.csv``.
+
+        Real and expected rather than a corruption: a refund for a sale from an earlier month
+        is netted off a payout in *this* month, and a single-month export cannot contain the
+        payment it reverses. The money genuinely left a settlement, and nothing in these three
+        files says which -- so these are the rows that make a residual unexplainable, and
+        naming them is what turns ``UNEXPLAINED_RESIDUAL`` into ``REFUND_UNLINKED``.
+
+        ``load`` deliberately does **not** refuse them, unlike an unknown payment in
+        ``settlement_items.csv``: membership is a claim about this month's data and a dangling
+        reference there is a broken file, while a refund's ``payment_id`` legitimately points
+        outside the window.
+        """
+        known = {p.payment_id for p in self.payments}
+        return tuple(r for r in self.refunds if r.payment_id not in known)
+
     def counts(self) -> dict[str, int]:
         return {
             "payments": len(self.payments),

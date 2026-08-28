@@ -31,7 +31,7 @@ from __future__ import annotations
 import dataclasses
 import random
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from ..common import ids
 from ..common.bizdays import BusinessCalendar
@@ -41,6 +41,10 @@ from .config import (
     BANK_CHANNELS,
     BATCH_SIZE_WEIGHTS,
     LATE_REPORT_SHARE,
+    REFUND_BPS_BAND,
+    REFUND_SHARE,
+    RESERVE_BPS_BAND,
+    RESERVE_SHARE,
     CAPTURE_HOUR_MAX,
     CAPTURE_HOUR_MIN,
     COUNTERPARTY,
@@ -53,7 +57,7 @@ from .config import (
     GenConfig,
 )
 from ..common.money import RUPEE, mul_bps, rupees
-from .model import Credit, Decomposition, Payment, Settlement, Story
+from .model import Credit, Decomposition, Payment, Refund, Settlement, Story
 from .rng import substream, weighted_choice
 
 #: UTR tails are 4 digits, matching the ``XXXX4471`` shape in Appendix A. Drawn
@@ -206,6 +210,213 @@ def _tds(cfg: GenConfig, gross_paise: int) -> int:
     return mul_bps(gross_paise, cfg.fees.tds_bps)
 
 
+def _draw_refunds(
+    cfg: GenConfig, rng: random.Random, grosses: list[int], groups: list[list[int]]
+) -> tuple[dict[int, int], dict[int, int]]:
+    """``(linked, unlinked)``: payment index -> refund in **absolute paise**.
+
+    Both are empty unless ``--netted-refunds`` is on. ``linked`` refunds cite a payment that
+    is in ``payments.csv``; ``unlinked`` ones cite a payment that is **not**, which is the
+    planted mess (see ``build``'s step 6b and ``Reason.REFUND_UNLINKED``). They are the same
+    arithmetic against a settlement's net and differ only in whether the matcher can attribute
+    them, which is why the two are merged to compute a net and kept apart for truth.
+
+    **The magnitude is drawn as basis points and immediately frozen into paise, and that
+    conversion happening *here* rather than at the point of use is the whole design.**
+    ``_make_nets_unique`` moves a gross by a paisa at a time to keep two settlements off one
+    net; if a refund were stored as a rate and re-derived from the gross later, every nudge
+    would move the refund, which moves the net, which is the value the nudge is trying to
+    place -- a loop whose fixed point is not guaranteed to exist. Frozen paise make the nudge
+    monotone again: the refund is a constant the net is computed *from*, never a function of
+    it. The cost is that a refund is not exactly ``x%`` of the final gross on a nudged row,
+    which is invisible in the data and is the right trade.
+
+    Drawn on the ``refunds`` stream, which ``rng.py`` has reserved since Phase 1, and drawn
+    with a consumption that is a function of ``cfg`` alone (rule 2): one ``sample`` for the
+    population and then exactly one ``randint`` per chosen payment. A per-payment
+    "should this be refunded?" coin flip would consume ``n`` draws instead of ``k``, which is
+    the same count but makes the *chosen set* depend on the amount distribution -- and the
+    refunded rows would then move whenever an amount band changed.
+
+    **Partial by construction.** ``REFUND_SHARE`` is a fraction, so a run always has both
+    refunded and unrefunded settlements. That is the same requirement
+    ``--settlement-report-late`` has and for the same reason: a flag that refunded every
+    payment would make "the refund term" and "every row" the same set, and no comparison
+    downstream could tell a refund-aware matcher from one that had absorbed the term into its
+    fee model.
+    """
+    if not cfg.flags.netted_refunds:
+        return {}, {}
+    lo, hi = REFUND_BPS_BAND
+    population = len(grosses)
+    k = round(population * REFUND_SHARE)
+    # At least one, or the run is labelled with a mess it does not have. Never so many that
+    # nothing is left over: one payment must stay unrefunded so the term is partial, and one
+    # more must be free to carry the planted unlinked refund below. ``GenConfig`` refuses the
+    # ``n`` that cannot satisfy both, so this clamp is the backstop rather than the policy.
+    k = max(1, min(k, population - 2))
+
+    def _amount(gross: int) -> int:
+        # ``randint`` is inclusive at both ends, so the band reads as written. A refund of
+        # nothing is not a refund -- ``Refund.__post_init__`` asserts it is positive and a zero
+        # row would be a declared refund the arithmetic cannot see -- so the floor is applied
+        # rather than trusted, since it is reachable at the smallest drawable gross.
+        return max(1, mul_bps(gross, rng.randint(lo, hi)))
+
+    chosen = sorted(rng.sample(range(population), k))
+    linked = {i: _amount(grosses[i]) for i in chosen}
+
+    # --- the planted one ---------------------------------------------------
+    # **Drawn from the payments no linked refund touched**, so one settlement never carries
+    # both provenances at once. Not cosmetic: truth publishes a single ``refunds_paise`` term
+    # per credit, and a settlement mixing an attributable refund with an unattributable one
+    # would make that term impossible to reason about -- the matcher could explain part of it,
+    # and "partly explained" is not a state this project's arithmetic has a name for.
+    #
+    # **Disjoint at the settlement level, not the payment level, and that distinction was a
+    # live bug rather than a hypothetical.** Excluding only the refunded *payments* is what
+    # this function used to do, and under ``--batching`` a settlement holding two payments can
+    # take a linked refund off one and the planted one off the other -- so its single
+    # ``refunds_paise`` term becomes partly attributable, which is the state ``build``'s
+    # assertion below says the arithmetic has no name for. It fired on seed 3 and seed 7 at
+    # n=200 the first time any gate ran ``--netted-refunds --batching`` together (gate 13),
+    # having predicted the failure in its own message.
+    #
+    # So the exclusion is by settlement. Without ``--batching`` every group is a singleton and
+    # this is exactly the old set, which is what keeps the 1:1 path byte-identical.
+    tainted = {i for group in groups for i in group if any(m in linked for m in group)}
+    remaining = [i for i in range(population) if i not in tainted]
+    if not remaining:
+        # Reachable only when every settlement in the run carries a linked refund, which needs
+        # a batching draw that gathers all of them -- possible at the smallest legal ``n`` and
+        # vanishingly unlikely above it. Dropping the plant is the honest response: a run
+        # without an unattributable refund is a weaker run, but a run whose refund term is
+        # half-attributable is an *incoherent* one, and truth would have to publish a number it
+        # could not describe. ``REFUND_UNLINKED`` simply has no case here.
+        return linked, {}
+    # ``sample`` of one rather than ``choice``: it consumes a draw count that is a function of
+    # the population alone, which is the property ``rng.py`` rule 2 asks for.
+    planted_index = rng.sample(remaining, 1)[0]
+    unlinked = {planted_index: _amount(grosses[planted_index])}
+    return linked, unlinked
+
+
+def _draw_reserves(
+    cfg: GenConfig, rng: random.Random, settlements: list[Settlement]
+) -> dict[str, int]:
+    """``settlement_id -> paise held back``. Empty unless ``--reserve`` is on.
+
+    **Design B: the reserve stays outside ``net_paise``.** The settlement declares its full
+    net and the bank credit arrives *short* by this amount, which appears in no input file at
+    all -- not as a column, not as a row, nowhere. That asymmetry is the entire mess, and the
+    alternative collapses it: if the reserve were folded into ``net_paise`` the credit would
+    equal the declared net again, every invariant would pass untouched, and nothing anywhere
+    would say money had been held. There would be no mess to find. So a reserve *necessarily*
+    makes ``credit < net``, and that is a consequence of modelling a reserve at all rather
+    than of choosing design B (``.plan/phase6.md`` correction (c) reaches the same conclusion
+    from the matcher's side).
+
+    **Drawn after the settlements are built, which is the opposite of ``_draw_refunds`` and
+    for a reason worth stating.** A refund is a term ``net_paise`` is computed *from*, so it
+    has to exist before ``_make_nets_unique`` places a net -- and it has to be frozen into
+    paise, or the nudge would chase a target that moves with it. A reserve is subtracted from
+    a net that is already final, so it touches the nudge loop not at all and can be drawn from
+    the finished settlements. Nothing about the reserve can perturb the uniqueness work.
+
+    Drawn on the ``reserve`` stream, which ``rng.py`` has reserved since Phase 1. Consumption
+    is one ``sample`` plus exactly one ``randint`` per chosen settlement -- a function of the
+    settlement count, which is itself a function of ``cfg`` (rule 2). Phase 5 decision 8 is the
+    reason that gets checked rather than assumed: drawing on a count that was not a function of
+    ``cfg`` shifted every UTR in the file and made a cross-run diff unreadable. Here the stream
+    is otherwise unused and drawn last, so no other stream can be displaced by it.
+
+    Partial by construction (``RESERVE_SHARE`` is a fraction), for the reason every share in
+    this generator is partial: a run where every settlement were reserved could not distinguish
+    a reserve-aware matcher from one that had simply widened its tolerance until everything fit.
+    """
+    if not cfg.flags.reserve:
+        return {}
+    lo, hi = RESERVE_BPS_BAND
+    population = len(settlements)
+    k = round(population * RESERVE_SHARE)
+    # At least one, or the run is labelled with a mess it does not have; never all of them, or
+    # the term stops being partial. ``GenConfig`` refuses the ``n`` that cannot satisfy both,
+    # so this clamp is the backstop rather than the policy.
+    k = max(1, min(k, population - 1))
+    chosen = sorted(rng.sample(range(population), k))
+    held: dict[str, int] = {}
+    for i in chosen:
+        s = settlements[i]
+        # ``randint`` is inclusive at both ends, so the band reads as written. A reserve of
+        # nothing is not a reserve -- it would be a row truth labels as reserved while the
+        # credit equals the net exactly, which is a claim the data contradicts -- so the floor
+        # is applied rather than trusted.
+        held[s.settlement_id] = max(1, mul_bps(s.net_paise, rng.randint(lo, hi)))
+    return held
+
+
+def _separate_reserved_amounts(
+    settlements: list[Settlement], held: dict[str, int]
+) -> None:
+    """Nudge each held amount until the short credit matches **no settlement's net**.
+
+    Mutates ``held`` in place. Without this, ``--reserve`` can plant a silent wrong match,
+    and it is the sharpest hazard in this flag -- sharper than anything ``--netted-refunds``
+    could produce, for a reason worth stating precisely.
+
+    **A reserved credit is the first row in this project whose true settlement is not in its
+    own candidate pool.** Every other credit equals some settlement's net, so blocking finds
+    the right settlement and the only question is whether anything *else* is in the pool too.
+    A reserved credit equals its own settlement's net *minus* the held amount, so its true
+    settlement is invisible to an exact-band lookup. That inverts the failure mode:
+
+      * For every pre-Phase-6 row, an amount clash puts **two** settlements in the pool and
+        ``resolve_credit`` abstains with ``AMBIGUOUS_DUPLICATE_AMOUNT``. Honest, and safe.
+      * For a reserved row, a clash puts **exactly one** settlement in the pool -- the
+        *wrong* one -- and its arithmetic closes perfectly, because the credit really does
+        equal that settlement's net. The matcher resolves it, names the wrong payment set,
+        and has no way whatsoever to know. That is a ``WRONG_MATCH``, on the one line this
+        project says never bends.
+
+    So the guard is not "keep ``(value_date, amount)`` unique" -- that is I3's per-date
+    property and it is **not sufficient here**. The clash that hurts is with any settlement
+    inside the *date window*, and the window is a matcher-side parameter this generator does
+    not know. The guard is therefore made window-independent and date-independent by
+    excluding the amount from **every** net in the run, which is strictly stronger than
+    anything a window could require. It also keeps the reserved credits distinct from each
+    other, so two reserved rows cannot collide into a pool of two either.
+
+    **The nudge is free, and that is what makes this legitimate rather than a fudge.** The
+    held amount appears in no input file -- no column, no row -- so moving it by a few paise
+    is unobservable to any matcher and changes no declared quantity. Compare
+    ``_unique_amount``, which nudges a *gross* and therefore does perturb ``payments.csv``.
+    Here the only visible consequence is the credit amount, which is already whatever the
+    reserve made it.
+    """
+    if not held:
+        return
+    all_nets = {s.net_paise for s in settlements}
+    taken_amounts: set[int] = set()
+    for s in settlements:
+        amount = held.get(s.settlement_id)
+        if amount is None:
+            continue
+        # Nudge the *reserve* up, which walks the credit down a paisa at a time. Up rather
+        # than down so the reserve can never round to zero and turn a row truth calls
+        # reserved into one whose credit equals its net.
+        while (s.net_paise - amount) in all_nets or (s.net_paise - amount) in taken_amounts:
+            amount += 1
+        # ``Credit.__post_init__`` asserts a positive amount. The band tops out at 20% of
+        # net and the nudge moves single paise, so this has enormous headroom -- checked
+        # rather than trusted, because a future band change is what would consume it.
+        assert amount < s.net_paise, (
+            f"{s.settlement_id}: a reserve of {amount}p is not less than its {s.net_paise}p "
+            f"net, so the credit would be zero or negative. Lower RESERVE_BPS_BAND."
+        )
+        held[s.settlement_id] = amount
+        taken_amounts.add(s.net_paise - amount)
+
+
 def _unique_amount(taken: set[tuple[date, int]], day: date, amount: int) -> int:
     """Nudge ``amount`` up by whole paise until ``(day, amount)`` is unused.
 
@@ -229,7 +440,11 @@ def _unique_amount(taken: set[tuple[date, int]], day: date, amount: int) -> int:
 
 
 def _batch_net(
-    cfg: GenConfig, grosses: list[int], methods: list[str], members: list[int]
+    cfg: GenConfig,
+    grosses: list[int],
+    methods: list[str],
+    members: list[int],
+    refunds: dict[int, int] | None = None,
 ) -> int:
     """A batch's ``net_paise``: per member, per method, each rounded at the paisa, summed.
 
@@ -237,7 +452,13 @@ def _batch_net(
     ``Settlement`` built in ``build`` cannot disagree about what a batch nets. Decision 7 --
     and see ``matcher/fees.derive``, which does the same sum independently and is what makes
     the residual a test rather than a tautology.
+
+    ``refunds`` maps a payment index to the refund netted off it, in **absolute paise** (see
+    ``_draw_refunds`` for why it is frozen rather than a rate). Defaulted to ``None`` rather
+    than required: every caller that predates ``--netted-refunds`` means "no refunds", and the
+    two are the same arithmetic.
     """
+    netted = refunds or {}
     total = 0
     for i in members:
         fee, gst = _deductions(cfg, grosses[i], methods[i])
@@ -245,7 +466,12 @@ def _batch_net(
         # this function protects. Leaving it out would nudge for uniqueness on a number the
         # emitted data never carries -- I3 would then check a key nothing guarded, and the
         # margin measured in ASSUMPTIONS #24a would be describing the wrong quantity.
-        total += grosses[i] - fee - gst - _tds(cfg, grosses[i])
+        #
+        # The refund is inside for the identical reason, and the reason is worth restating
+        # because a refund is the first term here that is **not derivable from a rate**: it is
+        # declared in ``refunds.csv``, so a matcher must look it up rather than compute it.
+        # That changes who can verify the number, not which side of the net it falls on.
+        total += grosses[i] - fee - gst - _tds(cfg, grosses[i]) - netted.get(i, 0)
     return total
 
 
@@ -257,8 +483,15 @@ def _make_nets_unique(
     settled_on_of: list[date],
     groups: list[list[int]],
     taken_gross: set[tuple[date, int]],
+    refunds: dict[int, int] | None = None,
 ) -> int:
     """Nudge grosses until no two settlements share a ``(settled_on, net)``. Returns nudges.
+
+    ``refunds`` is the frozen per-payment refund in paise, threaded through to ``_batch_net``
+    because a refund is one of the terms the net is computed from. Threading it rather than
+    re-deriving it is what keeps this loop monotone: a bump moves the gross, the refund stays
+    put, so the net moves by exactly the bump. A refund re-derived as a share of the gross
+    would move with every bump and the loop would be chasing a target that runs away from it.
 
     **``_unique_amount``'s guarantee does not survive summation, and this restores it.** That
     function keeps every ``(capture_date, gross)`` distinct, which is what makes a 1:1 credit
@@ -299,7 +532,7 @@ def _make_nets_unique(
         when = settled_on_of[members[0]]
         # The lowest member index, so the victim is a function of the data alone.
         victim = members[0]
-        while (when, _batch_net(cfg, grosses, methods, members)) in taken_net:
+        while (when, _batch_net(cfg, grosses, methods, members, refunds)) in taken_net:
             nudges += 1
             assert nudges < 100 * max(len(groups), 1), (
                 f"runaway nudging around {when} -- the amount space is saturated, which at "
@@ -316,7 +549,7 @@ def _make_nets_unique(
                 if (day, grosses[victim]) not in taken_gross:
                     break
             taken_gross.add((day, grosses[victim]))
-        taken_net.add((when, _batch_net(cfg, grosses, methods, members)))
+        taken_net.add((when, _batch_net(cfg, grosses, methods, members, refunds)))
     return nudges
 
 
@@ -510,6 +743,8 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     rng_bank = substream(cfg.seed, "bank_order")
     rng_dup = substream(cfg.seed, "dup")
     rng_batching = substream(cfg.seed, "batching")
+    rng_refunds = substream(cfg.seed, "refunds")
+    rng_reserve = substream(cfg.seed, "reserve")
 
     # --- Step 4: invent the payments -------------------------------------
     # Drawn first, then sorted by capture time, then numbered -- a real gateway
@@ -545,17 +780,47 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     methods = [d[2] for d in drafts]
     settled_on_of = [cal.add_business_days(day, cfg.delay_days) for day in capture_dates]
 
+    # --- Step 6a: --netted-refunds draws the refunds ----------------------
+    # Drawn **before** the uniqueness nudge and after the amounts are sorted, which is the
+    # only order that works. The nudge places a settlement's net, and a refund is one of the
+    # terms that net is computed from -- so the refund has to exist first, as a frozen number
+    # (see ``_draw_refunds``). Drawn after the sort so the chosen indices refer to the same
+    # payment numbering that reaches ``payments.csv``.
+    #
+    # ``refunded`` maps payment index -> refund in paise, netted off the settlement holding
+    # that payment. ``unlinked`` is the planted mess and maps the same way, but its refund row
+    # cites a payment that is **not in this month's file** -- so the money comes off a real
+    # settlement while nothing in the inputs says which settlement it came off. Both dicts
+    # are the same arithmetic and differ only in provenance, which is why they are merged for
+    # the net and kept apart for truth.
+    # The batches are decided **before** the refunds are drawn, because the planted refund has
+    # to know which settlement each payment lands in -- see ``_draw_refunds`` on why that
+    # exclusion is by settlement rather than by payment. Reordering these two is free of
+    # reproducibility cost because they draw on *different* substreams (``batching`` and
+    # ``refunds``), so neither one's sequence of values changes; that independence is the
+    # property ``rng.py``'s named streams exist to give, and it is what makes an ordering fix
+    # like this one a local edit rather than a reseeding of the whole run.
+    groups = (
+        _group_into_batches(rng_batching, settled_on_of)
+        if cfg.flags.batching
+        else [[i] for i in range(cfg.n)]
+    )
+
+    refunded, unlinked = _draw_refunds(cfg, rng_refunds, grosses, groups)
+    netted_by_index = {
+        i: refunded.get(i, 0) + unlinked.get(i, 0)
+        for i in set(refunded) | set(unlinked)
+    }
+
     if cfg.flags.batching:
-        groups = _group_into_batches(rng_batching, settled_on_of)
         # ``taken`` still holds every (capture_date, gross) the draw loop reserved, so the
         # nudge can dodge both collision channels at once. Gated on the flag: the 1:1 path
         # must stay byte-identical to Phase 1, since clean mode is the regression check and
         # ASSUMPTIONS.md #24a's numbers describe that exact code.
         _make_nets_unique(
-            cfg, grosses, methods, capture_dates, settled_on_of, groups, taken
+            cfg, grosses, methods, capture_dates, settled_on_of, groups, taken,
+            netted_by_index,
         )
-    else:
-        groups = [[i] for i in range(cfg.n)]
 
     payments = [
         Payment(
@@ -628,6 +893,13 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # AMOUNT_BANDS as paise. They are rupees, so the smallest gross is 10,000p and its
         # TDS is 10p. See .plan/phase6.md section 9(a).)
         tds = sum(_tds(cfg, p.gross_paise) for p in batch)
+        # The refund term, and it is the first one here that is **not computed from a rate**.
+        # ``netted_by_index`` was frozen before the uniqueness nudge ran, so this is a lookup
+        # of a number that already exists rather than a derivation -- which is exactly the
+        # position the matcher is in (``refunds.csv`` declares it; decision 9 says look it up
+        # and never search for it). Summed over the batch's members for the same reason the
+        # fee is: a batch's terms are the sum of its members' terms, never a rate on the total.
+        refunds_total = sum(netted_by_index.get(i, 0) for i in members)
         gross_total = sum(p.gross_paise for p in batch)
         # Every member of a batch shares a settlement date by construction
         # (``_group_into_batches`` partitions within one date), so the settlement's date is
@@ -657,7 +929,16 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
                 # amount band survives, blocking is untouched, and the whole flag lands as a
                 # change of *value* in a column the matcher already reads. Refunds get the
                 # same treatment in step 6; the reserve cannot, which is why it is last.
-                net_paise=gross_total - fee - gst - tds,
+                # Phase 6 step 6 puts the refund inside the net too, and ``settlements.csv``
+                # gains **no column for it** -- I9 freezes that header, and Appendix A is the
+                # authority on it. So the refund is visible to the matcher only through
+                # ``refunds.csv``, which cites a ``payment_id``: the matcher joins that to the
+                # settlement's membership and sums. The consequence is the one worth stating:
+                # like ``--tds``, this flag moves **no join at all** (the credit still equals
+                # the net), and unlike ``--tds`` the term is not derivable from any rate, so
+                # what it tests is a *lookup* rather than an arithmetic model. The reserve is
+                # the flag that cannot be treated this way, which is why it is last.
+                net_paise=gross_total - fee - gst - tds - refunds_total,
                 fee_paise=fee,
                 gst_paise=gst,
                 tds_paise=tds,
@@ -708,6 +989,93 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
                 first_utr[key] = s.utr
             planted_settlement_ids.add(settlements[i].settlement_id)
 
+    # --- Step 6b: --netted-refunds materialises the refund rows -----------
+    # The amounts were drawn before the nudge; this turns them into ``refunds.csv`` rows and
+    # records, per settlement, what truth has to publish. Nothing here draws randomness: the
+    # magnitudes are already frozen and the timestamps are *derived*, which is deliberate --
+    # a drawn refund time would consume a stream to produce a column no invariant reads and
+    # no matcher joins on.
+    #
+    # **The planted refund cites ``pay_0000``, which this generator never emits** (numbering
+    # starts at 1), and its ``created_at`` predates the month. That is the mess as the plan
+    # specifies it: the money genuinely left a real settlement, the refund row is genuinely in
+    # the file, and nothing in the three input files says *which* settlement it came off. The
+    # window is not widened to admit it -- the window is fixed by the posting lag (#15b), and
+    # a refund arriving from outside it is the mess rather than a bound to relax.
+    refunds: list[Refund] = []
+    #: settlement_id -> (the refund ids netted off it, their total in paise)
+    refunds_of: dict[str, tuple[list[str], int]] = {}
+    #: settlement_id -> the part of that total whose payment is not in this month's file
+    unlinked_of: dict[str, int] = {}
+    if netted_by_index:
+        # One business day after capture, so a refund never predates the sale it reverses.
+        # Derived rather than drawn -- see above.
+        for seq, (i, amount) in enumerate(sorted(netted_by_index.items()), start=1):
+            planted = i in unlinked
+            refunds.append(
+                Refund(
+                    refund_id=ids.refund_id(seq),
+                    # The out-of-scope citation. ``ids.payment_id(0)`` is well-formed and
+                    # unissued, so the row is syntactically ordinary and referentially orphaned
+                    # -- which is exactly the shape a real cross-month refund has in a
+                    # single-month export.
+                    payment_id=ids.payment_id(0) if planted else payments[i].payment_id,
+                    created_at=(
+                        datetime(cfg.year, cfg.month, 1, 10, 0, tzinfo=IST)
+                        - timedelta(days=5)
+                        if planted
+                        else payments[i].captured_at + timedelta(days=1)
+                    ),
+                    amount_paise=amount,
+                )
+            )
+        for idx, s in enumerate(settlements):
+            members = groups[idx]
+            ids_here = [
+                r.refund_id
+                for r, i in zip(refunds, sorted(netted_by_index))
+                if i in members
+            ]
+            total = sum(netted_by_index.get(i, 0) for i in members)
+            if total:
+                refunds_of[s.settlement_id] = (ids_here, total)
+            planted_here = sum(unlinked.get(i, 0) for i in members)
+            if planted_here:
+                unlinked_of[s.settlement_id] = planted_here
+                # Truth publishes one ``refunds_paise`` per credit, so a settlement netting
+                # both an attributable and an unattributable refund would have a term that is
+                # *partly* attributable -- not a state this project's arithmetic has a name
+                # for. ``_draw_refunds`` prevents it by excluding whole settlements from the
+                # planted draw; this re-derives that property here, from the finished groups,
+                # rather than trusting the draw to have got it right.
+                #
+                # Worth keeping precisely because it has already paid: when the exclusion was
+                # by *payment* instead of by settlement, this fired on seed 3 and seed 7 at
+                # n=200 the first time a gate ran ``--netted-refunds --batching`` together --
+                # a loud crash before a byte was written, which is the failure mode the
+                # generator's exit-code contract is built around. An assumption instead of an
+                # assertion would have shipped an incoherent refund term quietly.
+                assert planted_here == total, (
+                    f"{s.settlement_id} nets both an attributable and an unattributable "
+                    f"refund ({total - planted_here}p linked, {planted_here}p planted) -- "
+                    f"see _draw_refunds on why the planted draw excludes whole settlements"
+                )
+
+    # --- Step 7a: --reserve holds part of a payout back --------------------
+    # Drawn here, after the settlements are final and before the credits are drafted, which
+    # is the only window that works. After the settlements because the held amount is a
+    # fraction of a *finished* net (and because a reserve outside the net cannot perturb the
+    # uniqueness nudge -- see ``_draw_reserves``). Before the credits because the credit
+    # amount **is** ``net - held``, and everything below this line that reads an amount has
+    # to read the short one, including the narration echo fixup.
+    reserve_held = _draw_reserves(cfg, rng_reserve, settlements)
+    # And separated before use, or the flag can plant a silent wrong match rather than a
+    # detectable one. This is the single sharpest hazard in Phase 6 and the reasoning is in
+    # ``_separate_reserved_amounts``: a reserved credit is the first row here whose true
+    # settlement is *absent* from its own candidate pool, so an amount clash yields one
+    # confident wrong answer instead of two candidates and an honest abstention.
+    _separate_reserved_amounts(settlements, reserve_held)
+
     # --- Step 6: derive bank credits, 1:1 --------------------------------
     # Same date, same amount, and a narration assembled from parts. Four fields
     # reach the CSV; the linkage below exists only in memory and in truth.json.
@@ -716,22 +1084,30 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     # The echo fixup has to be *memoised*, or step 5b's work is undone here: a planted pair
     # shares a tail and a net, so if that tail echoes the amount both members enter the loop
     # below and each would draw its own spare -- handing the pair two different narration
-    # tails and separating it again. Keyed on ``(tail, net)`` because that pair is what the
-    # decision depends on. Clean mode is byte-identical: every tail is distinct there, so
-    # every lookup misses and the loop runs exactly as before.
+    # tails and separating it again. Keyed on ``(tail, credit amount)`` because that pair is
+    # what the decision depends on. Clean mode is byte-identical: every tail is distinct
+    # there, so every lookup misses and the loop runs exactly as before.
     fixed_tails: dict[tuple[int, int], int] = {}
     drafted_credits: list[tuple[date, int, float, Settlement, str]] = []
     for s in settlements:
         original = int(s.utr.removeprefix("XXXX"))
-        cached = fixed_tails.get((original, s.net_paise))
+        # **The amount the bank actually receives, which is the net only when nothing is
+        # held.** Every use below -- the echo fixup, the sort key, the emitted row -- reads
+        # this rather than ``s.net_paise``, and getting that wrong would be invisible until a
+        # rare seed: I7 compares the narration against the *credit's* amount, so a tail
+        # cleared against the net could still echo ``net - held`` and fail on a run nobody
+        # was looking at. With ``--reserve`` off this is ``s.net_paise`` exactly and every
+        # expression below is unchanged.
+        credit_amount = s.net_paise - reserve_held.get(s.settlement_id, 0)
+        cached = fixed_tails.get((original, credit_amount))
         if cached is None:
             tail = original
             # A tail that happens to equal its own credit's rupee figure would put the
             # amount into the narration, handing the matcher a free join. Swap it for
             # an unused tail rather than let invariant I7 fail on a rare seed.
-            while _tail_echoes_amount(tail, s.net_paise):
+            while _tail_echoes_amount(tail, credit_amount):
                 tail = next(spare_tails)
-            fixed_tails[(original, s.net_paise)] = tail
+            fixed_tails[(original, credit_amount)] = tail
         else:
             tail = cached
         # The narration template and channel are still drawn per credit, so a planted pair's
@@ -755,7 +1131,12 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # Trap 2: the tiebreak is what stops a stable sort from preserving
         # generation order (== payment order) among same-date same-amount rows.
         value_date = cal.add_business_days(s.settled_on, cfg.lag_days)
-        drafted_credits.append((value_date, s.net_paise, rng_bank.random(), s, narration))
+        # ``credit_amount``, not ``s.net_paise``: the bank statement is ordered by what the
+        # bank actually received, and under ``--reserve`` those differ. Sorting on the net
+        # while emitting the short amount would order the file by a number that appears
+        # nowhere in it -- and since the sort decides credit *numbering*, C0001..C000n would
+        # be assigned in an order no reader of the CSV could reconstruct.
+        drafted_credits.append((value_date, credit_amount, rng_bank.random(), s, narration))
 
     drafted_credits.sort(key=lambda c: (c[0], c[1], c[2]))
 
@@ -786,6 +1167,94 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # ``metrics._classify`` grades that as LUCKY_GUESS rather than CORRECT precisely
         # because the inputs could not have justified it.
         planted = s.settlement_id in planted_settlement_ids
+        refund_ids, refunds_here = refunds_of.get(s.settlement_id, ([], 0))
+        unlinked_here = unlinked_of.get(s.settlement_id, 0)
+        # **An unattributable refund leaves the row ``resolvable: true``, and that is Phase
+        # 4b's standard applied rather than the plan's wording followed.** ``.plan/phase6.md``
+        # step 6 calls the out-of-window refund "the planted mess", which reads as
+        # ``resolvable: false``. It is not, and the test is the one Phase 4b established: could
+        # an unbounded, model-free strategy separate this row? It could, and cheaply. The
+        # refund's amount *is* in ``refunds.csv``; a matcher that derives fee, GST and TDS from
+        # the rates is left with a residual equal to exactly that amount, so the orphan refund
+        # is identifiable by matching its declared amount against the unexplained remainder.
+        # Claiming unresolvability here would be truth asserting something an exhaustive
+        # matcher refutes -- the one outcome the plan's own step 4 rules out.
+        #
+        # So this matcher's ``REFUND_UNLINKED`` abstention is scored as a **miss**, not as a
+        # correct abstention: coverage falls and correctness holds. That is the same shape as
+        # Phase 5's ``AMBIGUOUS_MULTI_SUBSET`` rows at n=1000 -- an honest refusal on a row
+        # that is resolvable in principle, costing coverage and never correctness -- and the
+        # capability that would close it (attribute an orphan refund by its residual) is
+        # available to a later phase, declared here rather than quietly built.
+        held_here = reserve_held.get(s.settlement_id, 0)
+        # **A reserved row stays ``resolvable: true``, and this is the plan's one clause that
+        # measurement overturned rather than refined.** ``.plan/phase6.md`` step 7 says to mark
+        # these ``resolvable: false`` with ``PARTIAL_SETTLEMENT_PENDING``. That would be false
+        # about this data, by the standard Phase 4b established and gate 11 enforces.
+        #
+        # The test is whether an unbounded, model-free strategy could separate the row. It
+        # can, and the channel is the one gate 11 already measured: a reserve moves the
+        # credit's *amount* and leaves the settlement's **UTR** alone, so the narration tail
+        # still points at exactly one settlement. Measured directly before this was written
+        # (``.plan/probe_tail_vs_amount.py``, seed 42, n=200 and n=1000, every implemented flag
+        # combination): the tail-only join -- reading no date and no amount -- hits a unique
+        # settlement for **100% of gateway credits**, and declared membership then yields the
+        # correct payment set for 100% of those. An amount-side wedge does not degrade that
+        # channel at all. So the payment set of a reserved credit is identifiable; what is
+        # *not* identifiable is the arithmetic, because the held amount appears in no input
+        # file. Those are two different claims and ``resolvable`` is about the first.
+        #
+        # Marking it false would be actively harmful rather than merely imprecise.
+        # ``truth_io.is_planted_unresolvable`` is literally ``not resolvable``, and
+        # ``metrics._classify`` reads it twice: an abstention there becomes
+        # ``CORRECT_ABSTENTION`` instead of ``MISSED``, and a **correct** resolution becomes
+        # ``LUCKY_GUESS`` -- the cell ``metrics.py`` calls the cheapest available leak
+        # detector. So the wrong flag would inflate the honest-abstention count with separable
+        # rows *and* make the leak detector fire on honest work.
+        #
+        # ``--dup-amounts`` is the precedent in the other direction: to earn
+        # ``resolvable: false`` it had to destroy the tail channel too, by forcing both
+        # members to share one UTR (step 5b, and gate 11 asserts it). A reserve destroys
+        # nothing, so it does not earn the flag. The consequence is the same shape as the
+        # orphan refund above: the matcher's ``PARTIAL_SETTLEMENT_PENDING`` abstention scores
+        # as a **miss**, coverage falls, correctness holds, and the capability that would
+        # close it is declared rather than quietly taken.
+        note_parts: list[str] = []
+        if planted:
+            note_parts.append(
+                f"planted unresolvable: another credit shares this value_date "
+                f"({value_date.isoformat()}), this amount ({amount}p) and this UTR "
+                f"({s.utr}), so no field in the three input files separates them. "
+                f"Resolving it requires information outside these files; the only "
+                f"correct verdict is an abstention."
+            )
+        if unlinked_here:
+            # A note **without** a reason, which the ``Credit`` contract permits only on a
+            # resolvable row -- and that asymmetry is the point. This row is resolvable (the
+            # refund's amount is declared, so the residual identifies it), so it may not carry
+            # a reason code; but a reader of the answer key still needs to know the money left
+            # via an orphan refund. See the block above on why ``resolvable`` stays true here.
+            note_parts.append(
+                f"{unlinked_here}p of this credit's shortfall is a refund whose "
+                f"payment is not in this month's payments.csv (it cites "
+                f"{ids.payment_id(0)}, and its created_at predates the window). The "
+                f"refund row is present in refunds.csv, so the amount is declared and "
+                f"the row is resolvable in principle -- a matcher that derives the "
+                f"rate-based terms is left with a residual equal to exactly this "
+                f"refund. Abstaining here is honest but scores as a miss, not as a "
+                f"correct abstention."
+            )
+        if held_here:
+            note_parts.append(
+                f"{held_here}p of this settlement's {s.net_paise}p net was held back as a "
+                f"rolling reserve, so the bank credit is short by that amount. The held "
+                f"figure appears in **no input file** -- not a column, not a row -- so the "
+                f"arithmetic cannot be closed from the inputs and the only honest verdict is "
+                f"an abstention (PARTIAL_SETTLEMENT_PENDING). The row is nonetheless "
+                f"resolvable: this settlement's UTR is unchanged, so the narration tail still "
+                f"identifies it uniquely and its payment set is recoverable. Abstaining is "
+                f"correct behaviour and scores as a miss, not as a correct abstention."
+            )
         credits.append(
             Credit(
                 credit_id=ids.credit_id(seq),
@@ -806,20 +1275,41 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
                     # the terms rather than copied from the amount, so a term the answer key
                     # forgets cannot silently agree with the CSVs.
                     tds_paise=s.tds_paise,
+                    # Phase 6 step 6, and the same lesson as ``tds_paise`` above: a term the
+                    # answer key forgets while ``build`` subtracts it from the net cannot
+                    # silently agree with the CSVs, because I4 re-derives the subtraction from
+                    # these six terms and compares it to the emitted amount.
+                    refunds_paise=refunds_here,
+                    # Phase 6 step 7, and the term that makes the answer key's arithmetic
+                    # close on a reserved row. ``expected_credit_paise`` subtracts all six
+                    # terms, so with the reserve recorded here I4's per-credit check
+                    # (``expected == amount_paise``) holds unchanged -- the credit really is
+                    # ``gross - fee - gst - tds - refunds - reserve``.
+                    #
+                    # **This is the one term in the decomposition that no input file
+                    # declares**, and that asymmetry is the mess. The other five are derivable
+                    # (a rate on a declared gross) or declared outright (``refunds.csv``); this
+                    # one exists only in the answer key. So truth can state the arithmetic
+                    # while the matcher provably cannot reproduce it, which is precisely why
+                    # the matcher must abstain rather than fit a number to the gap.
+                    reserve_paise=held_here,
                 ),
-                refunds_netted=[],
-                reserve_held_paise=0,
+                # The refund ids, so truth says *which* refunds composed the term rather than
+                # only how much they came to. That is what lets I15 compare term by term
+                # instead of in total -- two refunds that sum correctly while being attributed
+                # to the wrong settlements are a real error that a total cannot see.
+                refunds_netted=list(refund_ids),
+                reserve_held_paise=held_here,
                 resolvable=not planted,
                 reason=str(Reason.AMBIGUOUS_DUPLICATE_AMOUNT) if planted else None,
-                note=(
-                    f"planted unresolvable: another credit shares this value_date "
-                    f"({value_date.isoformat()}), this amount ({amount}p) and this UTR "
-                    f"({s.utr}), so no field in the three input files separates them. "
-                    f"Resolving it requires information outside these files; the only "
-                    f"correct verdict is an abstention."
-                    if planted
-                    else None
-                ),
+                # Assembled from parts rather than nested conditionals, because Phase 6 makes
+                # two of these conditions **co-occurrable**: one settlement can carry an
+                # orphan refund and a reserve at once (the two draws are independent, and
+                # nothing forbids the overlap -- unlike the linked/unlinked refund split,
+                # which ``_draw_refunds`` keeps disjoint on purpose). The old nested
+                # expression could express only one note at a time, so the second condition
+                # would have silently overwritten the first in truth.
+                note=" ".join(note_parts) if note_parts else None,
             )
         )
 
@@ -863,7 +1353,7 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         payments=payments,
         settlements=settlements,
         credits=credits,
-        refunds=[],
+        refunds=refunds,
         membership_withheld=withheld,
     )
 

@@ -46,6 +46,7 @@ from __future__ import annotations
 from datetime import date
 
 from ..common.bizdays import BusinessCalendar
+from ..common.money import mul_bps
 from ..common.reasons import Reason
 from ..common.verdict import Decomposition, Outcome, Verdict
 from .blocking import Candidate, SettlementIndex
@@ -78,6 +79,43 @@ TIER_2 = 2
 # near 60 and the cap is close to binding. Widening it is the trap the plan names: a wider
 # pool manufactures ambiguity that costs coverage while looking generous.
 SETTLEMENT_CYCLE_DAYS = 2
+
+#: How far above a credit this matcher will look for a settlement when the exact join found
+#: **nothing**, expressed in basis points of the credit. A *declared assumption* about the
+#: counterparty's rolling-reserve policy, in exactly the sense the fee rates in ``fees.py`` and
+#: ``SETTLEMENT_CYCLE_DAYS`` above are: read off a contract, wrong if the counterparty holds a
+#: different share, and never fitted to a score.
+#:
+#: **Derived, not chosen.** A reserve of ``r`` leaves ``credit = net(1 - r)``, so the shortfall
+#: is ``credit x r/(1 - r)``. Against a published reserve of up to 20% that is 2,500 bps of the
+#: credit; 2,600 adds headroom for the paise-level nudge the generator applies. Proportional
+#: rather than absolute so it is size-independent -- an absolute paise band would be wrong at
+#: both ends of an amount distribution spanning four orders of magnitude.
+#:
+#: **This band is used only where the exact join already returned nothing, and it can only ever
+#: produce an abstention.** That is the whole reason it is admissible, and it is a sharper
+#: position than ``.plan/phase6.md`` correction (c) reached. The plan concluded that
+#: ``--max-adjustment`` must widen globally for a reserved row to be reachable at all, and
+#: measured the cost: at n=1000 even a 100p band loses 6 rows and 1,000p loses 41, so a band
+#: wide enough for a reserve would gut the file. That cost is real but it is a cost of widening
+#: the **resolution** path. Widening only the *diagnostic* path costs nothing measurable:
+#: ``candidates_for`` is called a second time, on rows that were already abstaining, and its
+#: result is never allowed to resolve. So the resolution path stays byte-identical -- same
+#: coverage, same ambiguity rate, same correctness argument -- and ``--max-adjustment`` keeps
+#: its default of 0. The free parameter sits where it provably cannot buy a match.
+RESERVE_PROBE_BPS = 2_600
+
+#: The shortfall fractions this matcher is willing to call a reserve, in basis points of the
+#: settlement's declared net. Below the floor a shortfall is more likely a rate or rounding
+#: disagreement than money deliberately held, and saying "reserve" there would be a confident
+#: wrong diagnosis; above the ceiling it is not a partial payout in any published sense.
+#:
+#: The floor is the load-bearing end and it is what keeps ``PARTIAL_SETTLEMENT_PENDING``
+#: distinct from ``UNEXPLAINED_RESIDUAL``: the largest rate-model error this data can produce
+#: is the fee's own rounding divergence, a couple of paise on a batch, which is orders of
+#: magnitude below 100 bps of a net. A diagnostic that fired on a few paise would relabel every
+#: rounding bug as a business explanation, which is worse than declining to explain it.
+RESERVE_PLAUSIBLE_BPS: tuple[int, int] = (100, 3_000)
 
 # The calendar the window is measured on. Weekends and holidays are not settlement days, so
 # a calendar-day window would have to be wide enough to straddle a weekend -- measured at
@@ -250,6 +288,27 @@ def _search_membership(
         (True, False),   # gross - fee - gst -- FEE_AND_GST
         (True, True),    # gross - all       -- FEE_GST_TDS
     ]
+    # **A linked refund is subtracted in every reading, and it is deliberately *not* a fifth
+    # axis.** ``refunds.csv`` names the ``payment_id`` each refund cites, so whether a refund
+    # was taken is *declared* rather than hypothesised -- ``refunds_by_payment`` is a lookup,
+    # never a search (``load.py`` decision 9). Making it an axis would double the readings to
+    # eight to recover information the file already states, and every extra reading is another
+    # chance for a coincidental subset to hit the target.
+    #
+    # **This was a wrong-match bug, not a tidy-up.** Withheld membership plus netted refunds
+    # was first run together by gate 13, and the true subset was *not in the search space at
+    # all*: the settlement's net is ``gross - fee - gst - tds - refunds``, and a reading that
+    # stopped at TDS priced every refunded member too high. So the search saw only
+    # coincidences. Usually none, and the row abstained as ``NO_CANDIDATE`` -- 22 of them on
+    # seed 1 at n=1000. Occasionally one unrelated subset hit the shrunken target exactly, and
+    # the row **resolved wrongly**: 2 per run on seeds 1 and 2 at n=1000, correctness 0.9962.
+    # Gate 12 could not see it because it withholds membership without netting refunds, so the
+    # true set was always reachable there.
+    #
+    # Zero-cost on a run without ``--netted-refunds``: the map is empty, every lookup returns
+    # 0, and the amounts are the ones Phase 5 measured.
+    linked_refunds = dataset.refunds_by_payment()
+
     hypotheses: list[list[Member]] = []
     for take_fee, take_tds in subtractions:
         reading: list[Member] = []
@@ -266,6 +325,7 @@ def _search_membership(
                 amount -= deduction.fee_and_gst_paise
             if take_tds:
                 amount -= deduction.tds_paise
+            amount -= linked_refunds.get(payment.payment_id, 0)
             if amount > 0:
                 reading.append(Member(payment.payment_id, amount))
         # Collapse duplicates: with no fee charged, "gross" and "net of fee" are the same
@@ -400,6 +460,84 @@ def resolve_credit(
     # inputs without knowing the lag, so the pool falls through to the abstention below.
 
     if not candidates:
+        # Phase 6 step 7: **the exact join found nothing, so before reporting "nothing
+        # matches" this asks the one further question the data can answer** -- is there a
+        # settlement this credit is *short of* by a plausible reserve?
+        #
+        # Why this is a second, separate lookup rather than a wider first one. A reserved
+        # credit is short of its settlement's net, so at ``max_adjustment_paise=0`` its true
+        # settlement is invisible and the row lands here. ``.plan/phase6.md`` correction (c)
+        # concluded from that ``--max-adjustment`` must widen globally, and measured the price
+        # at n=1000: a 100p band costs 6 rows and 1,000p costs 41, so a band wide enough for a
+        # 5-20% reserve would gut the file. That price is real -- but it is the price of
+        # widening the **resolution** path. Widening only the *diagnostic* path costs nothing:
+        # this call happens only on rows that were already abstaining, and its result can only
+        # ever produce another abstention. The resolution path above is untouched, so coverage,
+        # the ambiguity rate and the correctness argument are all exactly what they were.
+        #
+        # **It diagnoses and never resolves, and that is not a stylistic choice.** Decision 4
+        # forbids modelling the reserve, because a deduction whose magnitude is free closes
+        # every gap by construction -- it would convert ``UNEXPLAINED_RESIDUAL`` rows into
+        # resolved ones while every arithmetic gate stayed green, which is the single most
+        # dangerous thing this phase could build. The held amount is declared in **no input
+        # file**, so there is nothing to verify a fitted magnitude against. What the matcher
+        # can honestly say is "this settlement is short by an amount consistent with a rolling
+        # reserve, and a human should confirm it", which is what ``PARTIAL_SETTLEMENT_PENDING``
+        # means. Gate 13 asserts no resolved row ever carries a non-zero ``reserve_paise``.
+        #
+        # The plausibility band is what keeps this distinct from ``UNEXPLAINED_RESIDUAL``: a
+        # shortfall of a few paise is a rate or rounding disagreement, not a business decision,
+        # and calling it a reserve would relabel a rounding bug as an explanation.
+        lo_bps, hi_bps = RESERVE_PLAUSIBLE_BPS
+        short_of: list[tuple[Candidate, int, int]] = []
+        for cand in index.candidates_for(
+            credit,
+            window_days=window_days,
+            max_adjustment_paise=mul_bps(credit.amount_paise, RESERVE_PROBE_BPS),
+        ):
+            net = cand.settlement.net_paise
+            shortfall = net - credit.amount_paise
+            # Strictly positive only. ``amount_band`` is symmetric, so this probe also returns
+            # settlements the credit *exceeds* -- and a reserve can only ever make a credit
+            # smaller. A credit above a settlement's net is a different finding entirely
+            # (``UNEXPLAINED_RESIDUAL``'s negative-gap branch says "no deduction adds money"),
+            # and letting it in here would report money appearing as money withheld.
+            if shortfall <= 0:
+                continue
+            # As a share of the **declared net**, which is the base a reserve is actually a
+            # percentage of. Integer division: this is a plausibility test, so a floored basis
+            # point is exact enough and keeps the financial path free of floats.
+            share_bps = shortfall * 10_000 // net
+            if lo_bps <= share_bps <= hi_bps:
+                short_of.append((cand, shortfall, share_bps))
+
+        if short_of:
+            cited = "; ".join(
+                f"{c.settlement_id} (net {c.settlement.net_paise}p, short {short}p "
+                f"= {share / 100:.2f}% at {c.date_distance_days:+d}bd)"
+                for c, short, share in short_of[:3]
+            )
+            return Verdict(
+                credit.credit_id,
+                Outcome.EXCEPTION,
+                reason=Reason.PARTIAL_SETTLEMENT_PENDING,
+                note=(
+                    f"no settlement pays {credit.amount_paise}p exactly, but "
+                    f"{len(short_of)} within {window_days}bd declare a net this credit falls "
+                    f"plausibly short of: {cited}. A rolling reserve withheld from the payout "
+                    f"would look exactly like this, and the held amount is declared in no "
+                    f"input file -- so the shortfall cannot be proved, only recognised. "
+                    f"Committing to a settlement on a shortfall this matcher cannot verify "
+                    f"would be fitting a free magnitude to a gap, so a human confirms the "
+                    f"release schedule"
+                    + (
+                        f" -- {len(short_of)} settlements fit, which is the ambiguity itself"
+                        if len(short_of) > 1
+                        else ""
+                    )
+                ),
+            )
+
         return Verdict(
             credit.credit_id,
             Outcome.EXCEPTION,
@@ -503,7 +641,24 @@ def resolve_credit(
     # The self-check below pins this with a settlement whose ``fee_paise`` would close the
     # gap if anything here read it.
     gap = gross_total - credit.amount_paise
-    closing, derived = explain_gap(gap, members, schedule)
+
+    # Phase 6 step 6: the refunds netted off this settlement, **looked up and not searched**
+    # (decision 9 -- ``refunds.csv`` states the payment each refund belongs to, so the link is
+    # given). Subtracted from the gap *before* the rules are consulted, which is the design
+    # decision worth stating: a refund is declared data, not a hypothesis, so it belongs on the
+    # known side of the arithmetic rather than as a fifth rule.
+    #
+    # Two consequences. The rule count stays at **four**, because a constant subtracted from
+    # the gap shifts every rule's target equally and cannot make two rules collide that did not
+    # collide before -- so ``AMBIGUOUS_ADJUSTMENT``'s reachability argument is untouched by this
+    # step. And the refund can never *close* a gap on its own: it moves the target, and one of
+    # the four rules still has to account for what remains, exactly. A term that could close a
+    # gap by itself with a magnitude read from a file is decision 4's trap, which is why the
+    # reserve is not modelled at all and this one is subtracted rather than fitted.
+    refunds_by_payment = dataset.refunds_by_payment()
+    refunds_total = sum(refunds_by_payment.get(pid, 0) for pid in payment_ids)
+    rate_gap = gap - refunds_total
+    closing, derived = explain_gap(rate_gap, members, schedule)
 
     if len(closing) > 1:
         # **Two declared rules close this gap with different component splits.** Phase 6
@@ -552,6 +707,69 @@ def resolve_credit(
         # between a triage-able exception and a shrug: a 2,622p model against a 3,000p gap
         # points at a missing rule, while an unpriced method points at the rate table, and
         # "unexplained" alone points at nothing.
+        # Phase 6 step 6: **an orphan refund gets its own reason code before the generic
+        # residual one.** A refund citing a payment outside this month's file took money off a
+        # settlement that nothing in these three files attributes, so the remainder is not
+        # "unexplained" in the sense ``UNEXPLAINED_RESIDUAL`` means -- it is explained in kind
+        # and unattributable in fact, which is a different thing for whoever has to work the
+        # exception. Distinguished by amount: the leftover must equal one orphan refund exactly.
+        #
+        # **This diagnoses the row and deliberately does not resolve it.** Matching the residual
+        # against a declared refund amount would be enough to *attribute* the refund, and that
+        # capability is real -- truth marks these rows ``resolvable: true`` precisely because an
+        # unbounded matcher could do it (Phase 4b's standard, see ``story.build``). Doing it here
+        # would mean resolving on an amount coincidence with no independent confirmation, which
+        # is how a one-in-many collision becomes a wrong match. So the row abstains, coverage
+        # falls, correctness holds, and the capability is declared as available to a later phase
+        # rather than quietly taken.
+        # **Each candidate orphan is subtracted and the gap re-offered to the same four rules**,
+        # rather than compared against a hand-computed leftover. The first version of this
+        # branch did the latter -- ``leftover = gap - derived.total_paise`` -- and it silently
+        # failed to fire on the very run that introduced the flag. Worth recording because the
+        # mistake is a familiar one wearing new clothes: ``derived`` is what this schedule
+        # *predicts*, not what was withheld, and a ``--netted-refunds`` run without ``--fees``
+        # withholds no fee at all. So the leftover was measured against a deduction that never
+        # happened (searching for 14,982p while the orphan refund was 16,241p), and the row fell
+        # through to ``UNEXPLAINED_RESIDUAL``.
+        #
+        # Re-offering the remainder to ``explain_gap`` is the fix *and* the cheaper design: the
+        # four rules already enumerate which deductions were actually applied, which is exactly
+        # the unknown that broke the subtraction, and the unpriced-method discipline comes along
+        # for free instead of being re-implemented here.
+        hits: list[tuple[object, str]] = []
+        if gap > 0:
+            for orphan in dataset.orphan_refunds():
+                if orphan.amount_paise > gap:
+                    continue
+                also, _ = explain_gap(gap - orphan.amount_paise, members, schedule)
+                # Any rule closing the remainder is enough to *name* this orphan as the likely
+                # cause. Two rules closing it is not an ``AMBIGUOUS_ADJUSTMENT``: that code is
+                # about a resolved row's components being undetermined, and nothing is being
+                # resolved here.
+                if also:
+                    hits.append((orphan, also[0].rule))
+        if hits:
+            cited = ", ".join(
+                f"{o.refund_id} ({o.amount_paise}p, cites {o.payment_id})"  # type: ignore[attr-defined]
+                for o, _rule in hits[:3]
+            )
+            return Verdict(
+                credit.credit_id,
+                Outcome.EXCEPTION,
+                reason=Reason.REFUND_UNLINKED,
+                note=(
+                    f"{settlement_id} agrees on date and amount, and its {gap}p gap closes "
+                    f"only if an out-of-scope refund is assumed: {cited}. Each cites a payment "
+                    f"that is not in payments.csv, so the money left a settlement and nothing "
+                    f"in the input files says it left *this* one. Attributing it on an amount "
+                    f"coincidence would be a guess rather than a proof, so a human decides"
+                    + (
+                        f" -- {len(hits)} orphan refunds fit, which is the ambiguity itself"
+                        if len(hits) > 1
+                        else ""
+                    )
+                ),
+            )
         if gap < 0:
             shortfall = (
                 f"the credit exceeds the {gross_total}p gross of {len(payment_ids)} "
@@ -611,6 +829,17 @@ def resolve_credit(
         # being stated. The derived-versus-declared comparison is *reported* by the CLI for
         # exactly that reason (step 2).
         tds_paise=explanation.tds_paise,
+        # Phase 6 step 6, and the **one term here that is read rather than derived** -- which
+        # is legitimate for a reason the fee and TDS columns do not share. A refund is not
+        # priced by any rate: ``refunds.csv`` is the only statement of it that exists, so
+        # looking it up is modelling it, not copying an answer. The distinction that keeps
+        # decision 2 intact: reading ``settlements.csv``'s ``fee_paise`` would substitute a
+        # declared result for an arithmetic the matcher is supposed to reproduce, whereas
+        # reading a refund substitutes nothing -- there is no independent derivation of it to
+        # skip. What stops it closing gaps by construction is that it cannot close one at all:
+        # it shifts the target and a declared rule still has to account for the remainder
+        # exactly (see the ``rate_gap`` block above).
+        refunds_paise=refunds_total,
         rule=explanation.rule,
     )
 
@@ -1018,6 +1247,109 @@ if __name__ == "__main__":
     assert v.tier is None and v.residual_paise is None, (
         "an abstention must carry no tier and no residual -- there is no claimed "
         "decomposition for a residual to be the remainder of"
+    )
+
+    # --- Phase 6 step 7: the reserve probe, and what it must refuse to say ------
+    # A credit short of its settlement's net by 10% -- the shape ``--reserve`` produces. The
+    # exact join finds nothing (the band is [credit, credit] and no settlement pays that), so
+    # the probe runs and recognises the shortfall.
+    reserved_ds = dataset(
+        [payment("pay_0001", 100_000)],
+        [settlement("setl_0005", mon, 100_000, "8104")],
+        [credit("C0001", mon, 90_000)],
+        {"setl_0005": ("pay_0001",)},
+    )
+    v = verdict_of(reserved_ds, "C0001")
+    assert v.outcome is Outcome.EXCEPTION, (
+        "a reserved credit must abstain -- the held amount is in no input file, so resolving "
+        "it means fitting a free magnitude to a gap (decision 4)"
+    )
+    assert v.reason is Reason.PARTIAL_SETTLEMENT_PENDING, v.reason
+    # **The assertion the whole step exists for.** Correction (c)'s regression test: this row
+    # must not arrive as ``NO_CANDIDATE``, because Phase 7's entire job is telling a
+    # non-gateway credit from a gateway credit it cannot explain -- and a reserved row hiding
+    # inside ``NO_CANDIDATE`` would poison that distinction before Phase 7 begins.
+    assert v.reason is not Reason.NO_CANDIDATE
+    # And it names the settlement it suspects *in the note only*. Nothing is claimed: no tier,
+    # no residual, no payment set, no decomposition. This is what "diagnose, never resolve"
+    # means mechanically, and it is what gate 13 re-asserts over a whole run.
+    assert v.payment_ids == () and v.settlement_ids == ()
+    assert v.tier is None and v.residual_paise is None
+    assert v.decomposition is None, (
+        "a diagnosed reserve must publish no decomposition -- a reserve_paise term on a "
+        "verdict would be a magnitude this matcher cannot verify against any input"
+    )
+    assert "setl_0005" in (v.note or "") and "10.00%" in (v.note or ""), v.note
+
+    # A shortfall of 50p on a 100,000p net -- 5 bps, below ``RESERVE_PLAUSIBLE_BPS``' floor.
+    # The probe *finds* this settlement (it is well inside the band) and must still decline to
+    # call it a reserve: a few paise is a rate or rounding disagreement, and answering
+    # "rolling reserve" there would relabel a rounding bug as a business explanation. This is
+    # the case that keeps ``PARTIAL_SETTLEMENT_PENDING`` a meaningful code rather than a
+    # catch-all for every unmatched short credit.
+    tiny_ds = dataset(
+        [payment("pay_0001", 100_000)],
+        [settlement("setl_0005", mon, 100_000, "8104")],
+        [credit("C0001", mon, 99_950)],
+        {"setl_0005": ("pay_0001",)},
+    )
+    v = verdict_of(tiny_ds, "C0001")
+    assert v.reason is Reason.NO_CANDIDATE, (
+        f"a 5bps shortfall must not be diagnosed as a reserve, got {v.reason}"
+    )
+
+    # A credit that *exceeds* a settlement's net. ``amount_band`` is symmetric, so the probe
+    # sees this settlement -- and a reserve can only ever make a credit smaller. Reporting
+    # money appearing as money withheld would be a confident wrong diagnosis in the opposite
+    # direction, so the shortfall test is strictly positive.
+    over_ds = dataset(
+        [payment("pay_0001", 100_000)],
+        [settlement("setl_0005", mon, 100_000, "8104")],
+        [credit("C0001", mon, 110_000)],
+        {"setl_0005": ("pay_0001",)},
+    )
+    v = verdict_of(over_ds, "C0001")
+    assert v.reason is Reason.NO_CANDIDATE, (
+        f"a credit above a settlement's net is not a reserve, got {v.reason}"
+    )
+
+    # The probe respects the date window like every other lookup: the "right amount, wrong
+    # day" fixture above stays ``NO_CANDIDATE``, and so does a *reserved* row on the wrong day.
+    # Without this, the probe would silently widen the window as well as the band.
+    off_day = dataset(
+        [payment("pay_0001", 100_000)],
+        [settlement("setl_0005", mon, 100_000, "8104")],
+        [credit("C0001", tue, 90_000)],
+        {"setl_0005": ("pay_0001",)},
+    )
+    assert verdict_of(off_day, "C0001").reason is Reason.NO_CANDIDATE, (
+        "the reserve probe must not widen the date window, only the amount band"
+    )
+    # ...and the same row *inside* a 1-day window is diagnosed, or the assertion above is
+    # passing for the wrong reason (a probe that never fires would also satisfy it).
+    assert verdict_of(off_day, "C0001", window_days=1).reason is (
+        Reason.PARTIAL_SETTLEMENT_PENDING
+    ), "the probe does not fire even inside the window -- the case above proves nothing"
+
+    # **The band is the binding bound, and the plausibility ceiling is deliberately looser.**
+    # Recorded because the ceiling is therefore *unreachable* on this data and that is a fact
+    # worth stating rather than discovering later: a probe band of ``b`` bps of the credit
+    # admits nets up to ``credit x (1 + b/10000)``, so the largest share of the *net* it can
+    # ever see is ``b / (10000 + b)`` -- 2,063 bps at b=2,600, below the 3,000 bps ceiling. So
+    # the ceiling cannot fire while the band stands, and it is kept as a guard against a future
+    # band widening rather than as a live filter. Asserted so the two constants cannot drift
+    # into disagreeing about which one is in charge.
+    _max_share = RESERVE_PROBE_BPS * 10_000 // (10_000 + RESERVE_PROBE_BPS)
+    assert _max_share <= RESERVE_PLAUSIBLE_BPS[1], (
+        f"the probe band admits shortfalls up to {_max_share}bps of net, above the "
+        f"{RESERVE_PLAUSIBLE_BPS[1]}bps plausibility ceiling -- the ceiling would then be "
+        f"doing real filtering and needs its own fixture"
+    )
+    # The band must still cover the reserve the generator actually draws: config's
+    # RESERVE_BPS_BAND tops out at 2,000 bps of net, which is 2,500 bps of the short credit.
+    assert RESERVE_PROBE_BPS >= 2_500, (
+        "the probe band no longer covers a 20% reserve, so the reserved rows this matcher is "
+        "built to recognise would come back as NO_CANDIDATE"
     )
 
     # --- two candidates: ambiguous, and it must not pick one ---------------
