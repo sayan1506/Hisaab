@@ -46,6 +46,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hisaab.common import ids  # noqa: E402
+from hisaab.generator.config import UTR_PATCHY_SHARE  # noqa: E402
 from hisaab.generator.invariants import (  # noqa: E402
     InvariantError,
     check_batch_adjacency,
@@ -56,9 +57,11 @@ from hisaab.generator.invariants import (  # noqa: E402
     check_totals,
     check_unique_ids,
     check_within_block_alignment,
+    gateway_plausible_forms,
 )
 from hisaab.generator.model import (  # noqa: E402
     BANK_HEADER,
+    HOME_CURRENCY,
     PAYMENTS_HEADER,
     REFUNDS_HEADER,
     SETTLEMENT_ITEMS_HEADER,
@@ -282,6 +285,7 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     tds_on = flags.get("tds", False)
     refunds_on = flags.get("netted_refunds", False)
     reserve_on = flags.get("reserve", False)
+    fx_on = flags.get("fx", False)
     late_on = flags.get("settlement_report_late", False)
     unsettled_on = flags.get("unsettled", False)
     noise_on = flags.get("noise_rows", False)
@@ -310,10 +314,21 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     # quietly balance here.
     refund_cells = [c.decomposition.refunds_paise for c in truth.credits]
     refunds_of_settlement: dict[str, int] = {sid: 0 for sid in net_by_settlement}
+    # Phase 8 step 2b, attributed the same way and from the same source, but kept as its **own
+    # map** rather than folded into the refund term above. The two fall on opposite sides of the
+    # arithmetic -- a refund is subtracted, a rate movement is added and signed -- so a single
+    # combined term would let a wrong sign in one be absorbed by the other and still balance.
+    # (The in-memory ``check_story`` keeps them apart for exactly this reason; the shape here
+    # differs only in following this file's explicit-keys-plus-guard convention over a
+    # ``defaultdict``.)
+    fx_of_settlement: dict[str, int] = {sid: 0 for sid in net_by_settlement}
     for c in truth.credits:
         for sid in c.settlement_ids:
+            # One membership test governs both maps: they are keyed identically from
+            # ``net_by_settlement``, so a sid in one is in the other by construction.
             if sid in refunds_of_settlement:
                 refunds_of_settlement[sid] += c.decomposition.refunds_paise
+                fx_of_settlement[sid] += c.decomposition.fx_paise
     # Phase 6 step 7. Same sourcing as the refunds and one step further: a refund at least has
     # ``refunds.csv``, while the reserve is declared in **no input file at all**, so truth's
     # decomposition is its only record anywhere. Note what this term is *not* fed into --
@@ -363,6 +378,43 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
             f"statement does not carry, so no credited total means what it claims"
         )
     noise_cells = [amount_by_credit[cid] for cid in truth.non_gateway_credit_ids]
+
+    # Phase 8 step 2b, and this term's sourcing sits between the reserve's and the orphan's. The
+    # **magnitude** is in no input file at all, like the reserve -- but unlike the reserve, the
+    # data does record *which* rows moved: ``payments.csv`` has a ``currency`` column. So truth
+    # supplies the amount and the file supplies the membership, and the two can be held against
+    # each other rather than taken on trust.
+    #
+    # **Added, not subtracted, and signed.** Design (b): the payout is right at the settlement
+    # rate while ``payments.csv``'s gross is stale at the capture rate, so ``gross_total`` below
+    # is the capture-rate sum and the wedge closes only with the movement added back. Feeding
+    # truth's number into a wedge whose other two terms are read off disk is not circular -- it
+    # is exactly what pins it. A wrong sign here would make this pass on a generator that moved
+    # every rate the wrong way, which is why the sign is asserted per credit below rather than
+    # only in aggregate.
+    fx_cells = [c.decomposition.fx_paise for c in truth.credits]
+    foreign_payments = {
+        r["payment_id"] for r in payments if r["currency"] != HOME_CURRENCY
+    }
+    if not fx_on and foreign_payments:
+        raise InvariantError(
+            f"I4: {len(foreign_payments)} payment(s) are in a foreign currency but --fx is off "
+            f"per truth.json's flag block: {sorted(foreign_payments)[:5]}. Either the flag was "
+            f"not recorded or the currency column was written without it."
+        )
+    # The attribution check, and only in the direction that is sound. "No foreign member =>
+    # no rate movement" holds unconditionally; the converse does **not**, because a credit over
+    # several foreign payments can draw opposite signs that cancel to a zero sum, so asserting
+    # ``fx != 0`` for every credit with a foreign member would fail on legitimate data.
+    for c in truth.credits:
+        if c.decomposition.fx_paise and not (set(c.payment_ids) & foreign_payments):
+            raise InvariantError(
+                f"I4: truth attributes {c.decomposition.fx_paise:+d} paise of rate movement to "
+                f"{c.credit_id}, but none of its {len(c.payment_ids)} payment(s) is in a "
+                f"foreign currency per payments.csv. The answer key has moved a rate on a "
+                f"domestic row, so the wedge would still close while the term is attributed "
+                f"to the wrong credit."
+            )
     check_totals(
         sum(gross_by_payment.values()),
         sum(net_by_settlement.values()),
@@ -373,12 +425,14 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         reserve_cells,
         unsettled_cells,
         noise_cells=noise_cells,
+        fx_cells=fx_cells,
         fees_on=fees_on,
         tds_on=tds_on,
         refunds_on=refunds_on,
         reserve_on=reserve_on,
         unsettled_on=unsettled_on,
         noise_on=noise_on,
+        fx_on=fx_on,
     )
 
     # --- I3: cardinality, per flag rather than per clean_mode ----------------
@@ -550,14 +604,91 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         )
     check_settlement_arithmetic(
         [
+            # The eighth element is the ``--fx`` rate movement. The gross summed here is
+            # ``payments.csv``'s, which design (b) leaves **stale** at the capture rate, so
+            # this row closes only with the movement added -- the same asymmetry the aggregate
+            # wedge above has, seen one row at a time. Note what still gets no term:
+            # ``reserve``, because it sits between the net and the credit rather than between
+            # the gross and the net (see ``reserve_cells`` above).
             (sid, sum(gross_by_payment[p] for p in effective_members[sid]),
-             net_by_settlement[sid], *deductions[sid], refunds_of_settlement[sid])
+             net_by_settlement[sid], *deductions[sid], refunds_of_settlement[sid],
+             fx_of_settlement[sid])
             for sid in sorted(net_by_settlement)
         ]
     )
 
     # --- I7: the leak check, on the bytes actually written ------------------
     check_no_leak([(r["row_id"], amount_by_credit[r["row_id"]], r["narration"]) for r in bank])
+
+    # --- I19: --utr-patchy, on the bytes actually written -------------------
+    #
+    # **This is the copy that matters, and I18's own history is why it is here.** That check's
+    # indistinguishability assertion was first written against the in-memory story -- where the
+    # CSV writer cannot yet have touched it -- while the matcher only ever reads the file. The
+    # trap applies twice over to this flag: the mask exists to change what
+    # ``bank_statement.csv`` says, and decision 8's promise is about a *column* in
+    # ``settlements.csv``. Both are disk facts, so an in-memory-only I19 would be asserting
+    # about the one artefact nobody downstream reads.
+    #
+    # Nothing is suspended for this flag, and that was measured rather than predicted: the disk
+    # pass runs clean on 27 masked datasets across six flag sets
+    # (`.plan/probe_phase8_utr_patchy_wrong_ignore.py`). Strategy C cannot rise -- removing a
+    # tail removes readable text -- and Strategy D never reads a narration at all. Four of this
+    # project's suspension predictions have been wrong, so the empty list is a measurement.
+    if flags.get("utr_patchy", False):
+        # **The gateway filter is load-bearing, not defensive.** ``gateway_plausible`` noise rows
+        # are *also* digit-free and *also* in the producible set -- that is the entire point of
+        # the mask -- so counting every tail-less bank row would fold the noise rows into the
+        # share and inflate it by whatever ``--noise-rows`` drew. Truth names which rows are
+        # non-gateway, and this pass is allowed to read truth; the matcher is not.
+        gateway_ids = {c.credit_id for c in truth.credits}
+        masked_rows = sorted(
+            r["row_id"] for r in bank
+            if r["row_id"] in gateway_ids and not ids.digit_runs(r["narration"])
+        )
+        expected_masked = max(
+            1, min(round(len(settlements) * UTR_PATCHY_SHARE), len(settlements) - 1)
+        )
+        if len(masked_rows) != expected_masked:
+            raise InvariantError(
+                f"I19: {len(masked_rows)} gateway bank row(s) carry no reference tail on disk "
+                f"against the {expected_masked} that UTR_PATCHY_SHARE={UTR_PATCHY_SHARE} "
+                f"allocates over {len(settlements)} settlement(s): {masked_rows[:5]}. The mask "
+                f"is allocated by count over a sorted id list so the realised share is exact, "
+                f"and the in-memory pass agreeing while this one does not would mean the CSV "
+                f"writer changed a narration on its way to the file"
+            )
+
+        # Decision 8, on the column itself. This is the assertion truth's ``resolvable: true``
+        # rests on: what the flag strips is the bank statement's copy of the reference, never
+        # this one. ``Settlement.utr`` defaults to ``""`` and no model assertion checks it.
+        blank_utr = sorted(r["settlement_id"] for r in settlements if not r["utr"].strip())
+        if blank_utr:
+            raise InvariantError(
+                f"I19: {len(blank_utr)} settlement row(s) have an empty utr column in "
+                f"settlements.csv under --utr-patchy: {blank_utr[:5]}. This flag strips the "
+                f"BANK STATEMENT's copy of the reference (decision 8), never this column -- "
+                f"truth marks an FX or reserved row resolvable=true on the strength of it "
+                f"surviving, so an empty cell here makes the answer key a false statement "
+                f"about its own data"
+            )
+
+        # The indistinguishability property, on the written bytes. A masked genuine credit must
+        # be byte-identical to something ``--noise-rows`` could have produced, or it is
+        # identifiable by shape alone and ``WRONG_IGNORE == 0`` reports visibility rather than
+        # the matcher's ignore conjunction holding.
+        producible = gateway_plausible_forms()
+        narration_of = {r["row_id"]: r["narration"] for r in bank}
+        unproducible = [rid for rid in masked_rows if narration_of[rid] not in producible]
+        if unproducible:
+            raise InvariantError(
+                f"I19: {len(unproducible)} masked narration(s) in bank_statement.csv are not "
+                f"byte-producible as a gateway_plausible noise row: {unproducible[:3]} -- e.g. "
+                f"{narration_of[unproducible[0]]!r}. A naive tail strip leaves a dangling "
+                f"separator no noise template can render, so the masked row becomes "
+                f"identifiable by shape and the attack on WRONG_IGNORE is visible rather than "
+                f"real"
+            )
 
     # --- I6: every truth reference resolves --------------------------------
     for c in truth.credits:

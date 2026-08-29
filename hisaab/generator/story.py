@@ -46,24 +46,40 @@ from .config import (
     RESERVE_BPS_BAND,
     RESERVE_SHARE,
     UNSETTLED_SHARE,
+    FX_BPS_BAND,
+    FX_CURRENCIES,
+    FX_SHARE,
     NOISE_AMOUNT_BAND_RUPEES,
     NOISE_FOREIGN_COUNTERPARTIES,
     NOISE_SHARE,
     NOISE_STRATA_SPLIT,
     NOISE_TEMPLATES,
+    UTR_PATCHY_MASK,
+    UTR_PATCHY_SHARE,
     CAPTURE_HOUR_MAX,
     CAPTURE_HOUR_MIN,
     COUNTERPARTY,
     COUNTERPARTY_SHORT,
     COUNTERPARTY_SPACED,
     IST,
+    NARRATION_SPELLINGS,
     NARRATION_TEMPLATES,
     PAYMENT_METHODS,
     WHOLE_RUPEE_PERCENT,
     GenConfig,
 )
 from ..common.money import RUPEE, mul_bps, rupees
-from .model import Credit, Decomposition, NoiseRow, Payment, Refund, Settlement, Story
+from .model import (
+    HOME_CURRENCY,
+    PAYMENTS_HEADER,
+    Credit,
+    Decomposition,
+    NoiseRow,
+    Payment,
+    Refund,
+    Settlement,
+    Story,
+)
 from .rng import substream, weighted_choice
 
 #: UTR tails are 4 digits, matching the ``XXXX4471`` shape in Appendix A. Drawn
@@ -130,23 +146,81 @@ def _draw_capture_time(rng: random.Random, business_days: list[date]) -> datetim
     return datetime(day.year, day.month, day.day, hour, minute, second, tzinfo=IST)
 
 
-def _narration(rng: random.Random, tail: int, styles: int) -> str:
+def _narration(rng: random.Random, tail: int, styles: int, masked: bool = False) -> str:
     """Assemble a bank narration from parts. Two draws.
 
     Deliberately *not* a single format: real statements vary by bank and channel,
     which is what gives Phase 3's parser and Phase 10's LLM real work. Style
     variance changes no amount and no date, so clean mode stays clean where it
     counts. ``--narration-styles 1`` for a sterile file while debugging.
+
+    ``masked`` is ``--utr-patchy`` (Phase 8 step 6, decision 8): this row's reference tail
+    never reaches the bank statement. **Both draws happen either way**, before the branch, so
+    the ``narration`` stream advances identically whether a row is masked or not -- ``rng.py``
+    rule 2 requires consumption to be a function of ``cfg`` alone, and a mask that skipped a
+    draw would shift every later narration in the file. The mask index is a *lookup* on the
+    template for the same reason: it needs no draw of its own.
+
+    **A masked row is re-rendered in the noise vocabulary, not stripped of its digits.** The
+    difference is measured, and it is the whole safety property: deleting the tail from three
+    of the four templates leaves a dangling separator (``NEFT-RZRPAY-``) that **no**
+    ``gateway_plausible`` noise row can produce, so masked genuine credits would be
+    identifiable by shape alone -- and Phase 8's ``WRONG_IGNORE == 0`` would then hold because
+    the attack was visible rather than because ``tier1``'s IGNORED conjunction works. Same
+    hazard I12 names for planted rows ("absence-of-tail a tell unique to planted rows"),
+    reached from a different flag. ``config.py`` asserts the subset property over every
+    (template, spelling, channel) combination.
+
+    The channel and the counterparty spelling are this row's own, so masking changes exactly
+    one thing: whether a tail is offered. The counterparty survives, which is what keeps the
+    row un-ignorable and makes this an attack on ``WRONG_IGNORE`` rather than on parsing.
     """
-    template = NARRATION_TEMPLATES[rng.randrange(styles)]
+    index = rng.randrange(styles)
     channel = weighted_choice(rng, BANK_CHANNELS)
-    return template.format(
+    if masked:
+        return NOISE_TEMPLATES["gateway_plausible"][UTR_PATCHY_MASK[index]].format(
+            channel=channel, counterparty=NARRATION_SPELLINGS[index], tail=""
+        )
+    return NARRATION_TEMPLATES[index].format(
         channel=channel,
         counterparty=COUNTERPARTY,
         counterparty_spaced=COUNTERPARTY_SPACED,
         counterparty_short=COUNTERPARTY_SHORT,
         tail=tail,
     )
+
+
+def _draw_utr_patchy(
+    cfg: GenConfig, rng: random.Random, settlement_ids: list[str]
+) -> set[str]:
+    """Settlements whose bank credit loses its narration tail. ``--utr-patchy``.
+
+    **The narration's tail, never ``settlements.csv``'s ``utr``** -- decision 8. Truth's claim
+    that an FX or reserved row stays ``resolvable: true`` rests on the settlement's UTR being
+    intact, so stripping that column would make the answer key lie about its own data. What
+    this removes is the *bank statement's* copy, which is the channel a matcher would join on.
+
+    **Drawn over the settlement ids, deliberately ignoring everything else.** Same discipline
+    as ``_draw_fx`` and for a sharper reason: I12's message warns that absence-of-tail must not
+    become "a tell unique to planted rows", so the mask may not correlate with the planted
+    pairs -- and the cheapest way not to correlate with a thing is to not look at it. A planted
+    pair can therefore have one member masked and the other not. That does **not** separate the
+    pair: what makes it unresolvable is that both *settlements* agree on date, amount and UTR,
+    so a masked credit offers a matcher strictly *less* to go on, never more. Step 7 measures
+    that rather than trusting this paragraph.
+
+    Keyed on the settlement id rather than the credit id because the credit ids do not exist
+    yet: ``build`` drafts narrations before the bank-order sort assigns ``C####``, and there is
+    exactly one credit per settlement.
+
+    Allocated as a count over a sorted list, so the choice is a function of ``cfg`` and the id
+    order alone -- ``_allocate_strata``'s rule again, and it keeps the realised share exact
+    instead of wobbling seed to seed the way gate 14's floor would.
+    """
+    if not cfg.flags.utr_patchy:
+        return set()
+    k = max(1, min(round(len(settlement_ids) * UTR_PATCHY_SHARE), len(settlement_ids) - 1))
+    return set(rng.sample(sorted(settlement_ids), k))
 
 
 def _deductions(cfg: GenConfig, gross_paise: int, method: str) -> tuple[int, int]:
@@ -451,6 +525,7 @@ def _batch_net(
     methods: list[str],
     members: list[int],
     refunds: dict[int, int] | None = None,
+    fx: dict[int, int] | None = None,
 ) -> int:
     """A batch's ``net_paise``: per member, per method, each rounded at the paisa, summed.
 
@@ -465,6 +540,7 @@ def _batch_net(
     two are the same arithmetic.
     """
     netted = refunds or {}
+    moved = fx or {}
     total = 0
     for i in members:
         fee, gst = _deductions(cfg, grosses[i], methods[i])
@@ -477,7 +553,24 @@ def _batch_net(
         # because a refund is the first term here that is **not derivable from a rate**: it is
         # declared in ``refunds.csv``, so a matcher must look it up rather than compute it.
         # That changes who can verify the number, not which side of the net it falls on.
-        total += grosses[i] - fee - gst - _tds(cfg, grosses[i]) - netted.get(i, 0)
+        #
+        # **The FX shift is the third instance of that same argument, and the first term here
+        # that is ADDED rather than subtracted** -- it is signed, so it moves the net in either
+        # direction. Design (b): the payout is right at the settlement-day rate, so the net is
+        # computed from ``gross + shift`` while ``payments.csv`` keeps the stale capture-rate
+        # gross. Note what it is deliberately *not* inside: ``_deductions`` and ``_tds`` are
+        # still called on ``grosses[i]``, the recorded number, so the fee is priced on the gross
+        # the file carries. That keeps a matcher's independent re-derivation of the fee correct
+        # and leaves the whole discrepancy as one residual instead of smearing it across three
+        # columns. See ``_draw_fx_shifts``.
+        total += (
+            grosses[i]
+            + moved.get(i, 0)
+            - fee
+            - gst
+            - _tds(cfg, grosses[i])
+            - netted.get(i, 0)
+        )
     return total
 
 
@@ -490,6 +583,7 @@ def _make_nets_unique(
     groups: list[list[int]],
     taken_gross: set[tuple[date, int]],
     refunds: dict[int, int] | None = None,
+    fx: dict[int, int] | None = None,
 ) -> int:
     """Nudge grosses until no two settlements share a ``(settled_on, net)``. Returns nudges.
 
@@ -538,7 +632,7 @@ def _make_nets_unique(
         when = settled_on_of[members[0]]
         # The lowest member index, so the victim is a function of the data alone.
         victim = members[0]
-        while (when, _batch_net(cfg, grosses, methods, members, refunds)) in taken_net:
+        while (when, _batch_net(cfg, grosses, methods, members, refunds, fx)) in taken_net:
             nudges += 1
             assert nudges < 100 * max(len(groups), 1), (
                 f"runaway nudging around {when} -- the amount space is saturated, which at "
@@ -555,7 +649,7 @@ def _make_nets_unique(
                 if (day, grosses[victim]) not in taken_gross:
                     break
             taken_gross.add((day, grosses[victim]))
-        taken_net.add((when, _batch_net(cfg, grosses, methods, members, refunds)))
+        taken_net.add((when, _batch_net(cfg, grosses, methods, members, refunds, fx)))
     return nudges
 
 
@@ -808,6 +902,117 @@ def _draw_unsettled(
     return set(rng.sample(eligible, k))
 
 
+def _draw_fx(cfg: GenConfig, rng: random.Random) -> dict[int, str]:
+    """Payment indices captured in a foreign currency -> that currency. ``--fx``.
+
+    **This assigns the column and nothing else.** The rate *movement* -- the mess itself -- is
+    a separate edit that reads this mapping, and the plan splits them deliberately
+    (`.plan/phase8.md` step 2, "currency column first, rate move second; do not merge them").
+    Landed alone, this function changes one string per chosen payment in ``payments.csv`` and
+    no number anywhere: every amount, every net, every credit and every invariant is
+    untouched. That makes the first half independently verifiable -- if a byte-identity or
+    invariant run breaks here, it broke on the column, and no arithmetic is in the frame.
+
+    **Drawn over every payment index, deliberately ignoring ``groups``.** Decision 7 and trap 2
+    both turn on this draw being independent of the others, and the cheapest way to be
+    independent of ``--unsettled`` is to not look at what it did. The consequence is real and
+    accepted: an orphan can land on a foreign payment, and if *every* holder of a currency were
+    orphaned, I17's ``orphan_currencies <= settled_currencies`` fires -- correctly, because in
+    that dataset the currency column really would identify the payments that never settled.
+    ``FX_SHARE`` and the one-element ``FX_CURRENCIES`` are what keep that coincidence remote,
+    and step 4 measures it rather than trusting this paragraph
+    (``verify_output.py:482`` predicted it from the other side, phases before this code).
+
+    **Never keyed on ``method``.** ``config.py:41`` is explicit that ``international_card`` is
+    about where a card was issued, not what currency was charged, and the 2%-of-100 method
+    weight makes it a tempting shortcut. Keying on it would make FX-ness readable from a
+    ``payments.csv`` column the matcher already groups by, so the rows whose decomposition
+    cannot close would be identifiable by a filter -- the same family of leak as I17's.
+
+    The currency is **allocated by count, never drawn**, which is ``_allocate_strata``'s rule
+    applied to a second population. Here it also avoids a concrete footgun: ``rng.choice`` over
+    a one-element tuple routes through ``_randbelow(1)``, which draws a bit and *redraws while
+    it is 1* -- so consumption would be a function of nothing the config can see, breaking
+    ``rng.py``'s rule 2 in the subtlest available way. Allocation makes consumption exactly one
+    ``sample`` call over a population of ``cfg.n``.
+
+    Partial by construction, like every share in this generator: a run where every payment were
+    foreign could not distinguish an FX-aware matcher from one that had simply widened its
+    tolerance until everything fit. ``GenConfig`` refuses the ``n`` that cannot be partial, so
+    the clamp is the backstop rather than the policy.
+    """
+    if not cfg.flags.fx:
+        return {}
+    k = max(1, min(round(cfg.n * FX_SHARE), cfg.n - 1))
+    chosen = sorted(rng.sample(range(cfg.n), k))
+    return {i: FX_CURRENCIES[j % len(FX_CURRENCIES)] for j, i in enumerate(chosen)}
+
+
+def _draw_fx_shifts(
+    cfg: GenConfig, rng: random.Random, fx_currency: dict[int, str], grosses: list[int]
+) -> dict[int, int]:
+    """``payment index -> signed paise`` the rate moved between capture and settlement.
+
+    The mess itself, and **design (b)**: the payout is *correct* at the settlement-day rate and
+    ``payments.csv``'s ``gross_paise`` is the stale capture-rate number. So this returns a shift
+    that is added to the recorded gross when the settlement's net is computed, and nothing
+    rewrites ``payments.csv``. The spec's row 7 is explicit -- "the rate at capture differs from
+    the rate at settlement, the rupee amount was never fixed" -- and the alternative (design (a),
+    moving the credit away from a declared net) is the reserve's mess, not this one.
+
+    Two properties that follow, and they are why (b) was locked:
+
+      * **The Tier 1 join survives.** ``settlements.csv``'s net and the bank credit still agree
+        exactly, so blocking, the date window and the amount band all keep their existing
+        arguments. The flag lands as a change of *value* in a column the matcher reads, like
+        ``--tds`` and unlike ``--reserve``.
+      * **The residual equals this shift.** A matcher re-deriving fee, GST and TDS from the
+        recorded gross gets a number that misses by exactly the shift, which is the honest
+        ``UNEXPLAINED_RESIDUAL`` on a single-member row and the unclosable gap on a withheld
+        batch. Nothing in the three input files carries it, which is what makes
+        ``FX_RATE_GAP`` an abstention rather than a search failure.
+
+    **The fee is charged on the recorded gross, deliberately.** ``_deductions`` and ``_tds`` are
+    not passed the shift, so the wedge is a single term rather than a re-pricing -- which keeps
+    the matcher's independent re-derivation of the fee *correct* and makes the whole discrepancy
+    one number. Folding the shift into the fee base would smear it across three columns and turn
+    a clean residual into three wrong ones.
+
+    **The sign is drawn, not assumed.** A rate moves both ways; a flag that always moved it one
+    way would let a matcher close the gap by guessing the direction. It also matters for what the
+    reserve probe does downstream: ``.plan/phase8.md`` §1(b) measured that a credit **above** its
+    true settlement's net still collects a confident reserve diagnosis naming a *different*
+    settlement, so the sign buys no protection there and both directions have to be present for
+    that to be visible.
+
+    **Two draws per foreign payment, fixed** (rule 2): one ``randint`` for the magnitude, one for
+    the sign, both drawn unconditionally. Consumption is therefore a function of the *count* of
+    foreign payments, which ``_draw_fx`` fixed from ``cfg`` alone -- and that is why that function
+    allocates its currencies instead of drawing them. Measured: ``rng.choice`` over a one-element
+    sequence routes through ``_randbelow(1)``, which draws a bit and redraws while it is 1, so it
+    consumes 1-4 bits per call. That is still deterministic at a fixed seed, so it would not have
+    broken reproducibility -- what it would have broken is the insulation between the two draws
+    *on this one stream*: the shifts below would start at a stream position determined by the
+    currency values rather than by their count, so changing ``FX_CURRENCIES`` or the chosen
+    indices would cascade into every shift. Rule 2's "anything conditional gets its own stream",
+    applied within a stream. This function is why that mattered.
+    """
+    if not fx_currency:
+        return {}
+    lo, hi = FX_BPS_BAND
+    shifts: dict[int, int] = {}
+    for i in sorted(fx_currency):
+        bps = rng.randint(lo, hi)
+        sign = 1 if rng.random() < 0.5 else -1
+        # A move of nothing is not a move: it would leave truth naming a payment whose rate
+        # shifted while every number in the file agrees, which is a claim the data contradicts.
+        # ``FX_BPS_BAND``'s floor makes this unreachable at these amounts (10 bps on the
+        # smallest 10,000p gross is 10p); the ``max`` is the backstop, matching
+        # ``_draw_reserves``' floor on the same reasoning.
+        shifts[i] = sign * max(1, mul_bps(grosses[i], bps))
+    return shifts
+
+
 def _allocate_strata(k: int) -> dict[str, int]:
     """Split ``k`` noise rows across the three strata **by count, never by draw**.
 
@@ -1001,6 +1206,8 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     rng_reserve = substream(cfg.seed, "reserve")
     rng_unsettled = substream(cfg.seed, "unsettled")
     rng_noise = substream(cfg.seed, "noise")
+    rng_fx = substream(cfg.seed, "fx")
+    rng_utr_patchy = substream(cfg.seed, "utr_patchy")
 
     # --- Step 4: invent the payments -------------------------------------
     # Drawn first, then sorted by capture time, then numbered -- a real gateway
@@ -1096,6 +1303,29 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
             "clamp in _draw_unsettled is meant to make that unreachable"
         )
 
+    # --- Step 6d: --fx assigns the currency column ------------------------
+    # **After the sort**, for ``_draw_refunds``' reason: the returned indices refer to the
+    # parallel draft lists, and those only mean "the payment that reaches ``payments.csv`` at
+    # this position" once the order is final.
+    #
+    # **Before the uniqueness nudge**, which costs nothing today and is the placement the rate
+    # move needs tomorrow. Assigning a currency changes no number, so this could sit anywhere
+    # after the sort; the *rate move* is a term ``net_paise`` is computed from, so it has to
+    # exist before ``_make_nets_unique`` places a net -- exactly the ordering constraint
+    # ``--netted-refunds`` documents above. Putting the draw in its final position now means the
+    # second half of step 2 adds an argument rather than moving a call, and the byte-identity
+    # check between the two halves stays readable.
+    #
+    # Independent of ``groups`` and of ``unsettled_idx`` by construction -- see ``_draw_fx``.
+    # It draws on its own substream, so a run without the flag is byte-identical regardless.
+    fx_currency = _draw_fx(cfg, rng_fx)
+    # The rate move, drawn on the same stream immediately after the currencies -- **and frozen
+    # into absolute paise here**, which is the refund's discipline for the refund's reason. The
+    # nudge below moves a gross by a paisa at a time; a shift re-derived as a share of the gross
+    # would move with every bump and the loop would chase a target running away from it. Frozen,
+    # a bump moves the net by exactly the bump.
+    fx_shift = _draw_fx_shifts(cfg, rng_fx, fx_currency, grosses)
+
     if cfg.flags.batching:
         # ``taken`` still holds every (capture_date, gross) the draw loop reserved, so the
         # nudge can dodge both collision channels at once. Gated on the flag: the 1:1 path
@@ -1103,7 +1333,7 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # ASSUMPTIONS.md #24a's numbers describe that exact code.
         _make_nets_unique(
             cfg, grosses, methods, capture_dates, settled_on_of, groups, taken,
-            netted_by_index,
+            netted_by_index, fx_shift,
         )
 
     payments = [
@@ -1113,6 +1343,13 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
             captured_at=captured_at,
             gross_paise=grosses[i - 1],
             method=method,
+            # ``i - 1`` because this loop numbers payments from 1 while every parallel list --
+            # ``grosses``, ``methods``, ``groups`` and ``_draw_fx``'s keys alike -- is 0-based.
+            # The same shift ``grosses[i - 1]`` makes one line up. Getting it wrong here shifts
+            # the foreign set by exactly one payment and emits a file that is still internally
+            # consistent, so nothing downstream would fail: the self-check below asserts the
+            # realised currencies against ``_draw_fx``'s own keys rather than against a count.
+            currency=fx_currency.get(i - 1, HOME_CURRENCY),
         )
         for i, (captured_at, _drafted_gross, method) in enumerate(drafts, start=1)
     ]
@@ -1184,6 +1421,17 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # and never search for it). Summed over the batch's members for the same reason the
         # fee is: a batch's terms are the sum of its members' terms, never a rate on the total.
         refunds_total = sum(netted_by_index.get(i, 0) for i in members)
+        # The FX term, summed over the members like every other term here -- a batch's terms are
+        # the sum of its members' terms, never a rate on the total. **Signed**, so this one can
+        # raise a batch's net as easily as lower it, and a mixed batch can partly cancel: two
+        # members shifted in opposite directions net out toward zero, which is realistic and is
+        # why truth records the *realised* sum rather than a rate anyone could re-apply.
+        #
+        # ``fx_shift`` was frozen before the uniqueness nudge, so like ``netted_by_index`` this is
+        # a lookup of a number that already exists rather than a derivation. That matters for
+        # ``_batch_net``: the nudge and this loop must agree about what a batch nets, and they do
+        # so by reading the same frozen dict rather than by re-deriving from a rate.
+        fx_total = sum(fx_shift.get(i, 0) for i in members)
         gross_total = sum(p.gross_paise for p in batch)
         # Every member of a batch shares a settlement date by construction
         # (``_group_into_batches`` partitions within one date), so the settlement's date is
@@ -1222,7 +1470,15 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
                 # the net), and unlike ``--tds`` the term is not derivable from any rate, so
                 # what it tests is a *lookup* rather than an arithmetic model. The reserve is
                 # the flag that cannot be treated this way, which is why it is last.
-                net_paise=gross_total - fee - gst - tds - refunds_total,
+                # Phase 8 step 2b adds ``fx_total``, and it is the first term here that is
+                # **added**: the rate move is signed, so it raises the net as readily as it
+                # lowers it. Design (b) -- ``payments.csv`` keeps the stale capture-rate gross,
+                # this net is right at the settlement-day rate, and the bank credit still equals
+                # it. So like ``--tds`` and ``--netted-refunds`` the flag moves **no join**;
+                # unlike both, the term is declared in *no input file at all*, which is what
+                # makes the residual it leaves an honest abstention rather than a lookup the
+                # matcher skipped. Zero without ``--fx``, so this expression is unchanged there.
+                net_paise=gross_total + fx_total - fee - gst - tds - refunds_total,
                 fee_paise=fee,
                 gst_paise=gst,
                 tds_paise=tds,
@@ -1364,6 +1620,14 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     # Same date, same amount, and a narration assembled from parts. Four fields
     # reach the CSV; the linkage below exists only in memory and in truth.json.
     by_payment = {p.payment_id: p for p in payments}
+    # ``fx_shift`` is keyed by draft **index**, which is what the settlement loop above wants
+    # (``members`` are indices). The credit loop below works in payment **ids**, so the bridge is
+    # built once here rather than re-derived per credit. ``payments[i]`` is the payment at draft
+    # index ``i`` -- the same 0-based correspondence ``grosses[i]`` has, and the reason the
+    # ``Payment`` construction needs its ``i - 1``.
+    #
+    # Empty without ``--fx``, so every ``.get`` below misses and the arithmetic is unchanged.
+    fx_by_payment = {payments[i].payment_id: shift for i, shift in fx_shift.items()}
     spare_tails = iter(tails[cfg.n:])
     # The echo fixup has to be *memoised*, or step 5b's work is undone here: a planted pair
     # shares a tail and a net, so if that tail echoes the amount both members enter the loop
@@ -1373,6 +1637,14 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     # there, so every lookup misses and the loop runs exactly as before.
     fixed_tails: dict[tuple[int, int], int] = {}
     drafted_credits: list[tuple[date, int, float, Settlement, str]] = []
+    # --- Step 6c: --utr-patchy picks which credits lose their narration tail ----------
+    # Drawn **before** the loop because an allocated count is a property of the whole
+    # population, not of a row -- the same reason ``_allocate_strata`` runs once. The loop
+    # reads it as a membership test and draws nothing extra.
+    #
+    # Keyed on settlement ids, which is the only stable name available here: ``C####`` is
+    # assigned by the bank-order sort further down, after these drafts exist.
+    patchy = _draw_utr_patchy(cfg, rng_utr_patchy, [s.settlement_id for s in settlements])
     for s in settlements:
         original = int(s.utr.removeprefix("XXXX"))
         # **The amount the bank actually receives, which is the net only when nothing is
@@ -1402,7 +1674,19 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # that the two *settlements* agree on every field that could link a credit to one of
         # them -- date, amount and UTR -- so a byte-identical pair is merely the same
         # ambiguity with less surface texture, not a stronger or weaker plant.
-        narration = _narration(rng_narration, tail, cfg.narration_styles)
+        #
+        # ``--utr-patchy`` masks the tail on this row, and the ``tail`` computed above is
+        # still passed and still unused in that case -- deliberately, so the echo fixup runs
+        # for every credit and ``spare_tails`` is consumed identically whether the row ends up
+        # masked or not. A fixup skipped for masked rows would shift the spare tails handed to
+        # every later credit, which is the same reproducibility trap ``_narration``'s own
+        # both-draws-either-way rule avoids one level down.
+        narration = _narration(
+            rng_narration,
+            tail,
+            cfg.narration_styles,
+            masked=s.settlement_id in patchy,
+        )
         # ``value_date`` is sourced from ``settled_on``, **not** from the payment's
         # capture date. Until Phase 4 this read ``p.business_date``, which was an
         # artifact rather than a model: a real bank credit follows the settlement that
@@ -1497,6 +1781,17 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # fails before anything reaches disk rather than becoming a truth file that
         # disagrees with its own CSVs.
         gross_total = sum(by_payment[pid].gross_paise for pid in s.payment_ids)
+        # The FX term for this credit, summed over the same membership the gross is summed over.
+        # **Signed**, so a mixed batch can partly cancel -- which is why truth records the
+        # realised sum rather than a rate: nobody downstream could re-apply a rate to recover
+        # this, and that is the mess rather than an omission.
+        #
+        # ``gross_total`` above is deliberately the **stale** capture-rate sum (design (b)), so
+        # the decomposition states ``gross + fx`` and closes to the credit exactly. Writing the
+        # settlement-day gross here instead would make the answer key close just as well while
+        # silently contradicting ``payments.csv``, and I4 could not tell the difference -- it
+        # compares truth's arithmetic to the credit, not to the payments file.
+        fx_here = sum(fx_by_payment.get(pid, 0) for pid in s.payment_ids)
         # A planted row is unresolvable *from the inputs*, and the answer key says so. The
         # reason comes from ``common.reasons.Reason`` rather than a hand-typed literal: the
         # generator's intent and the matcher's verdict have to be drawn from one vocabulary,
@@ -1636,6 +1931,21 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
                     # while the matcher provably cannot reproduce it, which is precisely why
                     # the matcher must abstain rather than fit a number to the gap.
                     reserve_paise=held_here,
+                    # Phase 8 step 2b, and the **seventh** term -- the first one that is added
+                    # rather than subtracted, because a rate moves both ways. Same lesson as
+                    # ``tds_paise`` and ``refunds_paise``: ``build`` puts this inside
+                    # ``net_paise``, so an answer key that omitted it would state arithmetic
+                    # that disagrees with its own CSVs, and I4 re-derives the sum from these
+                    # seven terms rather than copying the amount.
+                    #
+                    # **Two terms here are declared in no input file, and they are unclosable in
+                    # different ways.** The reserve is *bounded* by the inputs -- a matcher can
+                    # see the credit fall short of a declared net and name the shortfall exactly.
+                    # This one hides inside a gross the matcher reads as authoritative: nothing
+                    # in the three files says the recorded gross is stale, so the gap is not even
+                    # locatable, only detectable as a residual. That is why ``FX_RATE_GAP`` is a
+                    # distinct code from ``PARTIAL_SETTLEMENT_PENDING`` rather than a reuse.
+                    fx_paise=fx_here,
                 ),
                 # The refund ids, so truth says *which* refunds composed the term rather than
                 # only how much they came to. That is what lets I15 compare term by term
@@ -2033,6 +2343,435 @@ if __name__ == "__main__":
             "a batched run that produced one settlement must refuse to withhold it: "
             "withholding the only settlement is total, not partial"
         )
+
+    # --- step 2a: --fx assigns the currency column and moves NO number --------
+    # Built directly. While ``fx`` was inert this patched ``MessFlags.IMPLEMENTED`` under
+    # ``try/finally``, because ``GenConfig`` refused the flag from every caller including this
+    # file. Step 8 landed the flag, so the patch became a no-op that re-added a name the set
+    # already held -- deleted rather than kept, because a guard that guards nothing while
+    # reading as load-bearing is the decoration this file keeps removing.
+    fx_cfg = GenConfig(seed=42, n=60, flags=MessFlags(fx=True))
+    fx_story = build(fx_cfg)
+
+    # The foreign payments are **exactly** the ones ``_draw_fx`` names, compared by id against
+    # an independently re-drawn mapping. This is the assertion that catches the 0-based/1-based
+    # shift at the ``Payment`` construction: a shift keeps the count and the partiality, emits a
+    # file that is still internally consistent, and would fail nothing else in this suite.
+    _expected_fx = _draw_fx(fx_cfg, substream(fx_cfg.seed, "fx"))
+    _foreign = {
+        p.payment_id: p.currency for p in fx_story.payments if p.currency != HOME_CURRENCY
+    }
+    assert _foreign == {
+        fx_story.payments[i].payment_id: c for i, c in _expected_fx.items()
+    }, f"the emitted foreign set is not the drawn one: {sorted(_foreign)}"
+    assert set(_foreign.values()) <= set(FX_CURRENCIES), sorted(set(_foreign.values()))
+    # Re-derived from the clamp rather than pinned at 5, so this stays an assertion about the
+    # wiring (every drawn index reached the file) instead of a test to edit when the share moves.
+    assert len(_foreign) == max(1, min(round(fx_cfg.n * FX_SHARE), fx_cfg.n - 1))
+    # **A partiality assertion stood here and was deleted, because it could not fire.**
+    # ``0 < len(_foreign) < len(payments)`` follows arithmetically from the line above: the
+    # clamp's value is in ``[1, n-1]`` by construction, so any mutation of ``k`` trips the count
+    # assertion first and partiality is never reached (measured -- the mutation run attributed
+    # ``partiality-lost`` to the count assertion, not to this one). Keeping it would have been a
+    # check that reads as load-bearing while testing nothing, which is the class this project
+    # keeps finding. The property is real and is guarded where it can actually fail: on the
+    # **constant**, in ``config.py``'s self-check beside ``RESERVE_SHARE``'s.
+    assert all(p.currency == HOME_CURRENCY for p in story.payments), "clean mode is all-INR"
+
+    # **The whole point of landing the column alone**: against the clean seed-42 run, every
+    # field of every row is identical except ``currency``. That single assertion carries two
+    # properties at once -- the rate move genuinely is not in this half (no gross, net or credit
+    # differs by a paisa), and the new ``fx`` substream perturbs no existing draw, which is trap
+    # 5's byte-identity requirement measured in-process rather than against ``HEAD``.
+    _without_currency = lambda ps: [  # noqa: E731 -- local, and naming it beats repeating it
+        (p.payment_id, p.order_id, p.captured_at, p.gross_paise, p.method, p.status)
+        for p in ps
+    ]
+    assert _without_currency(fx_story.payments) == _without_currency(story.payments), (
+        "--fx moved something other than the currency column"
+    )
+    assert fx_story.counts() == story.counts()
+    # The flag off draws nothing at all, so the mapping is empty rather than merely unread.
+    assert _draw_fx(cfg, substream(cfg.seed, "fx")) == {}
+
+    # --- step 2b: the rate move ---------------------------------------------
+    # **Two assertions stood here through step 2a and are STRENGTHENED rather than deleted**:
+    # "no settlement moved" and "no credit moved" were true of the column alone and are false by
+    # construction now. Suspending them would lose the property; the successors pin *which* rows
+    # moved and by *how much*, which is strictly stronger than the equalities were.
+    # Re-drawn on a fresh stream in **build's own order** -- currencies first, then shifts -- or
+    # the shifts would start from a different stream position and this whole block would be
+    # comparing against numbers the run never produced. Spelled as three statements rather than
+    # one nested call: the ordering is the load-bearing part and it should be visible.
+    _fx_rng = substream(fx_cfg.seed, "fx")
+    _fx_drawn = _draw_fx(fx_cfg, _fx_rng)
+    _fx_grosses = [p.gross_paise for p in fx_story.payments]
+    _fx_shift = _draw_fx_shifts(fx_cfg, _fx_rng, _fx_drawn, _fx_grosses)
+    assert _fx_shift, "--fx drew no rate movement at all"
+    by_pay_fx = {p.payment_id: p for p in fx_story.payments}
+    _fx_ids = {fx_story.payments[i].payment_id for i in _fx_shift}
+    # Re-derived from the same stream in the same order, so this is the wiring check the column
+    # assertion above is for the currency: the shifts that reached the settlements are the ones
+    # the draw produced. ``_draw_fx`` is called on the *shared* generator first, exactly as
+    # ``build`` does, or the shifts would start from a different stream position.
+    assert set(_fx_shift) == set(_expected_fx), "the shifted set is not the foreign set"
+
+    _clean_setl = {s.settlement_id: s for s in story.settlements}
+    _moved: dict[str, int] = {}
+    for _s2 in fx_story.settlements:
+        _before = _clean_setl[_s2.settlement_id]
+        # The fee columns must be **identical**, and this is design (b)'s sharpest consequence:
+        # the fee is priced on the *recorded* gross, so a rate move changes what was paid out
+        # without changing what was charged. If these moved, the shift had leaked into
+        # ``_deductions``' base and the matcher's independent fee re-derivation would be wrong --
+        # which would show up as three wrong terms instead of one clean residual.
+        assert (_s2.fee_paise, _s2.gst_paise, _s2.tds_paise) == (
+            _before.fee_paise, _before.gst_paise, _before.tds_paise
+        ), f"{_s2.settlement_id}: --fx moved a deduction; the fee is priced on the recorded gross"
+        assert (_s2.settled_on, _s2.payment_ids, _s2.utr) == (
+            _before.settled_on, _before.payment_ids, _before.utr
+        ), f"{_s2.settlement_id}: --fx moved a date, a membership or a UTR"
+        if _s2.net_paise != _before.net_paise:
+            _moved[_s2.settlement_id] = _s2.net_paise - _before.net_paise
+    # Exactly the settlements holding a shifted payment moved, and each by exactly its members'
+    # signed sum. The membership is read from the *clean* story, so this cannot be satisfied by a
+    # generator that moved the right total onto the wrong rows.
+    _by_id = {p.payment_id: i for i, p in enumerate(fx_story.payments)}
+    _want = {
+        s.settlement_id: sum(_fx_shift.get(_by_id[pid], 0) for pid in s.payment_ids)
+        for s in story.settlements
+    }
+    assert _moved == {sid: d for sid, d in _want.items() if d}, (
+        f"the settlements that moved are not the FX-bearing ones: {sorted(_moved)[:5]}"
+    )
+    # **Both signs are present.** A rate moves both ways, and a one-directional flag would let a
+    # matcher close every gap by guessing the direction -- so this is a property of the mess, not
+    # a statistical curiosity. It is the one assertion here that could fail on an unlucky seed
+    # rather than on a bug, which is why it is stated at n=60 where the foreign count is ~5: at
+    # 2^-5 the all-one-way draw is remote, and a failure here is worth investigating either way.
+    assert any(d > 0 for d in _fx_shift.values()), "no rate moved up"
+    assert any(d < 0 for d in _fx_shift.values()), "no rate moved down"
+    # The credit still equals the net, so the Tier 1 join survives -- design (b)'s whole point,
+    # and the property that distinguishes this flag from ``--reserve``.
+    for _c in fx_story.credits:
+        assert _c.amount_paise == sum(
+            s.net_paise for s in fx_story.settlements if s.settlement_id in _c.settlement_ids
+        ), f"{_c.credit_id}: --fx broke credit == net, which would make this the reserve's mess"
+        # Truth's arithmetic closes on an FX row, over seven terms now. This is what would have
+        # failed had ``fx_paise`` been omitted from the decomposition while ``build`` put the
+        # shift inside the net -- the same catch that found the missing ``tds_paise`` in Phase 6.
+        assert _c.decomposition.expected_credit_paise == _c.amount_paise, _c.credit_id
+        # And the gross truth states is the **stale** one, matching ``payments.csv`` rather than
+        # the settlement-day figure. A generator that recorded the shifted gross here would close
+        # its own arithmetic just as well while contradicting the payments file, and I4 compares
+        # truth to the *credit*, so it could not see the difference.
+        assert _c.decomposition.gross_paise == sum(
+            by_pay_fx[pid].gross_paise for pid in _c.payment_ids
+        ), f"{_c.credit_id}: truth's gross is not payments.csv's"
+    # ``fx_paise`` is non-zero on exactly the credits holding a shifted payment.
+    assert {c.credit_id for c in fx_story.credits if c.decomposition.fx_paise} == {
+        c.credit_id for c in fx_story.credits
+        if any(pid in _fx_ids for pid in c.payment_ids)
+    }, "truth's fx_paise is non-zero on the wrong set of credits"
+    assert [c.csv_row() for c in build(fx_cfg).credits] == [
+        c.csv_row() for c in fx_story.credits
+    ], "--fx is not deterministic"
+    # A run without the flag draws no shift, so every expression above is inert there.
+    assert _draw_fx_shifts(cfg, substream(cfg.seed, "fx"), {}, [p.gross_paise for p in
+                                                               story.payments]) == {}
+
+    # --- step 2b under --batching: the path the shift was threaded through --------
+    # **Everything above ran with the uniqueness nudge switched off.** ``_make_nets_unique`` is
+    # gated on ``--batching``, so the ``fx`` argument added to it and to ``_batch_net`` is not
+    # exercised by a single assertion in the block above -- the 1:1 path never calls either. This
+    # is the fixture for the code that edit actually touched.
+    #
+    # Why the shift has to be inside ``_batch_net`` at all: that function defines the value the
+    # nudge keeps unique, and ``build`` derives ``net_paise`` the same way. Leave the shift out of
+    # it and the nudge protects a number the emitted file does not carry -- two settlements can
+    # then share a ``(settled_on, net)`` on disk while the nudge believed them distinct, which is
+    # exactly the failure its docstring records for TDS and refunds. Third instance.
+    # Built directly, for the reason the ``--fx`` fixture above gives: step 8 landed the flag, so
+    # the ``IMPLEMENTED`` patch this carried is a no-op and is deleted rather than kept.
+    fxb_cfg = GenConfig(seed=42, n=200, flags=MessFlags(fx=True, batching=True))
+    fxb_story = build(fxb_cfg)
+
+    # The property the nudge exists to hold, now over nets that include a signed FX term.
+    _keys = [(s.settled_on, s.net_paise) for s in fxb_story.settlements]
+    assert len(set(_keys)) == len(_keys), (
+        "two settlements share a (settled_on, net) under --fx --batching -- the nudge is "
+        "protecting a net that is not the one being emitted"
+    )
+    fxb_by_pay = {p.payment_id: p for p in fxb_story.payments}
+    _fxb_foreign = {p.payment_id for p in fxb_story.payments if p.currency != HOME_CURRENCY}
+    assert _fxb_foreign, "--fx drew no foreign payment at n=200"
+    for _c in fxb_story.credits:
+        # Seven terms, over a *set* of payments, with a signed one among them.
+        assert _c.decomposition.expected_credit_paise == _c.amount_paise, _c.credit_id
+        # Truth's gross is the stale capture-rate sum, matching payments.csv.
+        assert _c.decomposition.gross_paise == sum(
+            fxb_by_pay[pid].gross_paise for pid in _c.payment_ids
+        ), f"{_c.credit_id}: truth's gross is not payments.csv's"
+        # The join survives on a batch too: credit == the settlement's net.
+        assert _c.amount_paise == sum(
+            s.net_paise for s in fxb_story.settlements
+            if s.settlement_id in _c.settlement_ids
+        ), _c.credit_id
+        # ``fx_paise`` against the batch's foreign membership -- and **not as a biconditional**,
+        # which is what this assertion was until it was measured
+        # (``.plan/probe_phase8_multi_foreign_batch.py``). ``bool(fx) == any(foreign)`` is sound
+        # left to right and *unsound* right to left: the term is the signed sum over the foreign
+        # members, so two members drawing equal magnitudes with opposite signs cancel to exactly
+        # zero, and the assertion would then reject legal data. No seed in 0..42 at n=200
+        # produces such a cancellation, which is luck rather than a guarantee -- the draws permit
+        # it, so an assertion that depends on it not happening is a latent false failure.
+        #
+        # The precise statement is a **three-way split on the foreign member count**, and it is
+        # strictly stronger than either direction alone. ``_draw_fx_shifts`` computes
+        # ``sign * max(1, ...)``, so a single foreign member's shift is never zero -- that is what
+        # makes the one-member case assertable rather than merely likely.
+        _mine = [pid for pid in _c.payment_ids if pid in _fxb_foreign]
+        if not _mine:
+            assert _c.decomposition.fx_paise == 0, (
+                f"{_c.credit_id}: fx_paise is {_c.decomposition.fx_paise:+d} but no member is "
+                f"foreign -- the term is attributed to a batch that never moved a rate"
+            )
+        elif len(_mine) == 1:
+            assert _c.decomposition.fx_paise != 0, (
+                f"{_c.credit_id}: fx_paise is zero on a batch with exactly one foreign member, "
+                f"whose shift _draw_fx_shifts floors at a magnitude of 1 -- so the member's "
+                f"shift was dropped rather than summed"
+            )
+        # len(_mine) >= 2: any value, zero included. Covered by the seven-term closure above,
+        # which pins the exact number without needing the per-member shifts this scope cannot
+        # re-derive (the nudge has already moved the grosses they were drawn from).
+    # Two existence guards, because they pin **different** properties and the first was doing
+    # duty for both. Measured at seed 42, n=200 (``.plan/probe_phase8_multi_foreign_batch.py``).
+    #
+    # (1) A mixed batch: at least one foreign and one domestic member, so the sum is shown to
+    # range over *only* the foreign ones. A generator summing every member's gross movement --
+    # or attributing the batch's whole shift to the wrong subset -- fails here.
+    _mixed = [
+        c for c in fxb_story.credits
+        if len(c.payment_ids) > 1
+        and any(p in _fxb_foreign for p in c.payment_ids)
+        and any(p not in _fxb_foreign for p in c.payment_ids)
+    ]
+    assert _mixed, (
+        "no batch holds both a foreign and a domestic payment, so the per-member FX sum is "
+        "untested -- raise n or re-check the draw"
+    )
+    # (2) A batch with **two or more** foreign members. Guard (1) does not imply this -- "a batch
+    # of four with one shifted member" satisfies it while the "sum" carries a single term -- and
+    # there is exactly **one** such batch at seed 42, n=200 (C0039), so the coverage this buys
+    # was real but accidental until it was pinned here.
+    #
+    # **What it buys, measured rather than asserted** (``.plan/probe_phase8_fx_sum_mutants.py``).
+    # The two FX summation sites are independent: one builds the settlement's ``net_paise``, the
+    # other truth's ``fx_paise``. A mutant that breaks *one* of them -- ``next(member)`` where
+    # ``sum(members)`` belongs -- is caught by the closure above, and it is caught **on C0039
+    # specifically**. Below two foreign members in a batch, ``next`` and ``sum`` are the same
+    # function, so both one-sided mutants would emit byte-identical data and survive. This guard
+    # is the reason they do not.
+    #
+    # **What it does not buy, also measured.** Break *both* sites in the same direction and
+    # nothing anywhere detects it: every closure closes, because both sides agree with each
+    # other about the wrong number, and ``tools/verify_output.py`` passes too
+    # (``.plan/probe_phase8_fx_sum_mutant_c_disk.py``). That is not a gap to plug but a
+    # consequence of design (b): the rate movement is declared in **no input file**, so a
+    # foreign payment whose shift was dropped is indistinguishable from one whose rate did not
+    # move. It is a mess-fidelity defect, not a consistency one -- there is nothing for it to
+    # contradict. The honest place for that claim is here, next to the guard it limits.
+    #
+    # Deliberately fragile in the direction that is safe: 19 of the 41 seeds measured have no
+    # such batch, so this fails loudly if the fixture's seed or n moves rather than going quietly
+    # vacuous. That is the same trade gate 11's sizes make.
+    _multi_foreign = [
+        c for c in fxb_story.credits
+        if sum(1 for p in c.payment_ids if p in _fxb_foreign) >= 2
+    ]
+    assert _multi_foreign, (
+        "no batch holds two or more foreign payments, so fx_paise is a one-term 'sum' on every "
+        "credit here and a generator that never added the members would pass -- raise n or "
+        "re-check the draw (seed 42/n=200 has exactly one such batch, and 19 of 41 seeds "
+        "measured have none)"
+    )
+    assert [c.csv_row() for c in build(fxb_cfg).credits] == [
+        c.csv_row() for c in fxb_story.credits
+    ], "--fx --batching is not deterministic"
+    #
+    # **Not asserted: that ``payments.csv`` is unchanged from the no-fx batched run.** It need not
+    # be, and claiming otherwise would be wrong. The nudge moves a gross by a paisa to dodge a net
+    # collision; the shift changes the nets, so it changes *which* batches collide, so a nudge can
+    # land on a different payment. A non-FX settlement's gross can therefore differ by 1p between
+    # the two runs. That is the nudge working, not the flag leaking. It also means the shift is
+    # computed from the **pre-nudge** gross while ``payments.csv`` carries the post-nudge one --
+    # the same position ``_draw_refunds`` has occupied since Phase 6, and harmless for the same
+    # reason: the value is frozen in absolute paise, and every consumer reads the frozen number.
+    #
+    # **Not asserted here, deliberately:** I17's ``orphan_currencies <= settled_currencies``
+    # under ``--fx --unsettled``. With ``--fx`` alone the run has no orphans, so the subset holds
+    # for want of an orphan and the assertion would pass without testing the interaction -- the
+    # vacuous-pass shape this project keeps finding. That measurement lives in
+    # ``invariants.py``'s positive control beside the check it constrains, where a mutant on the
+    # subset test can reach it; step 4 owns the *independence* of the two draws, below.
+
+    # --- step 4 (trap 2): the two draws are independent, ASSERTED --------------
+    # ``_draw_fx``'s docstring and the call site above both *claim* independence from
+    # ``--unsettled``; until now nothing tested it. It matters because I17 reads the currency
+    # column against the orphan set: if orphaning could steer the foreign draw (or the reverse),
+    # ``orphan_currencies <= settled_currencies`` would be measuring an artefact of the
+    # generator instead of a property of the data, and the trap-2 leak would be real.
+    #
+    # **The fixture is chosen for the collision, not for convenience.** On the seeds this file
+    # already uses (1, 2, 3, 42) the foreign set and the orphan set are *disjoint* at both n=60
+    # and n=200, so both equalities below would hold no matter how entangled the draws were --
+    # there is nothing to interfere with. The fixture needs three things at once: an orphaned
+    # foreign payment (or the draws cannot collide), a *settled* foreign payment (or no shift
+    # reaches a net and the arithmetic check is vacuous), and a home-currency orphan (or every
+    # orphan is foreign, and a currency-steered orphan draw would look correct).
+    #
+    # **n=60 cannot satisfy all three, structurally** -- and this is why: the unsettled clamp
+    # yields exactly one orphan at that size, so requiring it to be foreign forces the orphan
+    # set to be *entirely* foreign. 0 of 90 seeds qualify at n=60; 12 of 90 do at n=100 and 27
+    # of 90 at n=200. Hence n>=100 here, which is a property of the clamp rather than a seed
+    # accident -- raising n is the fix if a later change shrinks these, never dropping a
+    # condition. Seed 16/n=100 gives overlap 1 with 2 orphans and 8 foreign (7 settled);
+    # seed 6/n=200 gives overlap 2 with 4 orphans and 16 foreign (14 settled).
+    # Deliberately not seed 10, which ``invariants.py``'s control uses for its own overlap: one
+    # fixture drift must not silently defuse both.
+    def _ind_split(story: Story) -> tuple[set[str], set[str]]:
+        """(foreign payment ids, orphaned payment ids) -- the two draws, as realised."""
+        foreign = {p.payment_id for p in story.payments if p.currency != HOME_CURRENCY}
+        settled = {pid for s in story.settlements for pid in s.payment_ids}
+        return foreign, {p.payment_id for p in story.payments} - settled
+
+    for _ind_seed, _ind_n, _ind_overlap in ((16, 100, 1), (6, 200, 2)):
+        _ind_both = build(
+            GenConfig(seed=_ind_seed, n=_ind_n, flags=MessFlags(fx=True, unsettled=True))
+        )
+        _ind_fx_only = build(
+            GenConfig(seed=_ind_seed, n=_ind_n, flags=MessFlags(fx=True))
+        )
+        _ind_uns_only = build(
+            GenConfig(seed=_ind_seed, n=_ind_n, flags=MessFlags(unsettled=True))
+        )
+
+        _ind_f, _ind_o = _ind_split(_ind_both)
+
+        # **THE GENERATOR'S CLAIM FIRST, the fixture's shape second, and the order is the
+        # point.** Shape ran first here originally, and mutation testing showed that was
+        # wrong: the most plausible coupling -- filtering the currency draw so it skips what
+        # ``--unsettled`` orphaned -- *removes the overlap it is tested against*. The shape
+        # assertion fired first and reported "re-pick the seed from a collision sweep", so a
+        # realised trap-2 leak arrived wearing the label of a stale fixture, and the repair
+        # it recommends is to tune the seed until the defect goes green. Independence is a
+        # statement about the generator; shape is a statement about this fixture's ability to
+        # test it. Asking the generator first names the defect when there is one, and shape
+        # still catches a fixture that has drifted -- it merely runs second, where a passing
+        # equality is what it has to explain away.
+        assert _ind_f == _ind_split(_ind_fx_only)[0], (
+            f"seed {_ind_seed}/n={_ind_n}: adding --unsettled moved the foreign set, so "
+            f"_draw_fx is not independent of the orphan draw -- I17's subset test would be "
+            f"reading the generator's own coupling, which is trap 2 exactly. If the foreign "
+            f"set SHRANK, suspect a filter that skips orphaned payments: their shifts reach "
+            f"no net, so dropping them looks free and makes the currency column a function "
+            f"of the orphan set. Do not re-pick the fixture to make this pass"
+        )
+        assert _ind_o == _ind_split(_ind_uns_only)[1], (
+            f"seed {_ind_seed}/n={_ind_n}: adding --fx moved the orphan set, so "
+            f"_draw_unsettled is not independent of the currency draw"
+        )
+
+        # Shape, now that both equalities have held: each of these is a way for the fixture
+        # to stop testing the interaction while still going green, so a pass above means
+        # nothing until they hold too.
+        assert len(_ind_f & _ind_o) == _ind_overlap, (
+            f"seed {_ind_seed}/n={_ind_n} was chosen because {_ind_overlap} foreign "
+            f"payment(s) get orphaned, which is the only configuration where the two draws "
+            f"could interfere; it now orphans {len(_ind_f & _ind_o)} of them, so the "
+            f"equalities above held through disjointness rather than through independence "
+            f"-- re-pick the seed from a collision sweep (n>=100; see the note above on why "
+            f"n=60 cannot qualify), do not drop the condition"
+        )
+        assert _ind_f - _ind_o, (
+            f"seed {_ind_seed}/n={_ind_n}: every foreign payment is orphaned, so no FX "
+            f"shift reaches a net and the arithmetic check below is vacuous"
+        )
+        assert _ind_o - _ind_f, (
+            f"seed {_ind_seed}/n={_ind_n}: every orphan is foreign, so the orphan draw has "
+            f"no home-currency member and a currency-steered draw would look correct"
+        )
+
+        # An arithmetic handle on the same property, and a sharper one: the set equalities
+        # above would still hold if a shift were dropped, since neither looks at a net. Here
+        # the 1:1 path puts one payment in each settlement and ``_draw_fx_shifts`` floors
+        # every magnitude at 1 paisa, so a settled foreign payment moves *its* net and an
+        # orphaned one moves nothing -- forced, not approximate. Stated for the unbatched
+        # path on purpose: under --batching the nudge can move a third party's gross by a
+        # paisa, which the block above documents and which would break this.
+        #
+        # **Compared by IDENTITY, not by count, and the distinction is not cosmetic.** This
+        # was written as ``sum(1 for ...) == len(_ind_f - _ind_o)`` while its message claimed
+        # it would catch "a shift reached a settlement holding no foreign payment". A count
+        # cannot catch that: a shift dropped from one settlement and spuriously applied to
+        # another keeps the total and passes. The identities are in hand, so the assertion
+        # should be the one the message describes -- otherwise the message is the thing being
+        # trusted, and it is not what runs.
+        _ind_nets = {s.settlement_id: s.net_paise for s in _ind_both.settlements}
+        _ind_base = {s.settlement_id: s.net_paise for s in _ind_uns_only.settlements}
+        assert set(_ind_nets) == set(_ind_base), (
+            f"seed {_ind_seed}/n={_ind_n}: --fx changed which settlements exist; design (b) "
+            f"moves a net, never the batching"
+        )
+        _ind_moved = {k for k in _ind_nets if _ind_nets[k] != _ind_base[k]}
+        _ind_holds = {
+            s.settlement_id
+            for s in _ind_both.settlements
+            if any(pid in _ind_f for pid in s.payment_ids)
+        }
+        assert _ind_moved == _ind_holds, (
+            f"seed {_ind_seed}/n={_ind_n}: the settlements whose net moved are not the "
+            f"settlements holding a foreign payment. Moved but holds none: "
+            f"{sorted(_ind_moved - _ind_holds)}; holds one but did not move: "
+            f"{sorted(_ind_holds - _ind_moved)}. The first means a shift landed on the wrong "
+            f"settlement, the second means one was dropped (the floor is 1 paisa, so no real "
+            f"shift can be invisible)"
+        )
+        # And tie those settlements back to the *payment* draw, which is the quantity
+        # independence is about: in the 1:1 path each settlement holds one payment, so the
+        # settled foreign payments and the moved settlements are in bijection.
+        assert len(_ind_moved) == len(_ind_f - _ind_o), (
+            f"seed {_ind_seed}/n={_ind_n}: {len(_ind_moved)} nets moved but "
+            f"{len(_ind_f - _ind_o)} foreign payments are settled -- equal in the 1:1 path, "
+            f"so a settlement is carrying more than one payment and this fixture is no "
+            f"longer on the unbatched path these assertions describe"
+        )
+
+        # And the column-level claim ``_draw_fx``'s docstring makes for the first half:
+        # unbatched, the flag changes ``currency`` and nothing else in payments.csv.
+        _ind_rows = [p.csv_row() for p in _ind_both.payments]
+        _ind_rows_base = [p.csv_row() for p in _ind_uns_only.payments]
+        _ind_cols = {
+            PAYMENTS_HEADER[k]
+            for x, y in zip(_ind_rows, _ind_rows_base)
+            for k, (u, v) in enumerate(zip(x, y))
+            if u != v
+        }
+        assert _ind_cols == {"currency"}, (
+            f"seed {_ind_seed}/n={_ind_n}: --fx changed {sorted(_ind_cols)} in payments.csv; "
+            f"design (b) leaves gross_paise stale at the capture rate, so currency is the "
+            f"only column it may touch on the unbatched path"
+        )
+    #
+    # **What this does not prove.** That the draws are independent *of each other* at every seed
+    # -- two fixtures cannot say that, and the sweep behind them (0 mismatches over the 30
+    # collision seeds found in 160 runs) is evidence, not proof. The structural argument is the
+    # load-bearing one and lives in the code rather than in an assertion: the two draws take
+    # separate substreams (``rng_fx``, ``rng_unsettled``), and ``_draw_fx`` is not passed
+    # ``groups`` or ``unsettled_idx`` at all, so coupling them requires a signature change at a
+    # call site a reviewer reads. These assertions guard the case where someone adds that
+    # argument believing it harmless.
 
     # --- the UTR tail ceiling ---------------------------------------------
     # Tails are drawn without replacement from a 9,000-value space, so n has a hard upper

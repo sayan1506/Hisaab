@@ -43,10 +43,14 @@ from ..common import ids
 from ..common.bizdays import BusinessCalendar
 from ..common.reasons import Reason
 from .config import (
+    BANK_CHANNELS,
     COUNTERPARTY,
     COUNTERPARTY_SHORT,
     COUNTERPARTY_SPACED,
+    NARRATION_SPELLINGS,
     NOISE_STRATA_SPLIT,
+    NOISE_TEMPLATES,
+    UTR_PATCHY_SHARE,
     GenConfig,
     MessFlags,
 )
@@ -332,12 +336,18 @@ def check_totals(
     unsettled_cells: list[int],
     *,
     noise_cells: tuple[int, ...] | list[int] = (),
+    #: Phase 8 step 2b (``--fx``): the signed rate movement per credit. **Keyword-only with a
+    #: default**, exactly like ``noise_cells`` and for the same reason: every positional call
+    #: below predates the term and means "no FX", so those fixtures keep testing what they
+    #: tested. At zero the two assertions are character-for-character the ones Phase 7 left.
+    fx_cells: tuple[int, ...] | list[int] = (),
     fees_on: bool = False,
     tds_on: bool = False,
     refunds_on: bool = False,
     reserve_on: bool = False,
     unsettled_on: bool = False,
     noise_on: bool = False,
+    fx_on: bool = False,
 ) -> None:
     """I4 — the money adds up in aggregate, and deductions exist only when asked for.
 
@@ -456,6 +466,19 @@ def check_totals(
     # from the **credited** side rather than added to any wedge: it arrived in the bank and was
     # never settled by this gateway, so it belongs on neither side of gross/net.
     not_ours = sum(noise_cells)
+    # The rate movement (``--fx``, Phase 8 step 2b). **Added to the gross side and signed**, which
+    # makes it the first term here that can be negative and the first that widens the wedge in
+    # either direction. Design (b): ``payments.csv`` carries the stale capture-rate gross while
+    # the payout is right at the settlement-day rate, so the money genuinely settled is
+    # ``gross + moved`` and this assertion would otherwise report the whole shift as unaccounted
+    # for. It was measured doing exactly that before the term existed -- 113,694p on seed 42 at
+    # n=60 -- which is what says the check was load-bearing here rather than decoration.
+    #
+    # **Not on the credited side.** The credit still equals the net (that is design (b)'s point
+    # and what keeps the Tier 1 join alive), so the first assertion below is untouched. The
+    # reserve and the noise row sit there instead; this one belongs between gross and net, like
+    # the fee, the TDS and the refund.
+    moved = sum(fx_cells)
     _require(
         net_total - held == credit_total - not_ours,
         "I4",
@@ -465,12 +488,18 @@ def check_totals(
         f"({net_total - held - credit_total + not_ours:+d} paise never reached the bank)",
     )
     _require(
-        gross_total - never_settled - deducted == net_total,
+        gross_total + moved - never_settled - deducted == net_total,
         "I4",
+        # ``moved`` is printed with a sign and named "rate movement" rather than folded into
+        # ``deducted``: it is not a deduction, and a reader diagnosing a failure needs to see
+        # which side of the wedge is short. At zero the arithmetic is the five-term expression
+        # Phase 7 left, so every existing fixture reports the identical message.
         f"the gross/net wedge is not the declared deductions: gross={gross_total} "
-        f"- never-settled={never_settled} - deductions={deducted} = "
-        f"{gross_total - never_settled - deducted}, but net={net_total} "
-        f"({gross_total - never_settled - deducted - net_total:+d} paise unaccounted for)",
+        f"+ rate-movement={moved:+d} - never-settled={never_settled} "
+        f"- deductions={deducted} = {gross_total + moved - never_settled - deducted}, "
+        f"but net={net_total} "
+        f"({gross_total + moved - never_settled - deducted - net_total:+d} paise "
+        f"unaccounted for)",
     )
     for label, cells, on in (
         ("fee/gst", fee_cells, fees_on),
@@ -479,6 +508,11 @@ def check_totals(
         ("reserve", reserve_cells, reserve_on),
         ("never-settled gross", unsettled_cells, unsettled_on),
         ("non-gateway credit", noise_cells, noise_on),
+        # ``c != 0`` below already reads correctly for a signed term: a rate movement of any
+        # magnitude in either direction is a non-zero cell, and a run without ``--fx`` must have
+        # none. This is the clause that catches the mislabelled-data failure for this flag --
+        # truth carrying a movement the flag never asked for.
+        ("rate movement", fx_cells, fx_on),
     ):
         if on:
             continue
@@ -492,18 +526,28 @@ def check_totals(
 
 
 def check_settlement_arithmetic(
-    rows: list[tuple[str, int, int, int, int, int]] | list[tuple[str, int, int, int, int, int, int]],
+    rows: (
+        list[tuple[str, int, int, int, int, int]]
+        | list[tuple[str, int, int, int, int, int, int]]
+        | list[tuple[str, int, int, int, int, int, int, int]]
+    ),
 ) -> None:
-    """I4 — per settlement: ``net == gross - fee - gst - tds - refunds``, GST sits on the fee.
+    """I4 — per settlement: ``net == gross + fx - fee - gst - tds - refunds``, GST on the fee.
 
     ``rows`` is ``(settlement_id, gross_of_members, net, fee, gst, tds)`` with an optional
-    seventh element for the refunds netted off that settlement. **Optional rather than
-    required**, which is the opposite of the choice ``check_totals`` makes one function up, and
-    the asymmetry is deliberate: that function takes whole columns and a caller omitting one
-    would under-count the wedge silently, while here a missing seventh element is a row that
-    says "no refunds" -- and at zero refunds the assertion is character-for-character the
-    five-term one Phase 6 step 2 left behind. Every pre-Phase-6 fixture in this file therefore
-    keeps testing exactly what it tested before.
+    seventh element for the refunds netted off that settlement, and an optional **eighth** for
+    the ``--fx`` rate movement. **Optional rather than required**, which is the opposite of the
+    choice ``check_totals`` makes one function up, and the asymmetry is deliberate: that
+    function takes whole columns and a caller omitting one would under-count the wedge silently,
+    while here a missing element is a row that says "no refunds" or "no rate movement" -- and at
+    zero the assertion is character-for-character the five-term one Phase 6 step 2 left behind.
+    Every pre-Phase-6 fixture in this file therefore keeps testing exactly what it tested
+    before, and every pre-Phase-8 one likewise.
+
+    **The eighth term is signed and added**, which is the one place this row's arithmetic stops
+    being a pure subtraction. Design (b): ``payments.csv`` keeps the capture-rate gross, so a
+    settlement's declared net is correct about ``gross + fx``. Getting the sign wrong here would
+    make the check pass on a generator that moved every rate the wrong way.
 
     The per-row companion to ``check_totals``, and it earns its keep for a reason the
     aggregate cannot cover: totals that agree in sum can still be wrong row by row, and
@@ -528,11 +572,18 @@ def check_settlement_arithmetic(
     for row in rows:
         sid, gross, net, fee, gst, tds = row[:6]
         refunds = row[6] if len(row) > 6 else 0
+        # Phase 8 step 2b: the rate movement, optional **eighth** element on exactly the
+        # precedent the seventh set. At zero the assertion below is character-for-character the
+        # six-term one, so every pre-Phase-8 row in this file -- six-tuples and seven-tuples
+        # alike -- keeps testing what it tested. Signed, and **added**: design (b) leaves
+        # ``payments.csv``'s gross stale at the capture rate, so a settlement's declared net is
+        # right about ``gross + fx`` rather than about ``gross``.
+        fx = row[7] if len(row) > 7 else 0
         _require(
-            net == gross - fee - gst - tds - refunds,
+            net == gross + fx - fee - gst - tds - refunds,
             "I4",
-            f"{sid}: net {net} != gross {gross} - fee {fee} - gst {gst} - tds {tds} "
-            f"- refunds {refunds} = {gross - fee - gst - tds - refunds}",
+            f"{sid}: net {net} != gross {gross} + fx {fx:+d} - fee {fee} - gst {gst} "
+            f"- tds {tds} - refunds {refunds} = {gross + fx - fee - gst - tds - refunds}",
         )
         _require(
             gst <= fee,
@@ -1224,6 +1275,142 @@ def check_noise(story: Story, cfg: GenConfig) -> None:
     )
 
 
+def gateway_plausible_forms() -> frozenset[str]:
+    """Every string a ``gateway_plausible`` noise row can render, over all channels.
+
+    Shared by this module and ``tools/verify_output.py`` so the in-memory and on-disk passes
+    cannot disagree about what "indistinguishable from noise" means. Derived from the same
+    tables the generator renders from, which is the point: a mask re-rendered into a form this
+    set does not contain would be identifiable by shape, and a *second* copy of the vocabulary
+    would drift the day a template is edited.
+    """
+    return frozenset(
+        template.format(channel=channel, counterparty=spelling, tail="")
+        for template in NOISE_TEMPLATES["gateway_plausible"]
+        for channel in BANK_CHANNELS
+        for spelling in NARRATION_SPELLINGS
+    )
+
+
+def check_utr_patchy(story: Story, cfg: GenConfig) -> None:
+    """I19 — the credits whose bank narration lost its reference tail. ``--utr-patchy``.
+
+    Fifth in the pattern I15 (refunds), I16 (reserve), I17 (orphans) and I18 (noise) established:
+    a flag that removes evidence brings the check that says what it removed. Unlike those four
+    this flag suspends nothing, so I19 is not a successor -- it exists because the mask is the
+    one piece of mess in this project that makes a *genuine* row look like a discardable one,
+    and the cell it attacks (``WRONG_IGNORE``) is the only one that can lose money silently.
+
+    **Decision 8, and it is the assertion the answer key rests on.** What this flag strips is
+    the *bank statement's* copy of the reference, never ``settlements.csv``'s ``utr`` column.
+    Truth marks an FX or reserved row ``resolvable: true`` on the strength of that column
+    surviving, so a generator that stripped it would make the answer key a false statement
+    about its own data. ``Settlement.utr`` defaults to ``""`` and ``__post_init__`` does not
+    check it, so nothing else in this codebase would notice.
+
+    **Why the masked form is re-rendered rather than stripped**, asserted here because it is the
+    property a reviewer would most reasonably assume away. Deleting the 4-digit tail from the
+    four genuine templates leaves ``NEFT CR/RAZORPAYSOFT/``, ``NEFT/RAZORPAYSOFT/XXXX/SETTLEMENT``
+    and ``NEFT-RZRPAY-`` -- and **3 of those 4 shapes no noise row can produce**, because
+    ``gateway_plausible``'s templates end in ``XXXX``, ``REF`` or ``SETTLEMENT`` and never in a
+    dangling separator. A masked genuine credit would then be identifiable by shape alone, and
+    ``WRONG_IGNORE == 0`` would hold because the attack was *visible* rather than because
+    ``tier1``'s ignore conjunction works. That is I12's "absence-of-tail a tell unique to planted
+    rows" warning arriving on a different flag, and it is measured rather than argued
+    (`.plan/probe_phase8_utr_patchy_wrong_ignore.py`).
+
+    **What is deliberately NOT asserted here.**
+
+      * *"Every unmasked credit still carries a tail."* Given the count assertion below -- which
+        counts credits with no digit run -- that statement is true by the definition of the set
+        it counts, not a check. The unreachable-assertion trap from Phase 8 step 2a.
+      * *Partiality* (``0 < k < len(credits)``). It follows arithmetically from
+        ``_draw_utr_patchy``'s clamp, so it could not fail here; the property is guarded where
+        it *can* fail, on the constant in ``config.py``.
+      * *That the mask does not correlate with planted rows.* A single story cannot show that --
+        I12's constraint is distributional, and it is tested against an exact null over 40 seeds
+        in the probe above, with a power control that must be rejected.
+    """
+    masked = [c for c in story.credits if not ids.digit_runs(c.narration)]
+
+    if not cfg.flags.utr_patchy:
+        # Not merely skipped. With the flag off every genuine narration renders its tail, so a
+        # tail-less credit means the mask fired without being asked -- the same total-check
+        # discipline I18 uses on its clean-mode branch.
+        _require(
+            not masked,
+            "I19",
+            f"{len(masked)} gateway credit(s) carry no reference tail without --utr-patchy: "
+            f"{[c.credit_id for c in masked][:5]} -- every genuine template renders a 4-digit "
+            f"tail, so a row without one is the mask firing on a run that did not ask for it",
+        )
+        return
+
+    # Assertion 1: the flag produced its mess, and did not consume the whole file. Both
+    # directions matter -- a run labelled --utr-patchy with no masked row is a run whose name is
+    # a false statement about its data, and a run where *every* credit lost its tail would not
+    # distinguish a matcher that reads the counterparty from one that stopped ignoring anything.
+    # The denominator is the **settlements**, not the credits, because that is the population
+    # ``_draw_utr_patchy`` is handed -- it keys on settlement ids since the ``C####`` ids do not
+    # exist when narrations are drafted. The two counts are equal today (one credit per
+    # settlement; ``settlements_without_credit`` is never populated), so this reads the same
+    # either way -- but if a later flag ever settles without crediting, a masked settlement with
+    # no credit makes the realised count fall short, and this assertion firing with both numbers
+    # printed is the correct outcome rather than a spurious one.
+    population = len(story.settlements)
+    expected = max(1, min(round(population * UTR_PATCHY_SHARE), population - 1))
+    _require(
+        len(masked) == expected,
+        "I19",
+        f"{len(masked)} credit(s) lost their narration tail against the {expected} that "
+        f"UTR_PATCHY_SHARE={UTR_PATCHY_SHARE} allocates over {population} settlement(s) "
+        f"({len(story.credits)} credit(s)). "
+        f"The mask is allocated by count over a sorted id list precisely so the realised share "
+        f"is exact rather than wobbling seed to seed, so a mismatch means the draw and the "
+        f"constant disagree about the population",
+    )
+
+    # Assertion 2: decision 8. The settlement's own UTR must survive, on every settlement --
+    # not only the masked ones, since it is the answer key's evidence for the whole file.
+    blank = [s.settlement_id for s in story.settlements if not s.utr]
+    _require(
+        not blank,
+        "I19",
+        f"{len(blank)} settlement(s) carry an empty utr under --utr-patchy: {blank[:5]}. This "
+        f"flag strips the BANK STATEMENT's copy of the reference (decision 8), never "
+        f"settlements.csv's column -- truth marks an FX or reserved row resolvable=true on the "
+        f"strength of that column surviving, so stripping it makes the answer key a false "
+        f"statement about its own data. Settlement.utr defaults to '' and __post_init__ does "
+        f"not check it, so nothing else here would catch this",
+    )
+
+    # Assertion 3: the masked rows are indistinguishable from noise *by shape*. The one that
+    # keeps WRONG_IGNORE == 0 an honest measurement rather than a report of visibility.
+    producible = gateway_plausible_forms()
+    unproducible = [c.credit_id for c in masked if c.narration not in producible]
+    _require(
+        not unproducible,
+        "I19",
+        f"{len(unproducible)} masked narration(s) are not byte-producible as a "
+        f"gateway_plausible noise row: {unproducible[:3]} -- e.g. "
+        f"{next((c.narration for c in masked if c.narration not in producible), None)!r}. A "
+        f"naive tail strip leaves a dangling separator that no noise template can render, so a "
+        f"masked genuine credit becomes identifiable by shape alone and WRONG_IGNORE == 0 would "
+        f"pass because the attack was visible rather than because tier1's conjunction holds",
+    )
+
+    # **There is deliberately no "masked rows carry no digit run" assertion here**, and the
+    # reason is kept because the property is real and a reviewer will look for it. It is
+    # unreachable at this point twice over: ``masked`` is *defined* by having no digit run, and
+    # every form in ``producible`` is digit-free, so assertion 3 already excludes the case. A
+    # digit-bearing masked form would need a widened template or mask index -- and that story
+    # cannot be built, because ``config.py``'s self-check asserts the digit-free property over
+    # every (template, spelling, channel) combination at import time. The property is therefore
+    # guarded where it can actually fail, on the constants, exactly as Phase 8 step 2a's deleted
+    # partiality assertion was relocated. A real property guarded where its violation is
+    # unreachable is decoration that reads as coverage.
+
+
 def check_int_money(values: dict[str, object]) -> None:
     """I5 — every monetary value is an ``int`` (trap 9).
 
@@ -1438,6 +1625,14 @@ def check_story(
     # decomposition is the only place it exists. I16 independently checks these terms against
     # the per-credit shortfall, so this sum cannot quietly agree with a wrong attribution.
     reserve_cells = [c.decomposition.reserve_paise for c in credits]
+    # Phase 8 step 2b. Sourced from truth's decomposition like the refund and the reserve, and
+    # for the reserve's reason taken one step further: a refund is declared in ``refunds.csv`` and
+    # a reserve is at least *locatable* (the credit visibly falls short of a declared net), while
+    # a rate movement hides inside a gross the matcher reads as authoritative. Nothing in the
+    # three input files says the recorded gross is stale, so truth's decomposition is the only
+    # record of this term anywhere -- which is exactly why it cannot be re-derived from the files
+    # (that would make the assertion ``net == net``) and why it must come from here.
+    fx_cells = [c.decomposition.fx_paise for c in credits]
     # The never-settled term (``--unsettled``, Phase 7). Sourced from the payments rather than
     # from any settlement or credit, because that is the whole point of an orphan: **no
     # settlement and no credit mentions it at all**, so there is no cell anywhere downstream to
@@ -1459,11 +1654,13 @@ def check_story(
         refund_cells,
         reserve_cells,
         unsettled_cells,
+        fx_cells=fx_cells,
         fees_on=cfg.flags.fees,
         tds_on=cfg.flags.tds,
         refunds_on=cfg.flags.netted_refunds,
         reserve_on=cfg.flags.reserve,
         unsettled_on=cfg.flags.unsettled,
+        fx_on=cfg.flags.fx,
     )
     # I15 — the refund term is not merely *a* number that balances: every refund in the file
     # is accounted for exactly once, and each settlement's term equals the refunds truly
@@ -1486,15 +1683,28 @@ def check_story(
     # a check brings the check that replaces it. Runs after I17 because both read
     # ``story``-level populations and I17's are the payments; nothing here depends on its result.
     check_noise(story, cfg)
+    # I19 — the credits whose bank narration lost its reference tail. Fifth in the same pattern,
+    # with one difference stated in its docstring: ``--utr-patchy`` suspends nothing, so this is
+    # not a successor to a stood-down check. It runs after I18 because both reason about what a
+    # bank row offers a matcher, and I19's central assertion is that a masked genuine row is
+    # indistinguishable *from* an I18 noise row -- the two share one vocabulary
+    # (``gateway_plausible_forms``) so they cannot drift about what that means.
+    check_utr_patchy(story, cfg)
     # Per settlement, the refund term truth attributes to it. Sourced from the credits rather
     # than from a settlement column because ``settlements.csv``'s header is frozen (I9): a
     # netted refund is declared in ``refunds.csv`` and attributed by truth, which is exactly
     # the position the matcher is in. I15 independently checks that these terms equal the
     # refunds each credit cites, so this sum cannot quietly agree with a wrong attribution.
     refunds_of_settlement: dict[str, int] = defaultdict(int)
+    # Phase 8 step 2b, built the same way and from the same source for the same reason. Kept as a
+    # separate map rather than folded into the refund term: they fall on opposite sides of the
+    # arithmetic (a refund is subtracted, a rate movement is added and signed), so combining them
+    # would let one hide a wrong sign in the other.
+    fx_of_settlement: dict[str, int] = defaultdict(int)
     for c in credits:
         for sid in c.settlement_ids:
             refunds_of_settlement[sid] += c.decomposition.refunds_paise
+            fx_of_settlement[sid] += c.decomposition.fx_paise
     check_settlement_arithmetic(
         [
             (
@@ -1505,6 +1715,7 @@ def check_story(
                 s.gst_paise,
                 s.tds_paise,
                 refunds_of_settlement[s.settlement_id],
+                fx_of_settlement[s.settlement_id],
             )
             for s in settlements
         ]
@@ -2764,9 +2975,22 @@ if __name__ == "__main__":
     )
 
     # Mutant 3 -- the same leak in the other column. Measured separately rather than assumed to
-    # behave like ``status``: ``currency`` is read by no other check in this file (``--fx`` is
-    # unimplemented), so this mutant proves assertion 4's second half is load-bearing *now*
-    # rather than becoming decoration the day --fx starts moving that column.
+    # behave like ``status``, and it proves assertion 4's second half is reachable and fires.
+    #
+    # **Phase 8 step 3: this mutant's original justification has expired, and the mutant is still
+    # fine.** It used to read "``currency`` is read by no other check in this file (``--fx`` is
+    # unimplemented) ... rather than becoming decoration the day --fx starts moving that column."
+    # That day is here. The prediction was half right: the mutant does *not* go vacuous, because
+    # ``uns`` is built without ``--fx``, so every payment is INR, a USD orphan is the sole USD
+    # holder, and the subset genuinely fails.
+    #
+    # What it cannot do is the thing that now matters. With one currency in the file, assertion
+    # 4's real rule (``orphan_currencies <= settled_currencies``) and a crude "an orphan must
+    # carry the home currency" whitelist agree on **every** input, so this mutant fires under
+    # both. While ``--fx`` was unimplemented that was harmless -- no legal run had a second
+    # currency. Now one does, and the two rules come apart in the direction a negative mutant
+    # cannot see: a whitelist would reject *legitimate* data. Hence the positive control below,
+    # which is the half a mutant cannot supply.
     must_fail(
         "I17",
         dataclasses.replace(
@@ -2778,6 +3002,54 @@ if __name__ == "__main__":
         ),
         uns_cfg,
     )
+
+    # **The positive control mutant 3 cannot supply: assertion 4 must ACCEPT a legal foreign
+    # orphan.** A foreign orphan alongside at least one *settled* foreign payment satisfies the
+    # subset and must pass -- while an "an orphan must carry the home currency" whitelist would
+    # reject it. That configuration is the only one separating the two rules, and it became
+    # constructible only now that ``--fx`` can put a second currency in the file. Every negative
+    # mutant in this cluster fires under both rules, so no number of them closes this gap.
+    #
+    # **Measured rather than assumed** (`.plan/probe_phase8_fx_suspensions.py`): the coexistence is
+    # reachable from n=20 up -- 9/100 seeds at n=20, 6/100 at n=60, 29/100 at n=200 -- and
+    # **unreachable at n=12**, where a foreign orphan occurs on 9/100 seeds but never beside a
+    # settled foreign one. That small-n regime is exactly where I17 fires *legitimately*, so this
+    # control pins n=60 seed 10 (1 foreign orphan, 4 settled foreign) rather than a smaller
+    # fixture. Same trade gate 11's sizes make: fragile to a seed change, never vacuous.
+    # Built directly, not through the ``IMPLEMENTED`` seam: step 8 landed ``fx``, so ``GenConfig``
+    # accepts it from any caller. The ``try/finally`` patch this carried is **deleted rather than
+    # left as a no-op** -- adding a name already in the set guards nothing while reading as
+    # load-bearing to the next maintainer, which is the same "decoration that looks like
+    # coverage" this module keeps deleting. Same treatment I18's fixtures got when
+    # ``noise_rows`` landed.
+    _fxu_cfg = GenConfig(seed=10, n=60, flags=MessFlags(fx=True, unsettled=True))
+    _fxu = build(_fxu_cfg)
+    # Local import, deliberately. ``HOME_CURRENCY`` stays out of this module's import block
+    # because assertion 4 is currency-*agnostic* -- it compares two sets and names no currency --
+    # and a constant in scope is a constant a future edit can turn the check into a whitelist
+    # against. The self-check may read it; the checks may not.
+    from .model import HOME_CURRENCY
+
+    _fxu_foreign = {p.payment_id for p in _fxu.payments if p.currency != HOME_CURRENCY}
+    _fxu_orphans = set(_fxu.unsettled_payment_ids)
+    # The fixture's shape is asserted BEFORE the pass is claimed, because ``check_orphans``
+    # accepts any healthy story: a seed that drifted to zero foreign orphans would leave this
+    # control green while testing nothing at all.
+    assert _fxu_foreign & _fxu_orphans, (
+        f"seed 10/n=60 no longer orphans a foreign payment ({len(_fxu_foreign)} foreign, "
+        f"{len(_fxu_orphans)} orphans), so this control can no longer separate assertion 4's "
+        f"subset rule from an 'orphans must be INR' whitelist -- re-measure, do not delete"
+    )
+    assert _fxu_foreign - _fxu_orphans, (
+        f"seed 10/n=60 has no *settled* foreign payment, so the orphan's currency is unmatched "
+        f"and I17 would fire legitimately here -- this control needs the coexisting case, which "
+        f"is unreachable below n=20"
+    )
+    # Both, and for different reasons: ``check_orphans`` isolates the assertion under test (the
+    # convention the seven shadows below follow), while ``check_story`` proves the configuration
+    # is legal end to end rather than merely acceptable to one function.
+    check_orphans(_fxu, _fxu_cfg)  # must ACCEPT: {INR, USD} orphan side <= settled side
+    check_story(_fxu, _fxu_cfg)
 
     # --- the seven I3/I2 shadows, probed directly -----------------------------
 
@@ -3092,6 +3364,96 @@ if __name__ == "__main__":
             ),
             noise_cfg,
         ),
+    )
+
+    # --- I19: --utr-patchy, the mask on a genuine credit's narration tail -----------------
+    #
+    # **Every mutant below is attributed by MESSAGE, not by code.** ``check_utr_patchy`` raises
+    # one code from four assertions, and ``must_raise`` only proves the probe reached the
+    # function -- exactly the ``I17`` case this module's history records, where a sibling
+    # assertion supplied the same code and two probes turned out to be testing one thing. So
+    # each fixture names wording unique to the branch it targets.
+    #
+    # Built directly, exactly as I18's fixtures are: step 8 landed ``utr_patchy``, so
+    # ``GenConfig`` accepts it from any caller. This carried a ``try/finally`` patch of the
+    # ``IMPLEMENTED`` ClassVar while the flag was still inert, and that patch is **deleted rather
+    # than kept as a no-op** -- re-adding a name the set already holds guards nothing while
+    # reading as load-bearing.
+    _pcfg = GenConfig(seed=42, n=200, flags=MessFlags(utr_patchy=True, noise_rows=True))
+    _pstory = build(_pcfg)
+    _prep = check_story(_pstory, _pcfg)
+    # The flag stands nothing down: it removes evidence from the bank statement without making
+    # any existing claim unverifiable, so I19 is the first check in this family that is not a
+    # successor to a suspension. Pinned so a future edit cannot quietly add one.
+    assert _prep["checks_skipped"] == {"I3.no_orphans": ["noise_rows"]}, (
+        f"--utr-patchy must suspend nothing of its own (only --noise-rows' one entry): "
+        f"{_prep['checks_skipped']}"
+    )
+
+    def must_raise_i19(want: str, what: str, fn) -> None:
+        """Like ``must_raise``, but pins *which* I19 assertion fired by its wording."""
+        try:
+            fn()
+        except InvariantError as e:
+            assert str(e).startswith("I19"), f"{what}: expected I19, got: {e}"
+            assert want in str(e), (
+                f"{what}: I19 fired, but on a different assertion than intended -- wanted "
+                f"wording {want!r}, got: {e}"
+            )
+            fired.append("I19")
+        else:
+            raise AssertionError(f"{what} did not fire")
+
+    _pmasked = [c for c in _pstory.credits if not ids.digit_runs(c.narration)]
+    assert _pmasked, "the I19 fixture story has no masked credit, so every mutant below is moot"
+
+    def _pcredits(rows):
+        return dataclasses.replace(_pstory, credits=rows)
+
+    def _premask(i: int, narration: str):
+        """Rewrite one *masked* credit's narration, leaving every other row alone."""
+        rows = list(_pstory.credits)
+        j = rows.index(_pmasked[i])
+        rows[j] = dataclasses.replace(rows[j], narration=narration)
+        return _pcredits(rows)
+
+    # Assertion 1's flag-off half: a tail-less credit on a run that never asked for one. This is
+    # what makes I19 a total check rather than one that only runs on the messy path.
+    must_raise_i19(
+        "without --utr-patchy", "masked rows with the flag off",
+        lambda: check_utr_patchy(_pstory, GenConfig(seed=42, n=200)),
+    )
+
+    # Assertion 1's count half. Restoring a tail on one masked row leaves the realised count one
+    # short of what the constant allocates.
+    must_raise_i19(
+        "UTR_PATCHY_SHARE", "one masked row given its tail back",
+        lambda: check_utr_patchy(_premask(0, "NEFT-RAZORPAYSOFT-XXXX4471"), _pcfg),
+    )
+
+    # Assertion 2: decision 8. The settlement's own UTR is the answer key's evidence, and
+    # ``Settlement.utr`` defaults to ``""`` with no model-level check, so this is reachable by a
+    # one-field edit and nothing else in the codebase would notice.
+    must_raise_i19(
+        "empty utr", "a settlement stripped of its utr",
+        lambda: check_utr_patchy(
+            dataclasses.replace(
+                _pstory,
+                settlements=[dataclasses.replace(_pstory.settlements[0], utr="")]
+                + list(_pstory.settlements[1:]),
+            ),
+            _pcfg,
+        ),
+    )
+
+    # Assertion 3, and the mutant is the real defect rather than an invented one: this is what a
+    # naive digit-strip of template 1 actually produces. It carries no digit run, so it stays in
+    # the masked set and assertion 1's count still passes -- which is what makes assertion 3
+    # reachable at all. I18's assertion-14 discipline: the mutant has to survive the checks above
+    # it, or the assertion it targets is unreachable decoration.
+    must_raise_i19(
+        "not byte-producible", "a masked row a noise template cannot render",
+        lambda: check_utr_patchy(_premask(0, "NEFT CR/RAZORPAYSOFT/"), _pcfg),
     )
 
     # Counted, not written down: the literal "6" here went stale the moment Phase 4

@@ -173,6 +173,53 @@ RESERVE_BPS_BAND: tuple[int, int] = (500, 2_000)
 #: ``MEMBERSHIP_UNDECLARED``, which fails the acceptance gates rather than costing coverage.
 UNSETTLED_SHARE = 0.02
 
+#: Payments captured in a foreign currency (``--fx``, Phase 8), as a share of ``n``.
+#:
+#: 8% rather than a smaller fringe, and the reason is I17 rather than realism. ``--fx`` and
+#: ``--unsettled`` draw independently (decision 7 and ``story._draw_fx``), so an orphan can
+#: land on a foreign payment by coincidence -- and I17 asserts
+#: ``orphan_currencies <= settled_currencies``, which fails the moment *every* holder of some
+#: currency is an orphan. At this share n=60 draws ~5 foreign payments against ~1 orphan, so
+#: the failure needs all five to be orphaned at once. The margin is what makes the interaction
+#: safe; it is **not** safe by construction, which is why step 4 measures it rather than
+#: assuming it (`.plan/phase8.md` trap 2, third bullet, predicts this from the other side).
+FX_SHARE = 0.08
+
+#: The foreign currencies drawn from -- **one**, and the single element is a decision.
+#:
+#: A wider tuple multiplies I17's coincidence rather than adding realism: with four currencies
+#: over ~5 foreign payments most currencies have exactly one holder, and orphaning that holder
+#: fires I17 legitimately -- roughly 8% of ``--fx --unsettled`` runs at n=60, by the arithmetic
+#: above. One currency needs only one *settled* holder to satisfy the subset, which the share
+#: above makes near-certain.
+#:
+#: It also keeps the flag honest about what it is. Decision 8: the mess is the undeclared
+#: **movement** of a rate between capture and settlement, not a currency portfolio -- a rate
+#: table is a rate the matcher can subtract, which closes the gap by construction. A single
+#: foreign currency carries the movement with nothing extra to declare.
+#:
+#: Widening this re-opens the I17 coincidence and needs re-measuring, not interpolating --
+#: the same coupling ``UNSETTLED_SHARE`` documents against ``MAX_POOL``.
+FX_CURRENCIES: tuple[str, ...] = ("USD",)
+
+#: How far the rate moves between capture and settlement, in basis points of the recorded gross,
+#: as an unsigned magnitude. The **sign is drawn separately**, because a rate moves both ways and
+#: a one-directional flag would let a matcher close the gap by always guessing the same way.
+#:
+#: 10-200 bps over a T+2 window is the realistic span for USD/INR, and the bound that matters is
+#: the lower one: the move has to be unmistakably larger than the arithmetic it must not be
+#: confused with. The largest rounding divergence this generator produces is **1-2 paise** on a
+#: settlement (measured, see ``story._batch_net``), and the smallest gross in ``AMOUNT_BANDS`` is
+#: 10,000p -- so 10 bps on the smallest row is 10p, an order of magnitude above the rounding
+#: floor. Below that the FX gap would be indistinguishable from a fee-model rounding slip, and
+#: truth would be asserting a mess the inputs cannot support. Same standard as
+#: ``RESERVE_BPS_BAND``'s 100 bps floor, at a tenth the size because this term is not competing
+#: with a diagnostic band.
+#:
+#: The ceiling is bounded by what keeps a settlement's net positive after every deduction: at
+#: 200 bps down against ~236 bps of fee plus GST, a settlement still pays out ~95% of its gross.
+FX_BPS_BAND: tuple[int, int] = (10, 200)
+
 #: Bank rows that are **not gateway money at all** (``--noise-rows``, Phase 7), as a share of
 #: the gateway credits a run produces. A real statement carries the business's whole banking
 #: life; the reconciler's first job is deciding which rows are even in scope.
@@ -294,6 +341,49 @@ COUNTERPARTY = "RAZORPAYSOFT"
 COUNTERPARTY_SPACED = "RAZORPAY SOFTWARE"
 COUNTERPARTY_SHORT = "RZRPAY"
 
+#: Which counterparty spelling each ``NARRATION_TEMPLATES`` entry carries, by index. Declared
+#: rather than parsed back out of the rendered string: ``--utr-patchy`` has to re-render a
+#: narration in a *different* template while keeping this row's spelling, and recovering the
+#: spelling from the output would mean matching "RAZORPAYSOFT" inside "RAZORPAY SOFTWARE" --
+#: a prefix relation that ``normalize.py`` already documents as an ordering trap. The
+#: self-check below asserts this against what the templates actually render, so the two cannot
+#: drift.
+NARRATION_SPELLINGS: tuple[str, ...] = (
+    COUNTERPARTY,         # {channel}-{counterparty}-XXXX{tail}
+    COUNTERPARTY_SPACED,  # {channel} CR/{counterparty_spaced}/{tail}
+    COUNTERPARTY,         # {channel}/{counterparty}/XXXX{tail}/SETTLEMENT
+    COUNTERPARTY_SHORT,   # {channel}-{counterparty_short}-{tail}
+)
+
+#: Share of **gateway** credits whose bank narration loses its reference tail. ``--utr-patchy``,
+#: Phase 8 decision 8: the *narration's* tail, never ``settlements.csv``'s ``utr`` column, whose
+#: survival is what makes truth's ``resolvable: true`` claim honest for an FX or reserved row.
+#:
+#: 0.15 rather than something smaller because this flag's entire purpose is to attack
+#: ``WRONG_IGNORE``, and the attack has to land on enough rows to be a test: at the ``n=60``
+#: default that is ~9 credits, and at ``n=200`` batched (~125 credits) about 19. Partial for the
+#: reason every share here is partial -- a run where *every* genuine credit lost its tail would
+#: not distinguish a matcher that reads the counterparty from one that had simply stopped
+#: ignoring anything.
+UTR_PATCHY_SHARE = 0.15
+
+#: Genuine template index -> the ``gateway_plausible`` noise template that masks it.
+#:
+#: **The mapping exists because deleting the digits is not safe, and that is measured.** A naive
+#: strip of the 4-digit tail leaves ``NEFT CR/RAZORPAYSOFT/``, ``NEFT-RZRPAY-`` and
+#: ``NEFT/RAZORPAYSOFT/XXXX/SETTLEMENT`` -- and **3 of those 4 shapes are not producible by any
+#: noise row**, because ``gateway_plausible``'s templates end in ``XXXX``, ``REF`` or
+#: ``SETTLEMENT`` and never in a dangling separator. A masked genuine credit would then be
+#: identifiable *by shape alone*, so ``WRONG_IGNORE == 0`` would pass because the attack was
+#: visible rather than because decision 4's conjunction holds. That is I12's warning about
+#: absence-of-tail becoming "a tell unique to planted rows", arriving on a different flag.
+#:
+#: So a masked row is **re-rendered** into the noise vocabulary, keeping its own channel and its
+#: own spelling. Deterministic in the template index, so masking consumes no extra draw and
+#: ``rng.py`` rule 2 is unaffected. The self-check asserts every masked form is byte-producible
+#: as ``gateway_plausible`` noise, over every (template, spelling, channel) combination.
+UTR_PATCHY_MASK: tuple[int, ...] = (0, 1, 2, 0)
+
 
 @dataclass(frozen=True)
 class MessFlags:
@@ -315,7 +405,7 @@ class MessFlags:
     fx: bool = False                       # Phase 8  rate moves between capture/settle
     rounding_edge: bool = False            # Phase 8  fee x GST on a half-paisa
     settlement_report_late: bool = False   # Phase 8  withhold settlement_items.csv
-    utr_patchy: bool = False               # Phase 8  UTR missing/truncated on some rows
+    utr_patchy: bool = False               # Phase 8  UTR gone from bank narration
 
     #: Flags whose data generation is actually implemented in ``story.py``.
     #:
@@ -388,9 +478,26 @@ class MessFlags:
     #: invokes the generator as a **subprocess** and can patch nothing, so the declaration has to
     #: precede it regardless -- and the rule step 1 already recorded is the same one: a flag
     #: enters this set in the step that lands its generator code. Step 4 landed it.
+    #: **Phase 8 step 8 added ``fx`` and ``utr_patchy``, and the order was the discipline
+    #: above.** Both were read by ``story.py`` and checked by an invariant on both passes
+    #: before their names appeared here: ``fx`` in step 2b (the currency column, the signed
+    #: rate shift on its own substream, ``Decomposition.fx_paise``, I4 threaded through all
+    #: four call sites) and ``utr_patchy`` in step 6 (``_draw_utr_patchy``, the re-render into
+    #: the noise vocabulary, I19 in ``invariants.py`` *and* ``verify_output.py``). Until this
+    #: edit every probe that needed either flag patched this ClassVar in-process under
+    #: ``try/finally``, which is the visible cost of keeping declaration last -- and the right
+    #: cost, because the alternative is a run labelled with a mess it does not have.
+    #:
+    #: ``rounding_edge`` is the only name left out, and it is left out **permanently**: Phase 8
+    #: declines it (`.plan/phase8.md` §1(d)). That is what keeps the declared-but-inert refusal
+    #: and the seam probe below it honest -- both need a flag that is genuinely inert, and a
+    #: seam whose last subject lands is a seam that tests nothing. The self-check does not rely
+    #: on that decision holding, though: it manufactures the condition from a *landed* flag as
+    #: well, so revisiting the decline cannot quietly empty the check.
     IMPLEMENTED: ClassVar[frozenset[str]] = frozenset(
         {"settlement_delay", "fees", "dup_amounts", "batching", "settlement_report_late",
-         "tds", "netted_refunds", "reserve", "unsettled", "noise_rows"}
+         "tds", "netted_refunds", "reserve", "unsettled", "noise_rows",
+         "fx", "utr_patchy"}
     )
 
     @classmethod
@@ -408,6 +515,68 @@ class MessFlags:
     @classmethod
     def all_on(cls) -> MessFlags:
         return cls(**{n: True for n in cls.names()})
+
+    #: The flag pairs ``GenConfig.__post_init__`` refuses, as data.
+    #:
+    #: Declared because ``--all-mess`` has to *compute* a set the config will accept, and the
+    #: only alternative is a hardcoded "drop ``dup_amounts``" that goes stale the moment a
+    #: fifth rule lands -- silently, since the switch would still run and still look maximal.
+    #:
+    #: **This is an index of the four refusal sites below, never a second source of truth for
+    #: them.** Each refusal's message and its argument stay at the ``if`` site; this table
+    #: carries only the pair. The self-check asserts the two agree in *both* directions, which
+    #: is the whole reason the split is safe: a table entry with no matching refusal fails, and
+    #: a refusal with no matching entry fails too, because the reduced set stops constructing.
+    EXCLUSIVE_PAIRS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("dup_amounts", "batching"),
+        ("dup_amounts", "netted_refunds"),
+        ("dup_amounts", "reserve"),
+        ("dup_amounts", "fx"),
+    )
+
+    @classmethod
+    def composable(cls) -> tuple[MessFlags, list[tuple[str, str]]]:
+        """The largest flag set this config accepts, plus what it dropped and why.
+
+        Backs ``--all-mess``. Two kinds of drop, and the caller prints both: a flag that is
+        declared but inert (``story.py`` does not read it, so the run would be labelled with
+        a mess it does not have), and a flag that cannot compose with others.
+
+        **Which side of a conflict gets dropped is chosen by degree, not by name.** All four
+        pairs today share ``dup_amounts``, so dropping that one flag keeps eleven where
+        dropping the other side of each pair would keep eight. Spelling that as "drop
+        ``dup_amounts``" would have been shorter and would have been a hardcode; the loop
+        picks the flag appearing in the most unresolved pairs, breaking ties alphabetically so
+        the switch's meaning is deterministic.
+
+        Greedy max-degree is exact on a star-shaped table like today's, and only a heuristic
+        in general -- a future table could make it keep fewer flags than the optimum. It
+        cannot make it keep an *invalid* set, which is the property that matters here, and the
+        self-check asserts that by constructing the result.
+        """
+        keep = set(cls.IMPLEMENTED)
+        dropped = [
+            (n, "declared but not implemented -- story.py does not read it, so the run would "
+                "be labelled with a mess it does not have")
+            for n in cls.unimplemented()
+        ]
+        while True:
+            live = [(a, b) for a, b in cls.EXCLUSIVE_PAIRS if a in keep and b in keep]
+            if not live:
+                break
+            degree: dict[str, int] = {}
+            for pair in live:
+                for name in pair:
+                    degree[name] = degree.get(name, 0) + 1
+            victim = min(degree, key=lambda n: (-degree[n], n))
+            keep.discard(victim)
+            partners = sorted({a if b == victim else b for a, b in live if victim in (a, b)})
+            dropped.append((
+                victim,
+                "cannot be combined with "
+                + ", ".join(f"--{p.replace('_', '-')}" for p in partners),
+            ))
+        return cls(**{n: True for n in sorted(keep)}), dropped
 
     def any_on(self) -> bool:
         return any(getattr(self, n) for n in self.names())
@@ -720,6 +889,39 @@ class GenConfig:
                 "claim resolvable=false about data that is separable. Run them separately; "
                 "gate 11 covers the planted rows and gate 13 covers the reserve."
             )
+        # The **fourth** instance of one hazard, and it was found by measurement rather than
+        # predicted (`.plan/probe_phase8_fx_suspensions.py`, Phase 8 step 2). Batching makes a
+        # planted member's net a sum, a netted refund moves it, a reserve moves its credit -- and
+        # a rate movement moves it too. Every one of them ends with the pair no longer sharing an
+        # amount, so ``resolvable=false`` becomes a false statement about separable data.
+        #
+        # **Refused rather than suspended, for two measured reasons.** I12's own message says the
+        # planted count is the denominator of the ``correct_abstention`` rate, so standing it down
+        # would silently rescale this project's central claim -- the one thing the whole
+        # suspension discipline exists to prevent. And the failure is *probabilistic*: 15 of 30
+        # seeds fail at n=200 and 12 of 30 at n=60, with seed 42 passing at n=60 and failing at
+        # n=200. A combination that works on half the seeds is worse than one that never works,
+        # because a reviewer sees a pass and a judge's seed sees the truth.
+        #
+        # Note which direction was measured and found empty: across every *passing* seed, no
+        # surviving pair held a foreign member. So ``--fx`` never manufactures a spurious
+        # collision -- it only destroys planted ones, and the seeds that pass are those where the
+        # draw happened to miss both pairs. That is why this is an exclusivity rather than a
+        # widened I12.
+        #
+        # Consequence for `.plan/phase8.md` §1(e): the maximal legal set is unchanged at eleven
+        # flags, because ``dup_amounts`` was already outside it. This makes its exclusion rest on
+        # four reasons instead of three, which is a strengthening rather than a new restriction.
+        if self.flags.dup_amounts and self.flags.fx:
+            raise ValueError(
+                "--dup-amounts and --fx cannot be combined: a rate movement on one member of a "
+                "planted pair moves its net away from its partner's, so the pair stops sharing "
+                "an amount and stops being unresolvable -- truth would then claim "
+                "resolvable=false about data that is separable. Measured at 15/30 seeds failing "
+                "I12 at n=200 (12/30 at n=60), which makes it worse than a clean refusal: it "
+                "passes often enough to look fine. Run them separately; gate 11 covers the "
+                "planted rows and gate 15 covers the FX rows."
+            )
         if self.flags.settlement_report_late and self.n < 2:
             raise ValueError(
                 f"--settlement-report-late needs at least 2 settlements so that the "
@@ -827,13 +1029,20 @@ if __name__ == "__main__":
     # automatically instead of going stale.
     assert MessFlags().declared_but_inert() == []
     # Phase 6 step 6 landed ``netted_refunds``, so the inert probe moved to a Phase 7 flag; Phase
-    # 7 step 4 landed *that* one (``noise_rows``), so it moves again -- now to ``fx``, which
-    # Phase 8 will land. Moved rather than deleted, for the reason the seam probe below carries:
-    # the moment this names a flag that *is* implemented, it asserts nothing at all.
-    assert MessFlags(fx=True).declared_but_inert() == ["fx"]
+    # 7 step 4 landed *that* one (``noise_rows``), so it moved to ``fx`` -- and Phase 8 step 8
+    # has now landed both ``fx`` and ``utr_patchy``, so it moves a fourth time. Moved rather than
+    # deleted, for the reason the seam probe below carries: the moment this names a flag that
+    # *is* implemented, it asserts nothing at all.
+    #
+    # ``rounding_edge`` is where it stops moving, because Phase 8 **declines** that flag
+    # (`.plan/phase8.md` §1(d)) rather than deferring it -- so unlike its four predecessors this
+    # subject is not scheduled to land. The synthetic guard further down no longer depends on
+    # that: it manufactures an inert flag out of a *landed* one, so this check keeps a real
+    # subject even if the decline is revisited.
+    assert MessFlags(rounding_edge=True).declared_but_inert() == ["rounding_edge"]
     for _landed in ("settlement_delay", "fees", "dup_amounts", "batching",
                     "settlement_report_late", "tds", "netted_refunds", "reserve",
-                    "unsettled", "noise_rows"):
+                    "unsettled", "noise_rows", "fx", "utr_patchy"):
         assert _landed not in MessFlags.unimplemented()
         assert MessFlags(**{_landed: True}).declared_but_inert() == [], (
             f"{_landed} is implemented, so it must not be reported inert"
@@ -926,26 +1135,83 @@ if __name__ == "__main__":
 
     # The IMPLEMENTED seam still works for a flag no phase has landed yet. This probe was
     # written against ``batching``; Phase 5 landed it, so the probe moved to
-    # ``netted_refunds`` (Phase 6), then to ``noise_rows``, and Phase 7 step 4 landed that one
-    # -- so it now names ``fx``. Never deleted: the seam has to keep working for as long as
-    # *any* flag is still declared and inert, and the moment it tests a landed flag it tests
-    # nothing. Move it again when Phase 8 lands ``fx``; ``rounding_edge`` and ``utr_patchy``
-    # are the two left after that.
+    # ``netted_refunds`` (Phase 6), then to ``noise_rows`` (Phase 7 step 4), then to ``fx`` --
+    # and Phase 8 step 8 landed both ``fx`` and ``utr_patchy``, so it moves a fourth time, to
+    # ``rounding_edge``. Never deleted: the seam has to keep working for as long as *any* flag
+    # is declared and inert, and the moment it tests a landed flag it tests nothing.
     _original = MessFlags.IMPLEMENTED
     try:
-        MessFlags.IMPLEMENTED = _original | {"fx"}
-        assert MessFlags(fx=True).declared_but_inert() == []
-        assert GenConfig(flags=MessFlags(fx=True)).resolved()["flags_enabled"] == ["fx"]
+        MessFlags.IMPLEMENTED = _original | {"rounding_edge"}
+        assert MessFlags(rounding_edge=True).declared_but_inert() == []
+        assert GenConfig(
+            flags=MessFlags(rounding_edge=True)
+        ).resolved()["flags_enabled"] == ["rounding_edge"]
     finally:
         MessFlags.IMPLEMENTED = _original
     assert MessFlags.IMPLEMENTED == _original, "the probe must not leak"
-    assert "fx" in MessFlags.unimplemented(), "fx lands in Phase 8"
+    assert "rounding_edge" in MessFlags.unimplemented(), (
+        "Phase 8 declines --rounding-edge (.plan/phase8.md 1(d)), so it stays declared and "
+        "inert -- if it ever lands, the seam probe above needs a new subject and the "
+        "synthetic guard below becomes the only thing testing the refusal"
+    )
+    assert "fx" in MessFlags.IMPLEMENTED, "Phase 8 step 2b implements fx"
+    assert "utr_patchy" in MessFlags.IMPLEMENTED, "Phase 8 step 6 implements utr_patchy"
     assert "noise_rows" in MessFlags.IMPLEMENTED, "Phase 7 step 4 implements noise_rows"
     assert "netted_refunds" in MessFlags.IMPLEMENTED, "Phase 6 step 6 implements netted_refunds"
     assert "batching" in MessFlags.IMPLEMENTED, "Phase 5 step 1 implements batching"
+
+    # --- Phase 8 step 8: trap 1's synthetic guard ------------------------------
+    #
+    # **Everything above this point depends on some flag still being unimplemented, and that
+    # is a shrinking resource.** With ``fx`` and ``utr_patchy`` landed, exactly one name is
+    # left, and it is left only because Phase 8 *declined* it. Trap 1 in the phase-8 explainer
+    # is precisely this: when the last flag lands, ``unimplemented()`` empties, the refusal
+    # loop above iterates **zero times**, and the inert assertion has no subject -- the whole
+    # mechanism goes green while testing nothing, which is the vacuous-pass class Phase 7's
+    # commit named in its own subject line.
+    #
+    # So the refusal is tested against a flag manufactured inert by *removing a landed one*
+    # from the set. That inverts the dependency: instead of needing a flag nobody has built,
+    # the guard needs a flag somebody **has** built, and there will only ever be more of those.
+    # ``fees`` is the subject because it is the oldest landed flag and the least likely to be
+    # renamed, and it is restored in ``finally`` so a failure here cannot leave the seam open
+    # for the checks below.
+    #
+    # This is what makes the ``rounding_edge`` assertions above insurance rather than
+    # load-bearing: revisiting the decline would cost the seam its subject and cost nothing
+    # else, because the refusal mechanism is verified here without reference to it.
+    _synthetic = MessFlags.IMPLEMENTED
+    try:
+        MessFlags.IMPLEMENTED = frozenset(_synthetic - {"fees"})
+        assert MessFlags(fees=True).declared_but_inert() == ["fees"], (
+            "a flag absent from IMPLEMENTED must report as inert regardless of whether "
+            "story.py can in fact read it -- the set is the declaration, not the code"
+        )
+        try:
+            GenConfig(flags=MessFlags(fees=True))
+        except ValueError as _e:
+            assert "--fees" in str(_e), f"the refusal must name the switch: {_e}"
+        else:
+            raise AssertionError(
+                "GenConfig accepted a flag missing from IMPLEMENTED, so the declared-but-inert "
+                "refusal does not actually gate on that set -- every 'flag is refused' "
+                "assertion above would then be passing for an unrelated reason"
+            )
+    finally:
+        MessFlags.IMPLEMENTED = _synthetic
+    assert MessFlags.IMPLEMENTED == _synthetic, "the synthetic guard must not leak"
+    assert MessFlags(fees=True).declared_but_inert() == [], (
+        "fees must be back in IMPLEMENTED after the guard -- a leaked patch here would "
+        "refuse every --fees run in this process"
+    )
+
+    # Kept, and now with a successor that survives it emptying: the assertions above this line
+    # need a genuinely inert flag, the guard below it does not.
     assert MessFlags.unimplemented(), (
-        "no flag is unimplemented any more -- the seam above is testing nothing, and the "
-        "declared-but-inert refusal in GenConfig has no case left to catch"
+        "no flag is unimplemented any more -- the seam probe above is testing nothing, and "
+        "the declared-but-inert refusal loop iterates zero times. The synthetic guard above "
+        "still covers the refusal itself, so this is a signal to move the seam probe's "
+        "subject rather than a broken invariant"
     )
     # --- Phase 5 step 1: the batch size distribution --------------------------
     # Shape, never the exact weights: the weights are a tuning choice and pinning them would
@@ -987,6 +1253,43 @@ if __name__ == "__main__":
     # well under 100% of a net -- a reserve at or above the net would drive a credit to zero
     # or below, which ``Credit.__post_init__`` refuses.
     assert 0 < RESERVE_SHARE < 1, "the reserve share must be a genuine fraction"
+
+    # --- Phase 8 step 2a: the FX share --------------------------------------
+    # Imported **locally**, not at module scope. ``config.py`` has no package-level imports at
+    # all -- it is the bottom of this package's dependency order, and ``model.py`` reaches *up*
+    # to it (for ``IST``, inside its own self-check). A module-level ``from .model import ...``
+    # here would invert that for the sake of one assertion and put the two files one edit away
+    # from a genuine cycle. The local import keeps the layering and still lets the constants be
+    # compared, which is the whole point: ``HOME_CURRENCY`` and ``FX_CURRENCIES`` live in
+    # different files precisely because one is a fact about the entities and the other is a
+    # tuning choice, and nothing else checks that they disagree.
+    from .model import HOME_CURRENCY
+    # **This is where partiality is actually guarded, and finding that out took a mutation
+    # run.** ``story.py``'s self-check asserts both "the count is the clamp" and "the share is
+    # partial", and the second is decoration *there*: both re-derive from the same clamp, so any
+    # mutation of ``k`` trips the count assertion first and the partiality assertion can never
+    # fire (measured, `.plan/probe_phase8_fx_column_mutants.py`). The property survives only if
+    # the constant itself is constrained, which is what this line does -- the same job
+    # ``RESERVE_SHARE``'s assertion above has always done for the reserve.
+    assert 0 < FX_SHARE < 1, "the FX share must be a genuine fraction"
+    # A run where every payment were foreign could not distinguish an FX-aware matcher from one
+    # that had widened its tolerance until everything fit, and at n=60 a share above ~0.5 starts
+    # making "the foreign rows" and "most rows" the same set. Loose ceiling, not a tuning pin.
+    assert FX_SHARE < 0.5, "the foreign share must stay a minority of the file"
+    assert FX_CURRENCIES, "--fx needs at least one foreign currency to assign"
+    assert HOME_CURRENCY not in FX_CURRENCIES, (
+        "the home currency is not a foreign currency: a payment 'moved' to INR would be "
+        "labelled as carrying an FX gap while its rate never moved"
+    )
+    assert len(set(FX_CURRENCIES)) == len(FX_CURRENCIES), FX_CURRENCIES
+    # Widening this re-opens I17's coincidence -- with one holder per currency, orphaning that
+    # holder fires ``orphan_currencies <= settled_currencies`` legitimately. Not refused, since
+    # a later phase may want the breadth; asserted as a **single** element so widening it is a
+    # deliberate edit here rather than a silent one, and this comment is what it will read.
+    assert len(FX_CURRENCIES) == 1, (
+        "FX_CURRENCIES is deliberately one element -- see its docstring on the I17 "
+        "coincidence, and re-measure --fx --unsettled before widening it"
+    )
     _rlo, _rhi = RESERVE_BPS_BAND
     assert 0 < _rlo <= _rhi < 10_000, RESERVE_BPS_BAND
     # The lower bound is load-bearing rather than cosmetic, and this assertion is what says
@@ -1026,6 +1329,53 @@ if __name__ == "__main__":
         )
     else:
         raise AssertionError("GenConfig accepted --dup-amounts with --reserve")
+    # --dup-amounts + --fx is refused for the same reason as the three above, found by
+    # measurement in Phase 8 step 2 (`.plan/probe_phase8_fx_suspensions.py`): a rate movement on
+    # one member moves its net away from its partner's.
+    #
+    # **Phase 8 step 8 turned this pair of checks inside out, and the reason is worth keeping.**
+    # Until ``fx`` landed, ``MessFlags(dup_amounts=True, fx=True)`` was refused for ``fx`` being
+    # *inert*, not for the exclusivity -- the unimplemented-flag check in ``__post_init__`` runs
+    # before every exclusivity check. So the exclusivity assertion needed the seam patched to be
+    # reachable at all, and a control above it proved the ordering was real rather than assumed.
+    #
+    # Now that ``fx`` is implemented the exclusivity refusal is reachable directly, and it is the
+    # *control* that lost its subject. Both halves are kept, with the patch moved from one to the
+    # other: the exclusivity is tested plainly, and the ordering is tested by manufacturing
+    # inertness -- removing ``fx`` from the set rather than waiting for a flag nobody has built.
+    # Same inversion as the synthetic guard further up, and for the same reason: a check whose
+    # premise is "some flag is still unimplemented" is a check with an expiry date.
+    try:
+        GenConfig(flags=MessFlags(dup_amounts=True, fx=True))
+    except ValueError as e:
+        assert "dup-amounts" in str(e) and "--fx" in str(e), (
+            f"the refusal must name both flags: {e}"
+        )
+    else:
+        raise AssertionError("GenConfig accepted --dup-amounts with --fx")
+    # Each flag alone stays legal, or the refusal is over-broad -- the failure mode a pairwise
+    # check invites is refusing one of its operands outright.
+    assert GenConfig(flags=MessFlags(fx=True)).flags.enabled() == ["fx"]
+    assert GenConfig(flags=MessFlags(dup_amounts=True)).flags.enabled() == ["dup_amounts"]
+    # The ordering control, now synthetic. With ``fx`` withheld from IMPLEMENTED the refusal must
+    # cite inertness and must **not** name ``dup-amounts``: that is what proves the exclusivity
+    # assertion above is testing the exclusivity rule rather than riding on a refusal that would
+    # have happened anyway.
+    _before_dup_fx = MessFlags.IMPLEMENTED
+    try:
+        MessFlags.IMPLEMENTED = frozenset(_before_dup_fx - {"fx"})
+        try:
+            GenConfig(flags=MessFlags(dup_amounts=True, fx=True))
+        except ValueError as e:
+            assert "not implemented" in str(e) and "dup-amounts" not in str(e), (
+                f"the unimplemented check no longer runs first, so the exclusivity assertion "
+                f"above may be passing on the inertness refusal instead: {e}"
+            )
+        else:
+            raise AssertionError("GenConfig accepted a flag missing from IMPLEMENTED")
+    finally:
+        MessFlags.IMPLEMENTED = _before_dup_fx
+    assert MessFlags.IMPLEMENTED == _before_dup_fx, "the dup/fx probe must not leak"
     # And the combination the flag is *designed* to be run in stays legal, or the refusals
     # above have quietly made the deliverable command unrunnable.
     assert GenConfig(
@@ -1045,8 +1395,122 @@ if __name__ == "__main__":
         key=MessFlags.names().index,
     )
 
+    # --- ``--all-mess``: EXCLUSIVE_PAIRS must index the refusals above (Phase 8 step 9) -------
+    # **Forward -- every table entry names a refusal that exists.** A stale entry would make
+    # ``--all-mess`` drop a flag citing a rule that had been lifted. The refusal must name *both*
+    # switches, or the entry could be passing on a different rule (inertness, an ``n`` floor)
+    # while claiming the exclusivity.
+    for _a, _b in MessFlags.EXCLUSIVE_PAIRS:
+        try:
+            GenConfig(n=200, flags=MessFlags(**{_a: True, _b: True}))
+        except ValueError as _e:
+            for _switch in (f"--{_a.replace('_', '-')}", f"--{_b.replace('_', '-')}"):
+                assert _switch in str(_e), (
+                    f"EXCLUSIVE_PAIRS lists ({_a}, {_b}) but the refusal never names {_switch}, "
+                    f"so the entry may be riding on a different rule: {_e}"
+                )
+        else:
+            raise AssertionError(
+                f"EXCLUSIVE_PAIRS lists ({_a}, {_b}) but GenConfig accepts the combination -- "
+                f"the table claims a rule that does not exist, and --all-mess drops a flag for it"
+            )
+    # **Backward -- no refusal is missing from the table.** Asserted by *construction*, the only
+    # form that catches a rule the table has never heard of: a fifth exclusivity landing without
+    # an entry leaves its pair in ``composable()``'s result, and this line stops being able to
+    # build it. Nothing else in this file would notice, and ``--all-mess`` would exit 2 on a set
+    # it had announced one line earlier as the composable one.
+    _keep, _dropped = MessFlags.composable()
+    GenConfig(n=200, flags=_keep)
+    # Every flag is either kept or dropped **with a stated reason**. A flag missing from both
+    # sides is a silent drop, which is the mislabelled-run failure this mechanism exists to stop.
+    assert {_n for _n, _ in _dropped} == set(MessFlags.names()) - set(_keep.enabled()), (
+        f"--all-mess must account for every flag: kept {sorted(_keep.enabled())}, "
+        f"dropped {sorted(_n for _n, _ in _dropped)}"
+    )
+    assert all(_r.strip() for _, _r in _dropped), "a drop with no reason is a silent drop"
+    assert set(MessFlags.unimplemented()) <= {_n for _n, _ in _dropped}, (
+        "an inert flag survived into --all-mess's set, so the run would be labelled with a mess "
+        "story.py does not produce"
+    )
+    # The control that could embarrass the construction check above. With the table emptied,
+    # ``composable()`` must return a set GenConfig *refuses* -- otherwise "it constructs" is
+    # equally consistent with there being no exclusivity rules in this file at all.
+    _before_pairs = MessFlags.EXCLUSIVE_PAIRS
+    try:
+        MessFlags.EXCLUSIVE_PAIRS = ()
+        _naive, _ = MessFlags.composable()
+        try:
+            GenConfig(n=200, flags=_naive)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "with EXCLUSIVE_PAIRS emptied the whole implemented set constructed, so the "
+                "construction check above proves nothing -- it would pass on an empty table"
+            )
+    finally:
+        MessFlags.EXCLUSIVE_PAIRS = _before_pairs
+    assert MessFlags.EXCLUSIVE_PAIRS == _before_pairs, "the EXCLUSIVE_PAIRS control must not leak"
+
     assert sum(w for *_, w in AMOUNT_BANDS) == 100, "amount band weights must sum to 100"
     assert len(NARRATION_TEMPLATES) == 4
+
+    # --- ``--utr-patchy``'s two lookup tables (Phase 8 step 6) ----------------
+    # Both mirror something the templates already state, so what is worth asserting is that
+    # they cannot drift from it -- and the subset property below is checked over every
+    # combination rather than argued, because **3 of the 4 naive digit-strips fail it**.
+    assert len(NARRATION_SPELLINGS) == len(NARRATION_TEMPLATES)
+    assert len(UTR_PATCHY_MASK) == len(NARRATION_TEMPLATES)
+    assert 0 < UTR_PATCHY_SHARE < 1, (
+        "a share that masks every genuine credit would not distinguish a matcher that reads "
+        "the counterparty from one that had simply stopped ignoring anything"
+    )
+    _gp = NOISE_TEMPLATES["gateway_plausible"]
+    _spellings = (COUNTERPARTY, COUNTERPARTY_SPACED, COUNTERPARTY_SHORT)
+    # Every narration a ``gateway_plausible`` NOISE row can emit, over every spelling and
+    # channel. The masked forms must be a subset of this set.
+    _noise_shapes = {
+        _t.format(channel=_c, counterparty=_s, tail="")
+        for _t in _gp
+        for _s in _spellings
+        for _c in BANK_CHANNELS
+    }
+    for _i, _template in enumerate(NARRATION_TEMPLATES):
+        _spelling = NARRATION_SPELLINGS[_i]
+        _rendered = _template.format(
+            channel="NEFT",
+            counterparty=COUNTERPARTY,
+            counterparty_spaced=COUNTERPARTY_SPACED,
+            counterparty_short=COUNTERPARTY_SHORT,
+            tail=4471,
+        )
+        assert _spelling in _rendered, (
+            f"NARRATION_SPELLINGS[{_i}] says {_spelling!r} but template {_i} renders "
+            f"{_rendered!r} -- masking would re-render the row under a spelling it never "
+            f"carried, which changes the counterparty a matcher reads"
+        )
+        # And not a *longer* spelling as well: if the declared one is a substring of the real
+        # one, masking would silently shorten the counterparty. ``normalize.py`` documents the
+        # same prefix trap from the parsing side.
+        assert not [
+            _s for _s in _spellings if _s in _rendered and len(_s) > len(_spelling)
+        ], f"template {_i} carries a longer spelling than NARRATION_SPELLINGS[{_i}] declares"
+        assert 0 <= UTR_PATCHY_MASK[_i] < len(_gp), UTR_PATCHY_MASK[_i]
+        for _channel in BANK_CHANNELS:
+            _masked = _gp[UTR_PATCHY_MASK[_i]].format(
+                channel=_channel, counterparty=_spelling, tail=""
+            )
+            assert _masked in _noise_shapes, (
+                f"masking template {_i} on {_channel} yields {_masked!r}, which no "
+                f"gateway_plausible noise row can produce -- a masked genuine credit would be "
+                f"identifiable by shape alone, so WRONG_IGNORE would stay at zero because the "
+                f"attack is visible rather than because the IGNORED conjunction holds"
+            )
+            assert not any(_ch.isdigit() for _ch in _masked), (
+                f"{_masked!r} carries a digit run, so normalize.parse would report a ref_tail "
+                f"and the row would still offer a join -- masking must remove the tail, not "
+                f"relocate it"
+            )
     # Bands must be ordered and non-overlapping, or "long tail" is a lie.
     for (lo, hi, _), (nlo, _, _) in zip(AMOUNT_BANDS, AMOUNT_BANDS[1:]):
         assert lo <= hi < nlo, f"bands overlap or are unordered near {lo}-{hi}"

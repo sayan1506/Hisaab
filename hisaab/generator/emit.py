@@ -42,7 +42,20 @@ from .model import (
 
 #: Bumped only when truth.json's shape changes. Phase 2's reader pins it so a
 #: schema change fails loudly instead of being mis-parsed.
-TRUTH_SCHEMA_VERSION = 1
+#:
+#: **v2 (Phase 8 step 2b):** the decomposition block gains ``fx_paise``, the rate movement
+#: ``--fx`` puts between capture and settlement. Every run writes it -- at 0 without the flag --
+#: so the shape changes for clean mode too, which is exactly why this is a version bump rather
+#: than an optional key. ``scoring/truth_io.py`` *requires* the field instead of defaulting it,
+#: so a v1 document has to be rejected by this pin rather than by a missing-field error three
+#: functions deeper: absent-versus-null is the branch that reader refuses to grow.
+#:
+#: This is the first bump since Phase 1, and the six phases in between added ``tds_paise``,
+#: ``refunds_paise`` and ``reserve_paise`` *without* one -- because those fields already existed
+#: at zero from the start (decision #10's reasoning applied to the output contract). ``fx_paise``
+#: could not be pre-declared the same way for an honest reason: it is the only **signed** term,
+#: and adding it in Phase 1 would have meant declaring a shape nothing could yet justify.
+TRUTH_SCHEMA_VERSION = 2
 
 PAYMENTS_CSV = "payments.csv"
 SETTLEMENTS_CSV = "settlements.csv"

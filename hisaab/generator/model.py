@@ -43,6 +43,18 @@ SETTLEMENT_ITEMS_HEADER = ("settlement_id", "payment_id")
 BANK_HEADER = ("row_id", "value_date", "amount_paise", "narration")
 REFUNDS_HEADER = ("refund_id", "payment_id", "created_at", "amount_paise")
 
+#: The currency these books are kept in, and the default every payment carries unless ``--fx``
+#: moves it. Named here rather than repeated as a literal because Phase 8 gave it a second
+#: reader (``story._draw_fx`` needs "the value that is *not* foreign"), and two spellings of one
+#: fact is how a later widening changes one of them.
+#:
+#: ``matcher/tier1.py`` declares its **own** ``HOME_CURRENCY`` and must keep doing so: the
+#: matcher cannot import the generator (``tools/check_isolation.py`` check 6), so this is not a
+#: shared constant but the same assumption stated independently on both sides. Their agreement
+#: is a fact about the data rather than a fact about the code, which is what makes the matcher's
+#: reading of the column a real inference instead of a lookup.
+HOME_CURRENCY = "INR"
+
 
 def iso_utc(dt: datetime) -> str:
     """Aware datetime -> ``2026-08-10T11:04:22Z``.
@@ -64,7 +76,7 @@ class Payment:
     captured_at: datetime      # IST-aware; emitted as UTC Z
     gross_paise: int
     method: str
-    currency: str = "INR"      # only --fx ever changes this
+    currency: str = HOME_CURRENCY   # only --fx ever changes this (story._draw_fx)
     status: str = "captured"
 
     def __post_init__(self) -> None:
@@ -185,15 +197,41 @@ class Decomposition:
     tds_paise: int = 0
     refunds_paise: int = 0
     reserve_paise: int = 0
+    #: Phase 8 step 2b (``--fx``): how far the rate moved between capture and settlement, in
+    #: paise, on this credit's members. **The only SIGNED term here, and the only one that is
+    #: added rather than subtracted.** Under design (b) the payout is correct at the
+    #: settlement-day rate while ``payments.csv`` keeps the stale capture-rate gross, so the
+    #: credit really is ``gross + fx - fee - gst - tds - refunds - reserve`` and truth has to
+    #: carry the term for its own arithmetic to close on an FX row.
+    #:
+    #: Signed because a rate moves both ways. That makes this the one term ``verdict.py``'s
+    #: negativity guard could not accept, which is the right outcome for a second reason: the
+    #: **matcher's** copy of this shape deliberately has no ``fx_paise`` at all. A field the
+    #: matcher could populate is a field it could fit any residual into, closing the gap by
+    #: construction -- the failure ``.plan/phase8.md`` decision 8 names. So the asymmetry
+    #: between the two shapes is load-bearing rather than an oversight, and it is safe only
+    #: because an FX row is never ``RESOLVED``: the residual is non-zero, so ``tier1`` abstains
+    #: and the term is never compared. Measured rather than assumed.
+    #:
+    #: Like ``reserve_paise``, no input file declares it -- but unlike the reserve, it is not
+    #: even *bounded* by anything the inputs carry, since it hides inside a gross the matcher
+    #: reads as authoritative.
+    fx_paise: int = 0
 
     def __post_init__(self) -> None:
         for amount in self.as_dict().values():
+            # ``paise`` rejects floats and bools and says nothing about sign, which is exactly
+            # what this needs: ``fx_paise`` is legitimately negative when the rate moved down.
+            # The six other terms are non-negative by construction rather than by assertion
+            # here (``verdict.Decomposition`` is where that guard lives, on the shape that has
+            # no signed term to exempt).
             paise(amount)
 
     @property
     def expected_credit_paise(self) -> int:
         return (
             self.gross_paise
+            + self.fx_paise
             - self.fee_paise
             - self.gst_paise
             - self.tds_paise
@@ -209,6 +247,7 @@ class Decomposition:
             "tds_paise": self.tds_paise,
             "refunds_paise": self.refunds_paise,
             "reserve_paise": self.reserve_paise,
+            "fx_paise": self.fx_paise,
         }
 
     def as_truth(self) -> dict[str, int]:

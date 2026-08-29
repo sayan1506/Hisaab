@@ -20,9 +20,15 @@ nothing branches on it. The mechanical guard is in ``tools/acceptance.py`` gate 
 blanking every narration to a constant must change no verdict.
 
 **This module never raises.** A narration is free text from an external system, and
-Phase 8's ``--utr-patchy`` truncates or removes the tail on purpose. A parser that
-threw on a degraded string would turn "cannot corroborate this row" into "cannot
-process this file", and the matcher would fail on data it is supposed to survive.
+Phase 8's ``--utr-patchy`` removes the tail on purpose. A parser that threw on a
+degraded string would turn "cannot corroborate this row" into "cannot process this
+file", and the matcher would fail on data it is supposed to survive.
+
+*Removes*, and only removes: all twelve (style, channel) maskings render with no digit
+at all, measured 2026-08-29. The truncated-tail case the self-check below exercises
+(``XX93`` -> ``93``) is therefore this parser being defensive about a real bank
+statement, not a shape this generator emits -- worth keeping, and worth not mistaking
+for coverage of a flag.
 Every field is therefore ``str | None``, and an unparseable narration yields a
 ``Narration`` whose ``raw`` is intact and whose parts are ``None``.
 """

@@ -535,6 +535,37 @@ ABSTENTION_REASONS: frozenset[str] = frozenset(
         # recoverable from the untouched UTR, which is why these rows are also
         # ``resolvable: true`` and also score as misses.
         "PARTIAL_SETTLEMENT_PENDING",
+        # Phase 8, and **the admission is argued rather than made to get a gate green** --
+        # which is the only reason it is admissible at all. ``FX_RATE_GAP`` fires where a
+        # settlement's membership is withheld, no subset of the pool sums to the credit, and a
+        # payment in that pool was captured in a foreign currency: its ``gross_paise`` is fixed
+        # at the capture-day rate while the settlement's net and its credit are not.
+        #
+        # It belongs here for the same reason ``PARTIAL_SETTLEMENT_PENDING`` does, and the
+        # parallel is exact. Both name a quantity **declared in no input file** -- a rolling
+        # reserve's held amount there, a settlement-day rate here -- so the arithmetic cannot be
+        # closed from the inputs, only recognised. Both leave the payment set recoverable
+        # through the untouched UTR, so truth marks the holder ``resolvable: true`` and the
+        # abstention scores as a **miss, not a correct abstention**. Neither buys coverage.
+        #
+        # **What must not happen instead: admitting ``NO_CANDIDATE`` to make those rows pass.**
+        # That code means "I looked and found nothing", which covers a missing payment and an
+        # unmodelled deduction as well -- capability gaps. Admitting it would let every failed
+        # search anywhere score as an honest refusal, and separating those two was Phase 7's
+        # entire job. The producer is correspondingly narrow: with no foreign-currency payment
+        # in the pool the row still falls through to ``NO_CANDIDATE``, and a **declared** cause
+        # is checked first (an orphan refund, whose amount ``refunds.csv`` states), so this code
+        # is reached only when nothing in the inputs can account for the gap.
+        #
+        # Admitted while **unreachable on today's data**, and deliberately: no generator flag
+        # emits a non-INR payment until ``--fx`` lands two steps from here. Same treatment as
+        # ``AMBIGUOUS_ADJUSTMENT`` above, for the same reason -- a code that is unreachable and
+        # *not* listed turns into a spurious gate failure the moment it first fires, which is
+        # precisely how ``REFUND_UNLINKED`` and ``PARTIAL_SETTLEMENT_PENDING`` went missing
+        # until gate 13 was written. ``tier1.py``'s self-check reaches the branch with a
+        # fixture, and all five plausible mis-implementations of it are caught by mutation
+        # (`.plan/probe_phase8_branch_mutants.py`).
+        "FX_RATE_GAP",
     }
 )
 
@@ -919,6 +950,14 @@ def gate_11_planted(sizes: tuple[int, ...] = (60, 200)) -> None:
                 # --- truth's side of the plant --------------------------------------
                 truth_doc = json.loads((truth / "truth.json").read_text(encoding="utf-8"))
                 planted = [c for c in truth_doc["credits"] if not c["resolvable"]]
+                #: Read off the answer key rather than hardcoded ``False``, so this gate keeps
+                #: telling the truth if a later step ever runs it with the flag on. Phase 8
+                #: step 7 measured both settings (`.plan/probe_phase8_gate11_utr_patchy.py`);
+                #: the flag is not in this gate's own flag list, so today this is always False
+                #: and the two assertions below it are equivalent to the single one they
+                #: replaced -- which is the point. The gate does not weaken now, and it does
+                #: not misdiagnose later.
+                patchy_on = bool(truth_doc.get("flags", {}).get("utr_patchy", False))
                 if len(planted) != 2 * DUP_PAIRS:
                     raise GateFailure(
                         f"seed {seed}, n={n}: truth marks {len(planted)} credit(s) "
@@ -970,13 +1009,32 @@ def gate_11_planted(sizes: tuple[int, ...] = (60, 200)) -> None:
                             f"NOT unresolvable, and truth calling it so is a false statement "
                             f"about the data."
                         )
+                    # **Phase 8 step 7: split by cause.** This was one assertion --
+                    # ``len(tails) != 1 or None in tails`` -- and its message named exactly one
+                    # cause: "story.build's echo fixup must be memoised". That reading is right
+                    # for two *different* tails and wrong for a *missing* one, and under
+                    # ``--utr-patchy`` a planted member legitimately parses to ``None``. Left
+                    # merged, the gate would fail on an honest run advising a maintainer to fix
+                    # a memoisation bug that is not there -- and the fix they would reach for
+                    # (making the mask skip planted rows) is the one I12 forbids, because it
+                    # makes absence-of-tail a tell for unresolvability.
                     tails = {_tail_of(bank[c["credit_id"]]["narration"]) for c in members}
-                    if len(tails) != 1 or None in tails:
+                    distinct = {t for t in tails if t is not None}
+                    if len(distinct) > 1:
                         raise GateFailure(
-                            f"seed {seed}, n={n}: planted group {key}'s two narrations parse "
-                            f"to tails {sorted(str(t) for t in tails)} despite one shared "
-                            f"UTR. story.build's echo fixup must be memoised, or each member "
-                            f"draws its own spare tail and the pair is separated again."
+                            f"seed {seed}, n={n}: planted group {key}'s narrations parse to "
+                            f"{len(distinct)} different tails {sorted(distinct)} despite one "
+                            f"shared UTR. story.build's echo fixup must be memoised, or each "
+                            f"member draws its own spare tail and the pair is separated again."
+                        )
+                    if None in tails and not patchy_on:
+                        raise GateFailure(
+                            f"seed {seed}, n={n}: planted group {key} has a member whose "
+                            f"narration carries no reference tail, without --utr-patchy. Every "
+                            f"genuine template renders a 4-digit tail, so a missing one here is "
+                            f"the mask firing on a run that did not ask for it -- a different "
+                            f"defect from the echo fixup above, which is why the two are "
+                            f"separate assertions."
                         )
 
                 # --- the brute-force attack, actually run rather than argued away ----
@@ -985,15 +1043,41 @@ def gate_11_planted(sizes: tuple[int, ...] = (60, 200)) -> None:
                     by_tail.setdefault(utr.removeprefix("XXXX"), []).append(sid)
                 planted_ids = {c["credit_id"] for c in planted}
                 separated: list[str] = []
-                ambiguous = 0
+                # **Phase 8 step 7: one counter became three, by cause.** This was a single
+                # ``ambiguous`` tally over every row the tail-only join failed to resolve
+                # uniquely, asserted equal to the planted count -- and its own message named the
+                # flag that would break it: "a tail missing or colliding elsewhere is
+                # --utr-patchy's job in Phase 8, not this flag's". It was right. A masked row has
+                # no tail, so under that flag the tally goes from 4 to ~34 at n=200 and the gate
+                # fails reporting "the file has been degraded beyond the plant" about a run that
+                # is behaving exactly as designed.
+                #
+                # The three causes are genuinely different claims, and only the third belongs to
+                # ``--dup-amounts``:
+                #
+                #   * **no tail at all** -- the mask. Legitimate under ``--utr-patchy``, and a
+                #     defect on any other run, since every genuine template renders a 4-digit
+                #     tail.
+                #   * **a tail that hits no settlement** -- a generator defect here, because
+                #     every gateway credit's tail *is* its settlement's UTR tail. This gate runs
+                #     without ``--noise-rows``, so there is no legitimate source of one; a future
+                #     flag that adds ``look_alike`` rows would make this bucket honest and would
+                #     need the same split treatment rather than a relaxed number.
+                #   * **a tail hitting two or more settlements** -- the plant itself, and the
+                #     only bucket whose size this flag controls.
+                no_tail, tail_hits_none, collision = 0, 0, 0
                 for cid, row in bank.items():
                     tail = _tail_of(row["narration"])
-                    hits = by_tail.get(tail or "", [])
+                    hits = by_tail.get(tail, []) if tail is not None else []
                     if len(hits) == 1:
                         if cid in planted_ids:
                             separated.append(cid)
+                    elif tail is None:
+                        no_tail += 1
+                    elif not hits:
+                        tail_hits_none += 1
                     else:
-                        ambiguous += 1
+                        collision += 1
                 if separated:
                     raise GateFailure(
                         f"seed {seed}, n={n}: a tail-only strategy -- no date, no amount, "
@@ -1002,12 +1086,43 @@ def gate_11_planted(sizes: tuple[int, ...] = (60, 200)) -> None:
                         f"force, so it does not test the capability its name claims and "
                         f"resolvable=false is false for those rows."
                     )
-                if ambiguous != len(planted):
+                # The plant's own bucket, and the assertion that used to be made against the
+                # merged tally. Strictly stronger now: the old form could be satisfied by a
+                # missing tail cancelling out a collision that never happened.
+                #
+                # Under ``--utr-patchy`` a masked planted member carries no tail, so it moves to
+                # the bucket above rather than colliding -- measured at seed 2 and seed 3, n=200,
+                # the two cells where a pair is split by the mask
+                # (`.plan/probe_phase8_gate11_utr_patchy.py`). That is not the plant weakening:
+                # the two settlements still share one UTR, the credit simply no longer carries a
+                # tail to reach it with, and the pair stayed unseparated in both cells.
+                masked_planted = sum(
+                    1 for cid in planted_ids if _tail_of(bank[cid]["narration"]) is None
+                )
+                if collision != len(planted) - masked_planted:
                     raise GateFailure(
-                        f"seed {seed}, n={n}: the tail-only join is ambiguous on {ambiguous} "
-                        f"row(s) but only {len(planted)} were planted. The file has been "
-                        f"degraded beyond the plant -- a tail missing or colliding elsewhere "
-                        f"is --utr-patchy's job in Phase 8, not this flag's."
+                        f"seed {seed}, n={n}: the tail-only join collides on {collision} row(s) "
+                        f"against {len(planted)} planted less {masked_planted} masked. Every "
+                        f"planted row that still carries a tail must land on a shared UTR, and "
+                        f"nothing else may: a collision outside the plant means two settlements "
+                        f"share a UTR by accident, which makes an unplanted row unresolvable "
+                        f"while truth calls it resolvable."
+                    )
+                if no_tail and not patchy_on:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {no_tail} bank row(s) carry no reference tail "
+                        f"without --utr-patchy. Every genuine narration template renders a "
+                        f"4-digit tail, so this is the mask firing on a run that did not ask "
+                        f"for it -- reported separately from a collision because the two have "
+                        f"opposite causes and opposite fixes."
+                    )
+                if tail_hits_none:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {tail_hits_none} bank row(s) carry a tail that "
+                        f"matches no settlement's UTR. This gate runs without --noise-rows, so "
+                        f"every bank row is gateway money and its tail is its own settlement's "
+                        f"-- a tail pointing nowhere means the narration and the settlement "
+                        f"disagree about the reference."
                     )
 
                 # --- and now the number this whole phase exists to produce -----------
@@ -1841,33 +1956,59 @@ def gate_13_phase6(sizes: tuple[int, ...] = (200, 1000)) -> None:
                         f"a ratio is satisfied by not looking"
                     )
                 unresolved = [v for v in verdicts if v.get("outcome") != "RESOLVED"]
-                # One exemption, and it is an **identity** rather than a reason code: the
-                # credit netting an orphan refund whose settlement membership is withheld.
-                # ``_orphan_bearing_undeclared`` carries the reasoning for why
-                # ``NO_CANDIDATE`` is the honest answer on that row, and why admitting the
-                # code into ABSTENTION_REASONS would be the wrong fix -- it would let every
-                # failure to find a candidate score as an honest refusal, and separating a
-                # gateway credit the matcher cannot explain from a non-gateway row is
-                # Phase 7's entire job. Asserted as containment, so a second NO_CANDIDATE
-                # arriving for any other reason still fails the suite.
+                # **The one-row ``NO_CANDIDATE`` exemption was RETIRED in Phase 8, and the rule
+                # below is now unconditional.** It used to tolerate exactly one such row by
+                # identity -- the credit netting an orphan refund whose settlement membership is
+                # withheld -- because on a withheld settlement the orphan is subtracted from no
+                # member, so the true subset sat outside the search space and the search honestly
+                # found nothing.
+                #
+                # Phase 8 step 1 gave that row a real code instead. ``tier1.py``'s withheld-
+                # membership branch now offers the shortfall back as ``credit + orphan``, and
+                # where a subset appears it abstains as ``REFUND_UNLINKED`` -- naming an amount
+                # ``refunds.csv`` declares rather than one the matcher fitted. Measured across
+                # seeds 1/2/3/42 at n=200 and n=1000 on both this flag set and gate 14's: the
+                # bump reveals **truth's own membership on 3 of 4 rows and an ambiguity on the
+                # 4th, with zero coincidences** (`.plan/probe_phase8_refunds_first.py`).
+                #
+                # **So keeping the exemption would make this check vacuous, which is why it is
+                # gone rather than merely unused.** With no row landing ``NO_CANDIDATE`` on this
+                # flag set, an ``and not (...)`` clause guarding against one is a condition that
+                # can no longer fire -- the decoration class Phase 7's own commit is named for.
+                # Unconditional, it is strictly *stronger* than the exempted form and it earns a
+                # second job: if the refunds-first ordering ever regresses, those rows fall back
+                # to ``NO_CANDIDATE``, which is outside ``ABSTENTION_REASONS``, and this gate
+                # fails. The exemption tolerated exactly that regression; the rule now catches
+                # it. Same treatment ``SUSPENDED_BY`` gave its wrong predictions -- strengthened
+                # rather than stood down.
+                #
+                # ``_orphan_bearing_undeclared`` is still called, but only to *name* that
+                # population in the failure message. It is diagnostic now, never an excuse: the
+                # rows it lists get no special permission, and one of them landing outside
+                # ``ABSTENTION_REASONS`` fails the gate like any other.
                 exempt = _orphan_bearing_undeclared(data, credits)
                 dishonest = [
                     str(v.get("credit_id")) for v in unresolved
                     if str(v.get("reason")) not in ABSTENTION_REASONS
-                    and not (
-                        str(v.get("reason")) == "NO_CANDIDATE"
-                        and str(v.get("credit_id")) in exempt
-                    )
                 ]
                 if dishonest:
+                    stale = sorted(set(dishonest) & exempt)
                     raise GateFailure(
                         f"seed {seed}, n={n}: {len(dishonest)} unresolved row(s) carry a "
                         f"reason outside ABSTENTION_REASONS (e.g. {dishonest[:3]}). A "
-                        f"coverage shortfall is only acceptable as an honest abstention. The "
-                        f"only NO_CANDIDATE this gate tolerates is the orphan-refund row whose "
-                        f"membership is withheld ({sorted(exempt) or 'none in this run'}), and "
-                        f"it is named by identity rather than by admitting the code.\n"
-                        f"  reasons seen: "
+                        f"coverage shortfall is only acceptable as an honest abstention, and "
+                        f"Phase 8 retired the one exemption this gate used to grant.\n"
+                        + (
+                            f"  {len(stale)} of them ({stale}) net an orphan refund on a "
+                            f"settlement whose membership is withheld -- the population that "
+                            f"USED to be exempt. Phase 8's refunds-first branch in "
+                            f"tier1._search_membership should give those REFUND_UNLINKED, so a "
+                            f"NO_CANDIDATE here means that ordering regressed rather than that "
+                            f"the exemption is needed back.\n"
+                            if stale
+                            else ""
+                        )
+                        + f"  reasons seen: "
                         f"{dict(sorted(collections.Counter(str(v.get('reason')) for v in unresolved).items()))}"
                     )
 
@@ -2075,9 +2216,14 @@ def gate_14_phase7(sizes: tuple[int, ...] = (200, 1000)) -> None:
       * **Every unresolved *gateway* row abstains honestly**, with the noise rows excluded from
         that check rather than swept into it. Their outcome is scored on its own axis, and folding
         ``IGNORED`` into an abstention audit would let the easiest rows in the file vouch for the
-        hardest. Gate 13's single ``NO_CANDIDATE`` exemption is inherited by identity -- it did
-        not fire on any measured seed or size here, so it is a permission this gate carries
-        rather than a clause it depends on.
+        hardest. **Gate 13's single ``NO_CANDIDATE`` exemption was retired in Phase 8 and is no
+        longer inherited here** -- this check is unconditional. It never fired on this gate's own
+        seeds even before that (measured: the exempt row appears on seed 42, which this gate does
+        not run), so it was already a permission carried rather than a clause depended on; Phase 8
+        removed the permission itself, because the withheld-membership branch now abstains as
+        ``REFUND_UNLINKED`` on that shape and a clause guarding a code that can no longer arrive
+        is decoration. Unconditional is strictly stronger: a regression in that ordering drops
+        those rows back to ``NO_CANDIDATE`` and this check fails on them.
       * **A negative control**: the same seed and size with no flags resolves everything, ignores
         nothing and reports ``noise_recall`` as ``n/a``. A rate is only attributable to a cause
         when the run without the cause reads zero -- and an ``IGNORED`` in clean mode would mean
@@ -2160,16 +2306,29 @@ def gate_14_phase7(sizes: tuple[int, ...] = (200, 1000)) -> None:
                     )
 
                 # --- honest abstentions, gateway rows only -------------------------------
+                # **Unconditional since Phase 8, for the reason gate 13's copy of this carries
+                # in full.** The ``NO_CANDIDATE``-by-identity exemption is retired: the withheld-
+                # membership branch in ``tier1._search_membership`` now offers an orphan refund's
+                # declared amount back to the search and abstains as ``REFUND_UNLINKED``, so no
+                # gateway row on this flag set lands ``NO_CANDIDATE`` any more and a clause
+                # guarding one could not fire. Retired rather than left unused, and it gains a
+                # second job that way: a regression in that ordering drops those rows back to
+                # ``NO_CANDIDATE``, and this check now fails on them instead of excusing them.
+                #
+                # The noise-row exclusion is a different thing entirely and it **stays**. Those
+                # rows are scored on their own axis (``noise_recall``, and ``_noise_failure``
+                # above), and letting ``IGNORED`` count as an honest abstention would have the
+                # easiest rows in the file vouch for the hardest. Measured: on this flag set the
+                # noise strata are where ``NO_CANDIDATE`` legitimately lives -- 44 of the 48 such
+                # rows across seeds 1/2/3/42 at both sizes are non-gateway
+                # (`.plan/probe_phase8_no_candidate_control.py`), which is exactly why this
+                # check is scoped to gateway rows rather than widened to accept the code.
                 exempt = _orphan_bearing_undeclared(data, credits)
                 dishonest = [
                     str(v.get("credit_id")) for v in verdicts
                     if v.get("outcome") != "RESOLVED"
                     and str(v.get("credit_id")) not in noise_ids
                     and str(v.get("reason")) not in ABSTENTION_REASONS
-                    and not (
-                        str(v.get("reason")) == "NO_CANDIDATE"
-                        and str(v.get("credit_id")) in exempt
-                    )
                 ]
                 if dishonest:
                     unresolved = [
@@ -2177,13 +2336,23 @@ def gate_14_phase7(sizes: tuple[int, ...] = (200, 1000)) -> None:
                         if v.get("outcome") != "RESOLVED"
                         and str(v.get("credit_id")) not in noise_ids
                     ]
+                    stale = sorted(set(dishonest) & exempt)
                     raise GateFailure(
                         f"seed {seed}, n={n}: {len(dishonest)} unresolved gateway row(s) carry a "
                         f"reason outside ABSTENTION_REASONS (e.g. {dishonest[:3]}). The noise "
                         f"rows are excluded from this check on purpose -- they are scored on "
                         f"their own axis, and letting IGNORED count as an abstention would have "
                         f"the easiest rows in the file vouch for the hardest.\n"
-                        f"  reasons seen: "
+                        + (
+                            f"  {len(stale)} of them ({stale}) net an orphan refund on a "
+                            f"settlement whose membership is withheld -- the population gate 13 "
+                            f"used to exempt by identity. Phase 8's refunds-first branch in "
+                            f"tier1._search_membership should give those REFUND_UNLINKED, so a "
+                            f"NO_CANDIDATE here means that ordering regressed.\n"
+                            if stale
+                            else ""
+                        )
+                        + f"  reasons seen: "
                         f"{dict(sorted(collections.Counter(str(v.get('reason')) for v in unresolved).items()))}"
                     )
 
@@ -2255,6 +2424,456 @@ def gate_14_phase7(sizes: tuple[int, ...] = (200, 1000)) -> None:
         )
 
 
+#: The eleven flags ``--all-mess`` resolves to after Phase 8 step 9 -- every implemented flag
+#: except ``dup_amounts``, which is mutually exclusive with four of the others. Spelled out rather
+#: than read from ``MessFlags.composable()``: a gate that asked the config layer what to run would
+#: agree with a broken reduction about a wrong flag set. The generator refuses any illegal
+#: combination, so a drift between this tuple and ``composable()`` surfaces as a *failure* here.
+PHASE8_FLAGS: tuple[str, ...] = (*PHASE7_FLAGS, "--fx", "--utr-patchy")
+
+
+def _fx_and_mask_failure(
+    cells: dict[str, int],
+    fx_total: int,
+    fx_resolved: list[str],
+    masked_total: int,
+    masked_ignored: list[str],
+    fx_rate_gap: int,
+    label: str,
+) -> str | None:
+    """What is wrong with a run's FX and masking outcomes, or ``None`` if it is healthy.
+
+    Factored out for gates 13 and 14's reason: this gate's value is in what it refuses, so the
+    predicate meets a known-good input and every known-bad one before a real run is read.
+
+    **Each clause carries its own denominator, and three of the six exist only to refuse a
+    vacuous pass.** ``WRONG_IGNORE == 0`` is trivially true on a file where the mask fired on
+    nothing genuine, and Phase 8 step 6 measured exactly that: ``--utr-patchy --noise-rows``
+    alone gets **zero** masked credits to the ignore gate on all three seeds, because only
+    ``--reserve`` makes a credit differ from its settlement's declared net. So the population is
+    asserted non-empty beside the outcome, never inferred from the flag being on.
+
+    **``fx_resolved`` is driven off truth's ``fx_paise``, not off the verdict.** The plan asked
+    for gate 13's shape -- "no resolved row carries an FX term" -- and that is not writable here:
+    ``hisaab/common/verdict.Decomposition`` has **no** ``fx_paise`` field, deliberately
+    (``generator/model.py:209`` -- a field the matcher could populate is a residual it could fit
+    anything into). ``v["decomposition"].get("fx_paise", 0)`` therefore reads a key that can never
+    exist, returns 0 on every row of every run, and would pass forever. Measured: 0 of ~629
+    verdicts carry the key on any cell. The property ``model.py`` names as what makes the
+    asymmetry safe is the one asserted instead -- *an FX-bearing credit is never RESOLVED* -- and
+    it has a denominator: 15-16 such credits at n=200, 72-76 at n=1000.
+    """
+    if fx_total == 0:
+        return (
+            f"{label}: no credit carries a non-zero fx_paise, so the FX assertions below have no "
+            f"subject -- 'none resolved' is vacuous on a file with no FX row. --fx is on, so this "
+            f"is a generator regression rather than a permitted shape"
+        )
+    if fx_resolved:
+        return (
+            f"{label}: {len(fx_resolved)} credit(s) carrying an FX term were RESOLVED "
+            f"(e.g. {fx_resolved[:3]}), out of {fx_total}. The rate movement hides inside a gross "
+            f"the matcher reads as authoritative and is declared in no input file, so a resolved "
+            f"FX row means the arithmetic closed on a term it cannot see -- and the matcher's own "
+            f"Decomposition has no fx_paise to have priced it with"
+        )
+    if fx_rate_gap == 0:
+        return (
+            f"{label}: FX_RATE_GAP never fired across {fx_total} FX-bearing credit(s). It is in "
+            f"ABSTENTION_REASONS, so a run where it never appears lets those rows pass the "
+            f"honesty audit below on a code that was never exercised"
+        )
+    if masked_total == 0:
+        return (
+            f"{label}: no genuine credit lost its UTR tail, so WRONG_IGNORE == 0 is vacuous -- "
+            f"the ignore conjunction is never asked to keep a masked genuine credit. Phase 8 "
+            f"step 6 measured this exact shape on --utr-patchy --noise-rows without --reserve"
+        )
+    if masked_ignored:
+        return (
+            f"{label}: {len(masked_ignored)} masked genuine credit(s) were IGNORED "
+            f"(e.g. {masked_ignored[:3]}), out of {masked_total}. Truth marks these resolvable, "
+            f"so discarding one is money dropped from the books -- the failure Phase 7's "
+            f"conjunction exists to prevent, and the one --utr-patchy is designed to provoke"
+        )
+    if cells["wrong_ignore"] != 0:
+        return (
+            f"{label}: wrong_ignore is {cells['wrong_ignore']} over {masked_total} masked genuine "
+            f"credit(s). There is no acceptable non-zero value: a real credit set aside as "
+            f"non-gateway is unrecoverable without a human noticing the shortfall"
+        )
+    return None
+
+
+def _gate_15_self_check() -> None:
+    """Prove ``_fx_and_mask_failure`` accepts a healthy run and rejects each shape it names.
+
+    The healthy fixture is the measured seed-1 n=200 cell, so a pass here is attributable to a
+    run this gate actually produces rather than to a number chosen to satisfy the predicate.
+    Every bad case is checked by **wording**, because six clauses share one predicate and a
+    truthy return would otherwise not say which one fired.
+    """
+    def cells(wrong_ignore: int = 0) -> dict[str, int]:
+        return {"wrong_ignore": wrong_ignore}
+
+    healthy = dict(
+        cells=cells(), fx_total=16, fx_resolved=[], masked_total=19, masked_ignored=[],
+        fx_rate_gap=34, label="probe",
+    )
+    if (got := _fx_and_mask_failure(**healthy)) is not None:  # type: ignore[arg-type]
+        raise GateFailure(
+            f"gate 15's predicate rejects the healthy run it was measured on, so every failure "
+            f"it reports below would be unconditional and would prove nothing: {got}"
+        )
+
+    for override, want in (
+        # The three vacuity refusals: each is a run where the *outcome* is perfect and the
+        # population is empty, which is the shape this gate exists to refuse.
+        ({"fx_total": 0}, "no subject"),
+        ({"masked_total": 0}, "vacuous"),
+        ({"fx_rate_gap": 0}, "never fired"),
+        # The three real defects.
+        ({"fx_resolved": ["C0007"]}, "were RESOLVED"),
+        ({"masked_ignored": ["C0031"]}, "were IGNORED"),
+        ({"cells": cells(wrong_ignore=1)}, "no acceptable non-zero value"),
+    ):
+        got = _fx_and_mask_failure(**{**healthy, **override})  # type: ignore[arg-type]
+        if got is None or want not in got:
+            raise GateFailure(
+                f"gate 15's predicate failed to reject {override}: expected a complaint "
+                f"containing {want!r}, got {got!r}"
+            )
+
+
+def gate_15_phase8(sizes: tuple[int, ...] = (200, 1000)) -> None:
+    """Phase 8: the eleven-flag run -- foreign currency and a bank statement missing UTRs.
+
+    The capstone. Every implemented flag except ``dup_amounts`` (mutually exclusive with four of
+    the others), which is what ``--all-mess`` resolves to after step 9.
+
+    **Coverage is deliberately NOT asserted at 1.0, and that is a correction to this phase's own
+    plan.** Step 5 measured that ``--fx`` voids Tier 2's uniqueness inference whenever a foreign
+    payment is in the candidate pool: the subset search can no longer argue a unique membership,
+    so ~19% of credits abstain that would otherwise resolve. Measured coverage on this flag set is
+    **56.11%-71.20%** across the six cells, with ``FX_RATE_GAP`` alone taking 137-148 rows at
+    n=1000. A gate asserting 1.0 here would fail on correct code. What never bends is the pair
+    this project refuses to average: **correctness 1.0 and zero wrong matches**, on every cell.
+
+    What it asserts, per seed and size:
+
+      * ``_fx_and_mask_failure``, above -- six clauses, three of which refuse a *vacuous* pass by
+        asserting the population beside the outcome.
+      * **Correctness 1.0 with zero wrong matches**, on eleven flags. Nothing before this gate
+        scores a file where a term the matcher cannot see (the rate movement) hides inside a gross
+        it reads as authoritative.
+      * **No gateway row carries ``NO_CANDIDATE``** -- and this is *stronger* than the plan asked
+        for. The plan permitted ``NO_CANDIDATE <= 1`` by the characterised identity gate 13 used;
+        measured, gateway ``NO_CANDIDATE`` is **0** on all six cells, and all 35 such verdicts
+        across the matrix are noise rows whose narration names a gateway counterparty -- Phase 7's
+        conjunction correctly refusing to ignore them, after which the search honestly finds
+        nothing. So the exemption is not inherited: the assertion is equality with zero.
+      * **The partition, in both directions.** Every bank row is a gateway credit or a noise row,
+        never neither and never both, and every one carries a verdict. Without it, "the
+        ``NO_CANDIDATE`` rows are noise" would be an inference from *absence* from truth's
+        ``credits`` -- which is not the same claim as membership in the noise set.
+      * **Every unresolved gateway row abstains honestly.** Noise rows are excluded, for gate 14's
+        reason: they are scored on their own axis, and letting ``IGNORED`` count as an abstention
+        would have the easiest rows in the file vouch for the hardest.
+      * **``noise_correctly_ignored == noise_strata["plainly_foreign"]``.** Gate 14's identity,
+        re-run here because it is what rules out a ``plainly_foreign`` row hiding inside the
+        ``NO_CANDIDATE`` population **without re-deriving per-row strata** -- which are
+        deliberately off-disk, and which a gate must not reconstruct, since doing so would use the
+        same two evidence tests the matcher uses and agree with a broken matcher by construction.
+
+    **It honours ``--skip-slow``, and that is a decision by measurement rather than by imitation
+    of its two predecessors.** Gates 13 and 14 ignore the flag because their subjects read
+    literally zero at n=200 -- the reserve shortfall was invisible there, and
+    ``AMBIGUOUS_MULTI_SUBSET`` does not occur at all. Every subject *this* gate adds is
+    non-vacuous at n=200: 15-16 FX-bearing credits, 19 masked genuine credits, ``FX_RATE_GAP`` at
+    12-34, the plainly-foreign identity at 3=3, gateway ``NO_CANDIDATE`` at 0. The n=1000 cells
+    are kept in a full run because the eleven-flag matcher is the most expensive configuration in
+    this suite (~10.2s per cell, against 95s for the whole suite before this gate) and a size that
+    costs that much should not be paid twice for properties already covered at n=200.
+
+    What a pass does **not** prove. That an FX row *could not* be resolved -- only that none was.
+    The rate movement is declared in no input file and is not even bounded by one, so nothing but
+    truth's own record could say otherwise, and that limit belongs in the write-up. Nor does it
+    prove the ~19% Tier 2 abstention is minimal: it is the price of refusing to infer uniqueness
+    from a pool containing a payment whose home-currency amount is stale, and a matcher that
+    guessed there would score wrong matches rather than abstentions.
+    """
+    print(f"\ngate 15 -- Phase 8: all eleven flags, seeds {list(DEV_SEEDS)}")
+    _gate_15_self_check()
+
+    with tempfile.TemporaryDirectory(prefix="hisaab-phase8-") as tmp:
+        root = Path(tmp)
+        for seed in DEV_SEEDS:
+            for n in sizes:
+                base = root / f"s{seed}n{n}"
+                data, truth = base / "data", base / "truth"
+                _run(
+                    [
+                        sys.executable, "-m", "hisaab.generator",
+                        "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                        "--out", str(data), "--truth", str(truth), "--quiet", *PHASE8_FLAGS,
+                    ],
+                    f"generator with all Phase 8 flags at seed {seed}, n={n}",
+                )
+                out = base / "matches.json"
+                doc = _matcher_and_score(
+                    data, truth, out, seed, extra=["--window", str(MESS_WINDOW_DAYS)],
+                )
+                verdicts = json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+                truth_doc = json.loads((truth / "truth.json").read_text(encoding="utf-8"))
+                manifest = json.loads(
+                    (truth / "run_manifest.json").read_text(encoding="utf-8")
+                )
+                credits = truth_doc["credits"]
+                cells, rates = doc["cells"], doc["rates"]  # type: ignore[index]
+
+                # ``outcome``, subscripted rather than ``.get``-ed, and the vocabulary pinned.
+                # A probe written for this gate read ``v.get("status")`` -- a key verdicts do not
+                # carry -- so every comparison against "RESOLVED" was ``None == "RESOLVED"`` and
+                # three of its measurements were arithmetic on a missing key that could only
+                # come out clean. A missing key must raise here, and an unknown outcome value
+                # must not silently bucket as "not resolved".
+                outcome = {str(v["credit_id"]): str(v["outcome"]) for v in verdicts}
+                reason = {str(v["credit_id"]): str(v.get("reason")) for v in verdicts}
+                if unknown := sorted(set(outcome.values()) - {"RESOLVED", "EXCEPTION", "IGNORED"}):
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: unknown outcome value(s) {unknown}. Every check "
+                        f"below buckets on this field, so a value they do not know about would "
+                        f"be counted as 'not resolved' without a word"
+                    )
+
+                gateway_ids = {str(c["credit_id"]) for c in credits}
+                noise_ids = {str(i) for i in truth_doc["orphans"]["non_gateway_credit_ids"]}
+                bank_ids = {r["row_id"] for r in _csv_rows(data / "bank_statement.csv")}
+
+                # **The denominators, stated before anything is compared against them.** The five
+                # checks that follow are emptiness tests on set differences, and every one of them
+                # passes on an empty population: no bank row is in neither set when there are no
+                # bank rows, and no gateway credit carries NO_CANDIDATE when truth lists no
+                # credits. That is the failure mode this suite keeps finding -- a check that holds
+                # because it measured nothing -- so the populations are asserted rather than
+                # assumed from the flags being on.
+                if not bank_ids or not gateway_ids:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(bank_ids)} bank row(s) and "
+                        f"{len(gateway_ids)} truth credit(s). Every partition and NO_CANDIDATE "
+                        f"check below is an emptiness test that an empty population satisfies, "
+                        f"so neither may be zero for their passes to mean anything"
+                    )
+
+                # --- the partition, both directions ------------------------------------------
+                if neither := sorted(bank_ids - gateway_ids - noise_ids):
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(neither)} bank row(s) are neither a gateway "
+                        f"credit nor a listed noise row (e.g. {neither[:3]}). Every check below "
+                        f"splits on that membership, so a row in neither set is audited by none "
+                        f"of them"
+                    )
+                if both := sorted(gateway_ids & noise_ids):
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(both)} row(s) are listed as BOTH a gateway "
+                        f"credit and a noise row (e.g. {both[:3]}), so the noise exclusion below "
+                        f"would silently excuse genuine credits from the honesty audit"
+                    )
+                # The reverse direction of the same pairing, and not decoration: the masking check
+                # below indexes ``bank_by_id[cid]`` for every gateway credit, so a credit with no
+                # bank row would surface as a KeyError traceback rather than a gate failure.
+                if bodiless := sorted(gateway_ids - bank_ids):
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(bodiless)} truth credit(s) have no bank row "
+                        f"(e.g. {bodiless[:3]}). Truth lists them as gateway money that reached "
+                        f"the account, so the statement has to carry them"
+                    )
+                if missing := sorted(bank_ids - set(outcome)):
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(missing)} bank row(s) carry no verdict "
+                        f"(e.g. {missing[:3]}) -- the matcher must answer every row, and a row "
+                        f"with no verdict is invisible to every count in this gate"
+                    )
+
+                # --- the FX and masking axis, via the factored predicate ----------------------
+                fx_ids = {
+                    str(c["credit_id"]) for c in credits
+                    if int(c["decomposition"].get("fx_paise", 0) or 0) != 0
+                }
+                bank_by_id = {r["row_id"]: r for r in _csv_rows(data / "bank_statement.csv")}
+                # A genuine credit whose narration lost its four-digit tail. ``_tail_of`` is the
+                # gates' own definition, shared rather than re-spelled: a second regex would be a
+                # second definition of "still carries a UTR", and the two could disagree.
+                masked = sorted(
+                    cid for cid in gateway_ids
+                    if _tail_of(bank_by_id[cid]["narration"]) is None
+                )
+                if problem := _fx_and_mask_failure(
+                    cells,  # type: ignore[arg-type]
+                    fx_total=len(fx_ids),
+                    fx_resolved=sorted(c for c in fx_ids if outcome[c] == "RESOLVED"),
+                    masked_total=len(masked),
+                    masked_ignored=[c for c in masked if outcome[c] == "IGNORED"],
+                    fx_rate_gap=sum(
+                        1 for v in verdicts if str(v.get("reason")) == "FX_RATE_GAP"
+                    ),
+                    label=f"seed {seed}, n={n}",
+                ):
+                    raise GateFailure(problem)
+
+                # --- correctness never bends --------------------------------------------------
+                wrong = (
+                    cells["wrong_match"] + cells["wrong_match_invented"]  # type: ignore[index]
+                    + cells["lucky_guess"]  # type: ignore[index]
+                )
+                if wrong or rates["correctness"] != 1.0:  # type: ignore[index]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: correctness {rates['correctness']}, "  # type: ignore[index]
+                        f"{wrong} wrong match(es). Coverage is permitted to fall on this flag "
+                        f"set -- --fx voids Tier 2's uniqueness inference and those rows abstain "
+                        f"-- but a wrong match is a wrong answer that looks like a result, which "
+                        f"is the one outcome no flag excuses"
+                    )
+                # A collapse floor rather than a target: measured 56.11%-71.20% across six cells,
+                # so 0.45 is below every observed value and still catches a matcher that stopped
+                # resolving. Asserted because "coverage may fall" must not become "coverage may
+                # be anything" -- the FX abstentions are a bounded, argued cost, not a licence.
+                if float(rates["coverage"]) < 0.45:  # type: ignore[index, arg-type]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: coverage {rates['coverage']} is below the 0.45 "  # type: ignore[index]
+                        f"collapse floor (measured range on this flag set: 56.11%-71.20%). The "
+                        f"FX abstentions are an argued cost with a measured size, so a coverage "
+                        f"far under that band is a regression rather than the flag working"
+                    )
+
+                # --- no gateway row honestly found nothing ------------------------------------
+                # Equality with zero, stronger than the plan's "<= 1 by the characterised
+                # identity". Measured: 0 on all six cells, and all 35 NO_CANDIDATE verdicts
+                # across the matrix are noise rows naming a gateway counterparty in their
+                # narration -- Phase 7's conjunction refusing to ignore them, after which the
+                # search honestly finds nothing. Gate 13's exemption is deliberately not
+                # inherited: a permission carried past the shape that needed it is decoration.
+                if stranded := sorted(
+                    cid for cid in gateway_ids if reason[cid] == "NO_CANDIDATE"
+                ):
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(stranded)} gateway credit(s) carry "
+                        f"NO_CANDIDATE (e.g. {stranded[:3]}). That code is outside "
+                        f"ABSTENTION_REASONS on purpose -- admitting it would let every failed "
+                        f"search score as an honest refusal -- and on this flag set it belongs "
+                        f"to the noise strata, never to gateway money"
+                    )
+
+                # --- every unresolved gateway row abstains honestly ---------------------------
+                dishonest = [
+                    str(v["credit_id"]) for v in verdicts
+                    if str(v["outcome"]) != "RESOLVED"
+                    and str(v["credit_id"]) not in noise_ids
+                    and str(v.get("reason")) not in ABSTENTION_REASONS
+                ]
+                if dishonest:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(dishonest)} unresolved gateway row(s) carry a "
+                        f"reason outside ABSTENTION_REASONS (e.g. {dishonest[:3]}). The noise "
+                        f"rows are excluded on purpose -- they are scored on their own axis, and "
+                        f"letting IGNORED count as an abstention would have the easiest rows in "
+                        f"the file vouch for the hardest"
+                    )
+
+                # --- the composed plainly-foreign argument ------------------------------------
+                # ``_noise_failure`` rather than a hand-rolled equality, which is what this was
+                # first written as. Three reasons, and the first is the one that matters: gate
+                # 14's predicate is **already self-checked**, so reusing it inherits a control
+                # instead of adding a second uncontrolled assertion. It also separates the two
+                # directions -- a shortfall means a plainly-foreign row was not set aside, a
+                # surplus means a gateway-spelled row leaked into IGNORED, and only the second
+                # becomes a wrong answer next phase -- where the merged form said neither. And it
+                # keeps **one** definition of the identity: a private copy here could drift from
+                # gate 14's and the two would then disagree about what a healthy noisy run is.
+                strata: dict[str, int] = manifest["noise_strata"]
+                if problem := _noise_failure(
+                    cells, strata, f"seed {seed}, n={n}"  # type: ignore[arg-type]
+                ):
+                    raise GateFailure(
+                        f"{problem}\n"
+                        f"  This identity is also what rules out a plainly-foreign row hiding in "
+                        f"the NO_CANDIDATE population without re-deriving per-row strata -- which "
+                        f"a gate must not do, since it would use the matcher's own two evidence "
+                        f"tests and agree with a broken matcher by construction."
+                    )
+
+                print(
+                    f"    seed {seed}, n={n:<5} coverage {float(rates['coverage']):>7.2%}  "  # type: ignore[index, arg-type]
+                    f"correctness {rates['correctness']}  wrong 0  "  # type: ignore[index]
+                    f"fx {len(fx_ids):>3} (0 resolved)  masked {len(masked):>3} (0 ignored)  "
+                    f"wrong_ignore 0"
+                )
+
+
+#: Row 34 of ASSUMPTIONS.md prices every reason code in prose -- ``10 (`NO_CANDIDATE`,
+#: `REFUND_UNLINKED`)`` -- and this parses it back into a dict so gate 7 can compare the prose
+#: against ``MINUTES_PER_EXCEPTION`` itself.
+#:
+#: The dict already asserts its own exhaustiveness over ``Reason``, so a *new* code cannot
+#: silently price at zero. What nothing guarded was the **transcription**, and the gap was
+#: live: Phase 8 found row 34 listing 11 of the 13 codes, missing ``AMBIGUOUS_ADJUSTMENT`` (10)
+#: and ``MEMBERSHIP_UNDECLARED`` (20) -- the joint-most-expensive code in the table. Two
+#: sources of truth for one number, and the prose one is what a judge actually reads.
+ROW_34_MINUTES_RE = re.compile(r"(\d+)(?:\s*min[a-z]*)?\s*\(((?:`[A-Z_]+`(?:,\s*)?)+)\)")
+
+
+#: Reads ``MINUTES_PER_EXCEPTION`` out of the scorer **in a subprocess**, the way every other
+#: scorer number in this file arrives.
+#:
+#: The obvious spelling -- ``from hisaab.scoring.metrics import MINUTES_PER_EXCEPTION`` at the
+#: top of this file -- was written first and gate 5 rejected it, correctly. ``check_isolation``
+#: treats importing *anything* under ``hisaab.scoring`` as reaching the answer key, because a
+#: module that can import the package can import the loader. Putting the acceptance harness on
+#: the ``TRUTH_READERS`` allowlist to price one constant would trade a structural guarantee for
+#: a convenience: this file is the *verifier*, and it currently cannot reach truth in-process at
+#: all. So the constant crosses the same boundary the scored metrics already cross.
+#:
+#: Do not "simplify" this back into an import. The subprocess is the point.
+_MINUTES_SNIPPET = (
+    "import json;"
+    "from hisaab.scoring.metrics import MINUTES_PER_EXCEPTION as m;"
+    "print(json.dumps({r.name: v for r, v in m.items()}))"
+)
+
+
+def _priced_minutes() -> dict[str, int]:
+    """``{reason code: minutes}`` as ``metrics.MINUTES_PER_EXCEPTION`` declares it."""
+    out = _run([sys.executable, "-c", _MINUTES_SNIPPET], "reading MINUTES_PER_EXCEPTION")
+    try:
+        table = json.loads(out.splitlines()[0])
+    except (IndexError, json.JSONDecodeError) as e:
+        raise GateFailure(
+            f"could not read MINUTES_PER_EXCEPTION out of the scorer: {out!r} ({e})"
+        )
+    if not table:
+        raise GateFailure(
+            "MINUTES_PER_EXCEPTION came back empty, so comparing row 34 against it would "
+            "compare two empty tables and pass. The scorer's own assertion should make this "
+            "impossible; reaching it means the read is wrong, not that the table is."
+        )
+    return table
+
+
+def _row_34_minutes(text: str) -> dict[str, int]:
+    """``{reason code: minutes}`` as ASSUMPTIONS.md row 34 states it, in prose."""
+    rows = [ln for ln in text.splitlines() if ln.startswith("| 34 |")]
+    if len(rows) != 1:
+        raise GateFailure(
+            f"ASSUMPTIONS.md has {len(rows)} rows numbered 34, expected exactly one. The "
+            f"effort-estimate comparison reads that row, so it cannot run at all."
+        )
+    out: dict[str, int] = {}
+    for m in ROW_34_MINUTES_RE.finditer(rows[0]):
+        for code in re.findall(r"`([A-Z_]+)`", m.group(2)):
+            out[code] = int(m.group(1))
+    return out
+
+
 def gate_7_assumptions() -> None:
     """ASSUMPTIONS.md must exist and cover every topic the write-up has to state."""
     print("\ngate 7 -- ASSUMPTIONS.md")
@@ -2276,6 +2895,52 @@ def gate_7_assumptions() -> None:
             f"asks about; a missing one is a number we would end up bluffing."
         )
     print(f"    {len(REQUIRED_ASSUMPTION_TOPICS)} required topics all covered")
+
+    # --- row 34's prose must price every reason code exactly as the scorer does ----------
+    stated = _row_34_minutes(text)
+    priced = _priced_minutes()
+
+    # The vacuity guard, first: if reformatting row 34 stops the regex matching, every
+    # comparison below is between an empty dict and itself and would pass forever.
+    if not stated:
+        raise GateFailure(
+            "gate 7 parsed 0 reason codes out of ASSUMPTIONS.md row 34, so the comparison "
+            "against MINUTES_PER_EXCEPTION measured nothing. Either the row was reformatted "
+            "away from the `<minutes> (`CODE`, `CODE`)` shape ROW_34_MINUTES_RE expects, or "
+            "the codes were dropped. Both are failures -- an empty parse must never read as "
+            "agreement."
+        )
+    # And the control: the comparison must be able to fail. A code deleted from the parsed
+    # copy has to be reported, or the check cannot distinguish agreement from blindness.
+    _sabotaged = dict(stated)
+    _sabotaged.pop(sorted(_sabotaged)[0])
+    if _sabotaged == priced:
+        raise GateFailure(
+            "gate 7's own control failed: removing a code from row 34's parsed table still "
+            "compared equal to MINUTES_PER_EXCEPTION, so this check cannot detect a missing "
+            "code and its pass proves nothing."
+        )
+
+    if stated != priced:
+        unstated = {c: priced[c] for c in sorted(set(priced) - set(stated))}
+        unknown = sorted(set(stated) - set(priced))
+        disagree = {
+            c: (stated[c], priced[c])
+            for c in sorted(set(stated) & set(priced))
+            if stated[c] != priced[c]
+        }
+        raise GateFailure(
+            f"ASSUMPTIONS.md row 34 and metrics.MINUTES_PER_EXCEPTION disagree about the "
+            f"effort estimate.\n"
+            f"  priced in code but not stated in row 34: {unstated or '{}'}\n"
+            f"  stated in row 34 but not a real code   : {unknown or '[]'}\n"
+            f"  stated with different minutes           : {disagree or '{}'}\n"
+            f"The dict asserts its own exhaustiveness over Reason, so a new code cannot price "
+            f"at zero -- but nothing guarded this transcription, and row 34 is the copy a "
+            f"judge reads. Phase 8 found it listing 11 of 13 codes, omitting the "
+            f"joint-most-expensive one. Update whichever is wrong; do not let them drift."
+        )
+    print(f"    row 34 prices all {len(priced)} reason codes exactly as the scorer does")
     print(f"    {len(text.splitlines())} lines at {path.relative_to(ROOT)}")
 
 
@@ -2316,6 +2981,18 @@ def main(argv: list[str] | None = None) -> int:
         # honestly where the subset search is genuinely ambiguous -- and n=200 never presents
         # a Tier 2 pool above 64, so it cannot notice a regression in the cap Phase 7 raised.
         lambda: gate_14_phase7((200, 1000)),
+        # **Gate 15 HONOURS --skip-slow, and that breaks the pattern its two predecessors set.**
+        # Decided by measurement, which is what `.plan/phase8.md` step 10 asked for rather than
+        # copying the exemption a third time. Gates 13 and 14 ignore the flag because their
+        # subjects read literally zero at n=200 -- the reserve shortfall was invisible there, and
+        # AMBIGUOUS_MULTI_SUBSET does not occur at all. Every subject gate 15 adds is already
+        # non-vacuous at n=200: 15-16 FX-bearing credits, 19 masked genuine credits, FX_RATE_GAP
+        # at 12-34, the plainly-foreign identity at 3=3, gateway NO_CANDIDATE at 0. And the cost
+        # is the highest in this suite -- the eleven-flag matcher runs ~10.2s per n=1000 cell
+        # against 95s for the whole suite before this gate, so three of them are ~32s of the
+        # ~127s total. A size that expensive should not be paid twice for properties n=200
+        # already covers.
+        lambda: gate_15_phase8((200,) if args.skip_slow else (200, 1000)),
     ]
     try:
         for gate in gates:
@@ -2325,12 +3002,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all fourteen gates pass -- Phases 1 through 7 are complete")
-    print("\nClean mode still resolves at 100/100/0 (gate 9), and the first two rows of the")
-    print("mess dial are on: --fees wedges gross against net, --settlement-delay moves the")
-    print("dates, and the matcher holds 100% correctness with 0 wrong matches while proving")
-    print("its arithmetic per row against truth's own six-term decomposition -- term by term,")
-    print("never on the total, since a fee too high and a GST too low close the same gap.")
+    print("all fifteen gates pass -- Phases 1 through 8 are complete")
+    print("\nClean mode still resolves at 100/100/0 (gate 9), and the mess dial is now fully")
+    print("built: 12 of 13 flags implemented, eleven of them composing in one run (gate 15).")
+    print("Across every flag set in this suite the matcher holds 100% correctness with 0 wrong")
+    print("matches while proving its arithmetic per row against truth's own six-term")
+    print("decomposition -- term by term, never on the total, since a fee too high and a GST")
+    print("too low close the same gap.")
     print("\nTwo things Phase 4 settled that had been open, and both were surprises:")
     print("\n  The window is no longer untested. Gate 9's summary used to say +/-1000 days")
     print("  scored the same; gate 10 now pins --window 0 at 0% coverage under the posting")
@@ -2400,13 +3078,29 @@ def main(argv: list[str] | None = None) -> int:
     print("  single refunds_paise term would then have been partly attributable. The draw now")
     print("  excludes whole settlements. An assumption instead of an assertion would have")
     print("  shipped an incoherent refund term in silence.")
-    print("\n  One NO_CANDIDATE survives, and gate 13 permits it by identity rather than by")
-    print("  admitting the code: the credit that nets the orphan refund AND has its membership")
-    print("  withheld. An orphan refund cites a payment outside this month's file, so nothing")
-    print("  can price it; with membership declared that is REFUND_UNLINKED, an honest")
-    print("  abstention, and with membership withheld the true set is simply unreachable.")
-    print("  Admitting NO_CANDIDATE to ABSTENTION_REASONS would let every failed search score")
-    print("  as an honest refusal, and separating those two is Phase 7's whole job.")
+    print("\n  One NO_CANDIDATE used to survive here, and Phase 8 retired it rather than")
+    print("  keeping the exemption that tolerated it. The row is the credit that nets an")
+    print("  orphan refund AND has its membership withheld: the refund cites a payment outside")
+    print("  this month's file, so on a withheld settlement it is subtracted from no member and")
+    print("  the true subset sits outside the search space entirely. The search looked and")
+    print("  honestly found nothing, so gate 13 permitted exactly that row by identity.")
+    print("\n  It now gets a real code instead. The withheld-membership branch offers the")
+    print("  shortfall back as credit-plus-orphan, and where a subset appears the row abstains")
+    print("  as REFUND_UNLINKED -- naming an amount refunds.csv declares rather than one the")
+    print("  matcher fitted. Measured across seeds 1/2/3/42 at n=200 and n=1000 on both flag")
+    print("  sets: the bump reveals truth's own membership on 3 of the 4 rows and an ambiguity")
+    print("  on the 4th, with zero coincidences, and it reveals nothing on every row whose")
+    print("  truth nets no orphan refund. So the same evidence the declared-membership path")
+    print("  already used is no longer ignored one level down -- that asymmetry was the defect.")
+    print("\n  The verdict still abstains. The revealed set is deliberately discarded rather")
+    print("  than returned: resolving on it would subtract money the inputs say left SOME")
+    print("  settlement without saying it left this one, which is what the declared path")
+    print("  refuses too -- the withheld path must not be more confident than the path that")
+    print("  can see its membership. And retiring the exemption made this gate stronger, not")
+    print("  weaker: a regression in that ordering drops those rows back to NO_CANDIDATE,")
+    print("  which is outside ABSTENTION_REASONS, so the gate now catches what it used to")
+    print("  excuse. Admitting NO_CANDIDATE to that set would still be the wrong fix -- it")
+    print("  would let every failed search score as an honest refusal.")
     print("\n  The reserve is the one term deliberately left unmodelled. Its magnitude appears")
     print("  in no input file, so a rule that fitted it would close every gap by construction;")
     print("  gate 13 asserts no resolved row carries a reserve term and that all ~50 reserved")
@@ -2414,17 +3108,71 @@ def main(argv: list[str] | None = None) -> int:
     print("  NO_CANDIDATE. What a pass does NOT prove is that abstaining was the only available")
     print("  answer there -- with the held amount in no input, nothing but truth's own record")
     print("  could say otherwise, and that limit belongs in the write-up.")
+    print("\nPhase 7 put rows in the bank statement that are not gateway credits at all, and")
+    print("payments that never pay out. Gate 14 runs nine flags at once. The number to read")
+    print("there is not noise_recall (0.375 at n=200, 0.389-0.405 at n=1000) but the identity")
+    print("beside it: rows IGNORED == plainly_foreign rows in the manifest, checked in BOTH")
+    print("directions. Only one of the three noise strata is ignorable -- the other two carry")
+    print("a gateway counterparty by construction -- so a recall rate looks like a shortfall")
+    print("while the matcher is in fact setting aside every row it is entitled to and not one")
+    print("more. A ratio would have hidden a plainly-foreign row leaking into a diagnosis")
+    print("behind a look-alike row leaking into IGNORED; the identity cannot.")
+    print("\nPhase 8 added foreign currency and missing UTRs, and gate 15 runs eleven flags.")
+    print("It is the phase where a headline number got worse on purpose.")
+    print("\n  --fx costs about 19% of coverage, and that is the correct price. A foreign")
+    print("  payment settles at the rate on the settlement day; payments.csv keeps the gross")
+    print("  recorded at capture. So when such a payment sits in the candidate pool, Tier 2")
+    print("  can no longer argue the subset it found is the ONLY one summing to the credit --")
+    print("  the inference is voided rather than widened, and rows that would have resolved")
+    print("  abstain instead. Coverage reads 56.11%-71.20% against Phase 7's 86%-92%. Before")
+    print("  that fix, --fx on generator-drawn data produced 7 wrong matches; the plan's")
+    print("  hand-moved fixture could not see them. This hole cannot be closed the way Phase")
+    print("  6's was: a refund is declared in refunds.csv and can be looked up, but the")
+    print("  settlement-day rate is declared in NO input file. That is the entire flag.")
+    print("\n  --utr-patchy strips the reference tail from 15% of bank narrations, and")
+    print("  wrong_ignore stays 0 -- which on its own proves nothing. Measured: with")
+    print("  --utr-patchy --noise-rows alone, ZERO masked credits ever reach the ignore gate,")
+    print("  because everything resolves on the amount arithmetic first. The clean zero was")
+    print("  vacuous. Only --reserve delivers rows there; of the 12 that arrive, the real")
+    print("  two-test conjunction ignores 0 while the rejected 'no readable tail is enough'")
+    print("  rule would have ignored all 12. So gate 15 prints the population (19 masked")
+    print("  credits at n=200) beside the zero, rather than a zero whose denominator")
+    print("  nobody stated.")
+    print("\n  And one flag was declined on the strength of a measurement. --rounding-edge")
+    print("  was specified to make the two sides disagree about rounding; they cannot,")
+    print("  because mul_bps is defined once and shared while only the rates are duplicated.")
+    print("  Nor is the behaviour dormant: over 12,000 calls the division is inexact 2,183")
+    print("  times per 1,000-payment run, half-up beats truncation 1,125 times, and an exact")
+    print("  half -- the only case where half-up and banker's rounding differ -- arises 81.5")
+    print("  times. Declining it also keeps a check honest: rounding_edge stays permanently")
+    print("  declared-and-inert, so unimplemented() keeps a real subject instead of quietly")
+    print("  emptying. #23's Tier 3 tolerance is refused on the same footing -- 2 of 223")
+    print("  FX rows sit within its +/-50 paise, and resolving them would mean declaring 50")
+    print("  paise unexplained, which is what an exception IS here.")
     print("\nWhat this still does NOT prove: the business-day calendar is exercised only by")
     print("its own unit test, and the narration parser is still not on the match path at all")
-    print("(gated, deliberately -- gate 11 reads narrations to attack the data, never to")
-    print("resolve it). A planted pair is shown to defeat the two strategies this data")
+    print("(gated, deliberately -- gates 11 and 15 read narrations to attack the data, never")
+    print("to resolve it). A planted pair is shown to defeat the two strategies this data")
     print("supports -- date-plus-amount and the UTR tail -- plus the amount arithmetic, not")
     print("every conceivable one; and three-way collisions are refused by I12 at generation")
-    print("time rather than scored.")
-    print("\nNext: Phase 7, --noise-rows and --unsettled -- bank rows that are not gateway")
-    print("credits, and payments that never pay out. Phase 6 leaves it a debt it can now")
-    print("collect: NO_CANDIDATE still means 'nothing plausibly matches', carrying exactly one")
-    print("characterised row rather than a silent pile of reserved and refunded ones.")
+    print("time rather than scored. The masked-credit defence is exercised only where")
+    print("--reserve carries rows to the ignore gate, so it is 12 rows that hold it up, not")
+    print("19 per run. And a coverage figure of 56% is a claim about THIS flag set: it is")
+    print("not comparable to Phase 7's 86% without naming both.")
+    print("\nNext: Phase 9, exception ranking -- and Phase 8 hands it a queue with a shape it")
+    print("has to be told about. A row where a withheld reserve and an FX rate move are both")
+    print("consistent with the same gap is not hypothetical, so a verdict naming one cause")
+    print("would have Phase 9 ranking a guess.")
+    print("\nThree reason codes also close here, and they are producerless in three different")
+    print("senses -- worth separating, because Phase 9 would otherwise rank codes that cannot")
+    print("appear. CREDIT_MISSING has no construction site at all: Phase 7 made it structurally")
+    print("unreachable by emitting one verdict per bank row, so a settlement with no credit has")
+    print("no verdict slot to carry it. SETTLEMENT_MISSING IS constructed (tier1.py), but the")
+    print("branch is unreachable through the loader -- load.py refuses a settlement citing an")
+    print("unknown payment before the matcher runs -- so it is defence against that check being")
+    print("weakened, not a code that fires. ROUNDING_DRIFT is producerless as a direct result of")
+    print("declining --rounding-edge. Phase 8 is the last phase that adds flags, so it is the")
+    print("last that could have given any of the three a producer.")
     return 0
 
 

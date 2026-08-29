@@ -25,7 +25,12 @@ from pathlib import Path
 #: duplicated rather than imported: the scorer must not depend on the generator,
 #: so that a schema drift between them surfaces as a loud version mismatch
 #: instead of being hidden by a shared constant.
-SUPPORTED_SCHEMA_VERSION = 1
+#:
+#: **v2 (Phase 8 step 2b):** the decomposition block gains ``fx_paise``. Bumped here in the same
+#: change that bumps the generator's copy -- the duplication above only pays off if both move
+#: together, and a scorer left at v1 would reject every regenerated run with the version error
+#: below, which is the loud failure the duplication is designed to produce.
+SUPPORTED_SCHEMA_VERSION = 2
 
 TRUTH_JSON = "truth.json"
 MANIFEST_JSON = "run_manifest.json"
@@ -46,10 +51,21 @@ class TruthDecomposition:
     refunds_paise: int
     reserve_paise: int
     expected_credit_paise: int
+    #: Phase 8 (``--fx``): the rate movement between capture and settlement, in paise. The one
+    #: **signed** term, and the one that is **added** -- design (b) leaves ``payments.csv``'s
+    #: gross stale at the capture rate while the payout is right at the settlement rate.
+    #:
+    #: Last in declaration order, and with a default, so this stays a widening rather than a
+    #: rewrite: every positional ``TruthDecomposition(value, 0, 0, 0, 0, 0, value)`` in the
+    #: scorer's own fixtures keeps meaning what it meant. The generator's copy carries the same
+    #: field; ``common/verdict.Decomposition`` deliberately does **not** -- a term the matcher
+    #: could populate is a term it could fit any residual into. That asymmetry is why
+    #: ``metrics.DECOMPOSITION_TERMS`` does not list this one.
+    fx_paise: int = 0
 
     def closes(self) -> bool:
         return self.expected_credit_paise == (
-            self.gross_paise - self.fee_paise - self.gst_paise
+            self.gross_paise + self.fx_paise - self.fee_paise - self.gst_paise
             - self.tds_paise - self.refunds_paise - self.reserve_paise
         )
 
@@ -194,6 +210,14 @@ def load_truth(truth_dir: Path | str) -> Truth:
             refunds_paise=_require_int(d, "refunds_paise", where),
             reserve_paise=_require_int(d, "reserve_paise", where),
             expected_credit_paise=_require_int(d, "expected_credit_paise", where),
+            # **Required, not ``.get``-with-default**, even though the dataclass defaults it.
+            # This file refuses absent-versus-null branches by policy (see the ``reason``/``note``
+            # comment below): a reader that tolerates a missing key grows a branch per field, and
+            # one of those branches is eventually wrong. A v2 answer key always writes this term,
+            # at 0 without ``--fx``, so a missing one means a v1 document that the version pin
+            # above has already rejected -- or a generator that forgot the term, which is exactly
+            # what should fail loudly here rather than score as agreement.
+            fx_paise=_require_int(d, "fx_paise", where),
         )
         if not dec.closes():
             raise TruthError(f"{where}: decomposition does not close to expected_credit_paise")

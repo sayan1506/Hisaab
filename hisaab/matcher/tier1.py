@@ -80,6 +80,26 @@ TIER_2 = 2
 # pool manufactures ambiguity that costs coverage while looking generous.
 SETTLEMENT_CYCLE_DAYS = 2
 
+#: The currency these books are kept in. A payment captured in anything else has a
+#: ``gross_paise`` fixed at the **capture-day** rate, while its settlement's net and its bank
+#: credit reflect the **settlement-day** rate -- so the recorded gross is stale by an amount no
+#: input file declares. Phase 8's ``--fx``.
+#:
+#: A *declared assumption* in the same sense as ``SETTLEMENT_CYCLE_DAYS`` and the fee rates in
+#: ``fees.py``: read off the merchant's own reporting currency, and wrong for a merchant who
+#: keeps books elsewhere.
+#:
+#: **Deliberately not derived from the data.** "Whatever most payments use" would be a majority
+#: vote that agrees with the file by construction -- and on a file where every payment is
+#: foreign it would report no foreign payments at all, which is the failure mode that makes a
+#: derived constant worse than a wrong declared one: it cannot be contradicted.
+#:
+#: Read only where the subset search has already found nothing, and only to *name* a cause --
+#: it can never turn an abstention into a match. What the column supplies is that a rate
+#: applies, never its magnitude, which is why ``FX_RATE_GAP`` stays an honest refusal rather
+#: than a gap this matcher could close if it tried harder.
+HOME_CURRENCY = "INR"
+
 #: How far above a credit this matcher will look for a settlement when the exact join found
 #: **nothing**, expressed in basis points of the credit. A *declared assumption* about the
 #: counterparty's rolling-reserve policy, in exactly the sense the fee rates in ``fees.py`` and
@@ -265,6 +285,49 @@ def _tier2_pool(settled_on: date, dataset: Dataset) -> list[Payment]:
     ]
 
 
+def _count_distinct_sets(
+    hypotheses: list[list[Member]], target: int
+) -> tuple[list[frozenset[str]], bool, PoolTooLarge | None]:
+    """Search every reading at one target, counting the *distinct* sets across all of them.
+
+    **Extracted in Phase 8 with no behaviour change.** The body is the loop that sat inline in
+    ``_search_membership``; it is lifted out because the refunds-first ordering below has to run
+    the same readings against a **second** target -- the credit plus a declared orphan refund.
+    Re-searching by copying the loop would make two copies of the precedence rule that
+    ``_search_membership`` documents as a measured wrong-match bug (one wrong match in 627 on
+    seed 1 at n=1000, from letting a unique-but-wrong answer override a known ambiguity), and a
+    duplicated rule is the copy that drifts.
+
+    Returns ``(found, split, over_cap)``:
+
+      * ``found`` -- the distinct payment-id sets, in discovery order. A reading reporting two
+        or more contributes **both**, because the question is not "does this reading resolve?"
+        but "can anything I know explain this credit in more than one way?".
+      * ``split`` -- whether any single reading itself reported two or more. Carried separately
+        from ``len(found)``: two readings each finding one *different* set is also an ambiguity,
+        but it is a different sentence in the note, and the caller says which.
+      * ``over_cap`` -- a pool refusal, if any reading was refused before searching. The last
+        one wins, which is deliberate rather than careless: the caller treats *any* refusal as
+        fatal ("half a search is not a search"), so which reading reported it cannot change the
+        verdict, and overwriting is what keeps this extraction behaviour-identical.
+    """
+    found: list[frozenset[str]] = []
+    split = False
+    over_cap: PoolTooLarge | None = None
+    for members in hypotheses:
+        result = tier2_resolve(members, target)
+        if isinstance(result, PoolTooLarge):
+            over_cap = result
+        elif isinstance(result, TwoOrMore):
+            split = True
+            for candidate_set in (result.first, result.second):
+                if candidate_set not in found:
+                    found.append(candidate_set)
+        elif isinstance(result, ExactlyOne) and result.payment_ids not in found:
+            found.append(result.payment_ids)
+    return found, split, over_cap
+
+
 def _search_membership(
     credit: Credit,
     candidate: Candidate,
@@ -383,20 +446,7 @@ def _search_membership(
     # unique-but-wrong answer overrode the known ambiguity and the row resolved wrongly. One
     # wrong match in 627, and the whole point of the third axis is that this is the number that
     # may not be traded.
-    found: list[frozenset[str]] = []
-    split = False
-    over_cap: PoolTooLarge | None = None
-    for members in hypotheses:
-        result = tier2_resolve(members, credit.amount_paise)
-        if isinstance(result, PoolTooLarge):
-            over_cap = result
-        elif isinstance(result, TwoOrMore):
-            split = True
-            for candidate_set in (result.first, result.second):
-                if candidate_set not in found:
-                    found.append(candidate_set)
-        elif isinstance(result, ExactlyOne) and result.payment_ids not in found:
-            found.append(result.payment_ids)
+    found, split, over_cap = _count_distinct_sets(hypotheses, credit.amount_paise)
 
     if over_cap is not None:
         # A bounded refusal, and deliberately **not** an ``ABSTENTION_REASONS`` code: the
@@ -436,11 +486,127 @@ def _search_membership(
             ),
         )
 
+    # **Read off the POOL, not off any found subset, and that is the whole subtlety.** A stale
+    # gross belongs to a payment in the *true* membership -- which is precisely what this search
+    # does not know. Measured at seed 1, n=1000: all five wrong matches chose an entirely
+    # domestic subset (``got_fgn=0``) while the true set held one foreign member, so a test on
+    # the found rows would have caught none of them. The pool is the only set the matcher can
+    # ask about before it has committed.
+    #
+    # Hoisted out of the ``not found`` branch below because Phase 8 step 5 gave it a second
+    # reader: the same fact now also voids a *successful* search. Zero cost when ``--fx`` is
+    # off -- no foreign payment, empty list, both readers fall through.
+    foreign = sorted({p.currency for p in pool if p.currency != HOME_CURRENCY})
+    n_foreign = sum(1 for p in pool if p.currency != HOME_CURRENCY)
+
     if not found:
-        # Not a cue to widen the pool. Either a payment is missing from the data or a
-        # deduction this matcher does not model was taken; widening the window until
-        # something adds up would convert both into a match, which is the failure mode
+        # Nothing sums to the credit under any reading. **Three different facts produce that,
+        # and Phase 8 separates them here in a fixed order -- declared causes before
+        # undeclared ones.** Before this branch existed the row abstained as ``NO_CANDIDATE``
+        # for all three, which is honest about the search and silent about the cause.
+        #
+        # Still not a cue to widen the pool, in any of the three: widening the window until
+        # something adds up converts a missing payment into a match, which is the failure mode
         # Phase 4 measured for the nearest-date tie-break.
+
+        # --- 1. an orphan refund, which the inputs DECLARE -------------------------------
+        # ``refunds_by_payment`` keys only payments present in ``payments.csv`` (``load.py``
+        # decision 9, so unattributable money cannot close a gap), so an orphan refund is
+        # subtracted from **no** member and every reading above sums to a target the credit
+        # sits below by exactly that refund. Offering the shortfall back is therefore a
+        # *lookup* on a declared amount, not a fitted magnitude -- the same evidence the
+        # declared-membership path uses one level up, which until Phase 8 the withheld path
+        # ignored. That asymmetry was the bug: the same orphan refund named on a declared
+        # settlement was invisible on a withheld one.
+        #
+        # **Measured before it was written** (`.plan/probe_phase8_refunds_first.py`, seeds
+        # 1/2/3/42 at n=200 and n=1000, both the Phase 6 and Phase 7 flag sets): of the 4 rows
+        # that reach here on a non-FX run, the bump reveals **truth's own membership on 3 and
+        # an ambiguity on the 4th**, with **zero coincidences** -- and on every row whose truth
+        # nets no orphan refund, the bump reveals nothing at all. So this test does not fire
+        # where it must not.
+        #
+        # **It names the cause and still abstains.** The set the bump reveals is deliberately
+        # discarded rather than returned: resolving on it would mean subtracting money that
+        # the inputs say left *some* settlement without saying it left *this* one -- exactly
+        # what the declared path refuses two branches down, and the withheld path must not be
+        # more confident than the path that can see its membership.
+        for orphan in dataset.orphan_refunds():
+            # ``over_cap`` cannot newly fire here: the hypotheses are the same lists, so the
+            # pool size is unchanged and a refusal would already have returned above.
+            revealed, _split, _cap = _count_distinct_sets(
+                hypotheses, credit.amount_paise + orphan.amount_paise
+            )
+            if revealed:
+                how = (
+                    f"{len(revealed)} different subsets do"
+                    if len(revealed) > 1
+                    else f"a subset of {len(sorted(revealed[0]))} payment(s) does"
+                )
+                return Verdict(
+                    credit.credit_id,
+                    Outcome.EXCEPTION,
+                    reason=Reason.REFUND_UNLINKED,
+                    note=(
+                        f"matched {settlement_id} on date and amount, its membership is "
+                        f"undeclared, and no subset sums to {credit.amount_paise}p -- but "
+                        f"{how} sum to {credit.amount_paise + orphan.amount_paise}p, which is "
+                        f"this credit plus {orphan.refund_id} ({orphan.amount_paise}p). That "
+                        f"refund cites {orphan.payment_id}, which is not in payments.csv, so "
+                        f"the money left a settlement and nothing in the input files says it "
+                        f"left this one. The amount is declared, so the shortfall is named "
+                        f"rather than fitted -- and the membership is still not proved, so a "
+                        f"human decides"
+                    ),
+                )
+
+        # --- 2. a foreign-currency payment, whose rate the inputs DO NOT declare ----------
+        # Phase 8's ``--fx``: a payment captured in a foreign currency carries a
+        # ``gross_paise`` fixed at the **capture-day** rate, while the settlement's net and the
+        # bank credit both reflect the **settlement-day** rate. Every reading above is built
+        # from the recorded gross, so a stale figure puts the true membership outside the
+        # search space -- the same shape as the refund bug, minus the fix, because the
+        # settlement-day rate is declared in **no input file**. There is nothing to look up and
+        # no fifth hypothesis that is not a free parameter.
+        #
+        # **The witness is the currency column, and it says only *that* a rate applies.** It is
+        # read rather than the *magnitude* inferred, which is the whole distinction from
+        # ``UNEXPLAINED_RESIDUAL``: that code means "the gap is measurable and no rule I have
+        # accounts for it" -- reachable, and the honest answer where membership *is* declared,
+        # because there the recorded grosses can be summed and the gap computed. Here there is
+        # no declared set to sum, so the gap has no measurable value at all. Different facts,
+        # different codes; sharing one would make a measurable gap and an unmeasurable one
+        # indistinguishable in every report.
+        #
+        # **Keyed on ``currency``, never on ``method``** -- decision 7. ``config.py``'s
+        # ``international_card`` is about where a card was issued, not what currency was
+        # charged, so keying on the method would make FX-ness readable from a column the
+        # generator sets for unrelated reasons.
+        #
+        # **And it is deliberately not a catch-all.** With no foreign-currency payment in the
+        # pool the row falls through to ``NO_CANDIDATE`` below, which keeps its own meaning: a
+        # payment is genuinely missing from the file, or a deduction is unmodelled. Admitting
+        # every failed search here would let a missing capability score as an honest refusal,
+        # and separating those two is what Phase 7 was for.
+        if foreign:
+            return Verdict(
+                credit.credit_id,
+                Outcome.EXCEPTION,
+                reason=Reason.FX_RATE_GAP,
+                note=(
+                    f"matched {settlement_id} on date and amount, but no subset of the "
+                    f"{len(pool)} payment(s) captured within {SETTLEMENT_CYCLE_DAYS}bd sums to "
+                    f"{credit.amount_paise}p at gross or net of the declared rates -- and "
+                    f"{n_foreign} of them were captured in {', '.join(foreign)}, whose "
+                    f"gross_paise is fixed at the capture-day rate while this settlement's net "
+                    f"and its credit are not. No input file carries the settlement-day rate, "
+                    f"so the gap cannot be closed from these inputs -- only recognised. "
+                    f"Fitting a rate that makes the arithmetic work would be choosing a free "
+                    f"parameter, so a human supplies the rate"
+                ),
+            )
+
+        # --- 3. neither: the search looked and found nothing ------------------------------
         return Verdict(
             credit.credit_id,
             Outcome.EXCEPTION,
@@ -450,6 +616,72 @@ def _search_membership(
                 f"{len(pool)} payment(s) captured within {SETTLEMENT_CYCLE_DAYS}bd sums to "
                 f"{credit.amount_paise}p, at gross or net of the declared rates -- a payment "
                 f"is missing or a deduction is unmodelled, and the window stays fixed"
+            ),
+        )
+
+    # --- exactly one subset hit, and a foreign payment makes that stop being proof ---------
+    # **Phase 8 step 5, and it is a correctness fix rather than a coverage choice.** Everything
+    # above rests on one inference: exactly one subset of the pool sums to the credit, therefore
+    # it is the membership. That holds only while the true subset is *in* the search space, and
+    # a foreign payment is exactly the condition under which it is not -- design (b) leaves
+    # ``payments.csv``'s gross at the capture-day rate while the settlement's net and the credit
+    # carry the settlement-day one, so a true member is priced wrong in every reading here.
+    #
+    # Measured rather than argued (`.plan/probe_phase8_fx_withheld_real.py`, seeds 1/2/3/42 at
+    # n=1000, six flags): **7 wrong matches** -- 5 at seed 1, 2 at seed 3, none on the same
+    # seeds with ``--fx`` off. At seed 1 the arithmetic is exact on all five, and it names the
+    # mechanism with no room for interpretation::
+    #
+    #     sum(net over the TRUE members) + fx_paise == credit_amount
+    #
+    # So the true subset sums to ``credit - fx``, the search targets ``credit``, the true set is
+    # provably absent, and an unrelated all-domestic subset hit the target by coincidence. Seed
+    # 1's 21 FX-bearing withheld credits went 16 ``FX_RATE_GAP`` + 5 wrong + **0 correct**.
+    # ``AMBIGUOUS_MULTI_SUBSET`` also *fell* (-1/-2/-4 across seeds), which is the same fact
+    # from the other side: removing the true subset turns honest ambiguity into false certainty.
+    #
+    # **Why the check cannot be narrower.** Three sharper tests were measured and refused:
+    #
+    #   * *Test the found subset for foreign members* -- catches none of the seven. Every wrong
+    #     subset was entirely domestic; the foreign payment is in the true set, which is the set
+    #     the search failed to find.
+    #   * *Compare the re-derived fee/GST/TDS against ``settlements.csv``'s declared columns* --
+    #     a perfect discriminator on the runs that have ``--tds`` (1,220 correct subsets kept,
+    #     all 7 wrong ones caught) and **catastrophic without it**: on ``--fees`` alone the
+    #     generator withholds no tax while this schedule derives 10 bps, so the tuple never
+    #     agrees and it rejects 163 of 163 *correct* subsets. ``adjustments.py`` documents that
+    #     divergence and I measured around it. It is also refused structurally --
+    #     ``check_isolation.py`` check 7 keeps those three columns out of the resolution path,
+    #     for the reason ``fees.py`` gives: consuming a declared deduction closes the residual
+    #     the instant ``--fees`` populates it, and coverage becomes a tautology.
+    #   * *Bound the FX magnitude and re-search* -- fitting a free parameter, which is the one
+    #     thing this row may not do. No input file carries the settlement-day rate.
+    #
+    # **The cost is real, stated, and paid deliberately.** At seed 1, 122 of the 141 withheld
+    # credits that resolve correctly today have a foreign payment somewhere in their pool (~19%
+    # of all credits), and they become abstentions. The pool is a date window, not a settlement,
+    # so 80 foreign payments in a 1,000-payment month contaminate nearly every window -- the
+    # coarseness is inherent to what the matcher is allowed to know, not to this check. What is
+    # bought is that correctness stops depending on whether a coincidence happened to be unique,
+    # and every lost row carries an ``ABSTENTION_REASONS`` code instead of a wrong answer.
+    if foreign:
+        return Verdict(
+            credit.credit_id,
+            Outcome.EXCEPTION,
+            reason=Reason.FX_RATE_GAP,
+            note=(
+                f"matched {settlement_id} on date and amount, and exactly one subset of the "
+                f"{len(pool)} payment(s) captured within {SETTLEMENT_CYCLE_DAYS}bd sums to "
+                f"{credit.amount_paise}p -- but {n_foreign} payment(s) in that pool were "
+                f"captured in {', '.join(foreign)}, whose gross_paise is fixed at the "
+                f"capture-day rate while this settlement's net and its credit are not. A "
+                f"member priced at a stale rate cannot be summed to the target, so the true "
+                f"membership need not be in the search space at all and this single hit is not "
+                f"evidence that it was found: a subset drawn entirely from the other payments "
+                f"can sum to the same number by coincidence, which is measured at 7 wrong "
+                f"matches across four seeds when this row resolves. No input file carries the "
+                f"settlement-day rate, so the uniqueness cannot be re-established -- only "
+                f"reported. A human supplies the rate"
             ),
         )
 
@@ -981,15 +1213,23 @@ if __name__ == "__main__":
     from .load import Credit as C
     from .load import Dataset as D
     from .load import Payment as P
+    from .load import Refund as R
     from .load import Settlement as S
 
     mon, tue = date(2026, 8, 10), date(2026, 8, 11)
     when = datetime(2026, 8, 10, 5, 34, 22, tzinfo=timezone.utc)
 
-    def payment(pid: str, gross: int, method: str = "card") -> P:
+    def payment(
+        pid: str, gross: int, method: str = "card", currency: str = HOME_CURRENCY
+    ) -> P:
         # The method is now load-bearing, not decoration: the fee rate is looked up by it,
         # so a residual cannot be explained from the amount alone.
-        return P(pid, f"ord_{pid[4:]}", when, gross, method, "INR", "captured")
+        #
+        # ``currency`` is settable for Phase 8's ``FX_RATE_GAP`` fixtures, and it defaults to
+        # ``HOME_CURRENCY`` rather than to the literal ``"INR"`` so that re-pointing the
+        # constant cannot leave the fixtures asserting against a currency the matcher no longer
+        # treats as domestic -- which would turn every fixture below into an FX row at once.
+        return P(pid, f"ord_{pid[4:]}", when, gross, method, currency, "captured")
 
     def settlement(
         sid: str, on: date, net: int, tail: str = "0000", fee_paise: int = 0
@@ -1001,8 +1241,12 @@ if __name__ == "__main__":
     def credit(cid: str, on: date, amount: int, narration: str = "NEFT-RAZORPAYSOFT-XXXX8104") -> C:
         return C(cid, on, amount, narration)
 
-    def dataset(payments, settlements, credits, items) -> D:
-        return D(tuple(payments), tuple(settlements), tuple(credits), (), items)
+    def dataset(payments, settlements, credits, items, refunds=()) -> D:
+        # ``refunds`` defaults to empty, which is what every pre-Phase-8 fixture passed
+        # positionally. Phase 8's refunds-first ordering needs an *orphan* refund on the file
+        # (one citing a payment absent from ``payments``), so the parameter is exposed rather
+        # than the tuple being hard-coded.
+        return D(tuple(payments), tuple(settlements), tuple(credits), tuple(refunds), items)
 
     def verdict_of(ds: D, cid: str, **kwargs) -> Verdict:
         index = SettlementIndex(ds.settlements)
@@ -1698,6 +1942,176 @@ if __name__ == "__main__":
     v = verdict_of(unreachable, "C0001")
     assert v.outcome is Outcome.EXCEPTION
     assert v.reason is Reason.NO_CANDIDATE, v.reason
+    assert "window stays fixed" in (v.note or ""), v.note
+
+    # (3a-3d) Phase 8 splits that empty-search branch three ways, **declared causes before
+    # undeclared ones**, and these four fixtures are deliberately a matched set: (3) above and
+    # (3a) differ in *one field*, (3b) and (3c) differ in the same one field, and (3d) is the
+    # control that stops the refund test from being a rubber stamp. A fixture suite that only
+    # showed each new code firing somewhere would not distinguish "the branch works" from
+    # "the branch fires on everything", which is the failure the ordering exists to prevent.
+
+    # (3a) The same numbers as (3), with the member captured in a foreign currency ->
+    # FX_RATE_GAP. The pairing is the argument: identical pool, identical target, identical
+    # settlement, and the *only* difference is a column whose whole content is "a rate applies
+    # here". So a pass cannot be attributed to the amounts.
+    fx_row = dataset(
+        [payment("pay_0001", 40_000, currency="USD")],
+        [settlement("setl_0005", mon, 99_999, "8104")],
+        [credit("C0001", mon, 99_999)],
+        {},
+    )
+    v = verdict_of(fx_row, "C0001")
+    assert v.outcome is Outcome.EXCEPTION
+    assert v.reason is Reason.FX_RATE_GAP, v.reason
+    assert v.tier is None, "an abstention claims no tier"
+    assert v.payment_ids == () and v.settlement_ids == (), (
+        "the verdict contract forbids an abstention from carrying ids -- and here it matters "
+        "twice, because a row this matcher cannot price must not look like a match to the "
+        "scorer's set-equality join"
+    )
+    assert "USD" in (v.note or ""), (
+        f"the note must name the currency it read, so a human can check the claim against "
+        f"payments.csv rather than taking the code's word for it: {v.note}"
+    )
+    assert "capture-day rate" in (v.note or ""), v.note
+    # The distinction from UNEXPLAINED_RESIDUAL has to be *in the note*, or the two codes are
+    # one code with two spellings: this one says the gap has no measurable value at all,
+    # because no declared set exists to sum. See the branch comment.
+    assert "No input file carries the settlement-day rate" in (v.note or ""), v.note
+    # Wording unique to THIS branch, because step 5 gave ``FX_RATE_GAP`` a second call site
+    # whose note also says "capture-day rate" and also says "No input file carries the
+    # settlement-day rate". Without an assertion on the half that differs, this fixture would
+    # pass against a mutant that reached the *other* site -- the identical failure Phase 8 step
+    # 1 hit with ``REFUND_UNLINKED``, where one code from two sites made a wrong verdict look
+    # right because the code and its cited evidence both matched.
+    assert "no subset of the" in (v.note or ""), (
+        f"this fixture pins the EMPTY-SEARCH site, whose note must say nothing summed: {v.note}"
+    )
+
+    # (3a2) The same code from the **other** site, and the pairing is again the argument:
+    # ``pay_0001``'s gross is now exactly the credit, so exactly one subset hits and the search
+    # *succeeds*. A foreign payment in the pool voids the uniqueness inference anyway -- the true
+    # membership need not be in the search space at all, so one hit is not evidence it was found.
+    # Phase 8 step 5, measured at 7 wrong matches across seeds 1/2/3/42 at n=1000 before this
+    # branch existed.
+    fx_unique = dataset(
+        [payment("pay_0001", 99_999, currency="USD")],
+        [settlement("setl_0005", mon, 99_999, "8104")],
+        [credit("C0001", mon, 99_999)],
+        {},
+    )
+    v = verdict_of(fx_unique, "C0001")
+    assert v.outcome is Outcome.EXCEPTION, (
+        f"a unique subset hit with a foreign payment in the pool must not resolve: {v}"
+    )
+    assert v.reason is Reason.FX_RATE_GAP, v.reason
+    assert v.payment_ids == () and v.settlement_ids == (), (
+        "the abstention must carry no ids, even though a subset WAS found -- the found set is "
+        "deliberately discarded rather than reported, exactly as the orphan-refund branch "
+        "discards the set its bump reveals"
+    )
+    assert "exactly one subset of the" in (v.note or ""), (
+        f"the note must say the search succeeded and was overruled, or it is indistinguishable "
+        f"from the empty-search site above: {v.note}"
+    )
+    assert "coincidence" in (v.note or ""), v.note
+
+    # (3a3) **The control that could embarrass (3a2)**, and it is the one that matters: the same
+    # numbers with the payment domestic must RESOLVE. Without it, (3a2) would pass just as well
+    # against a matcher that had stopped resolving withheld settlements altogether -- an
+    # abstention-on-everything is trivially free of wrong matches, and the coverage cost of the
+    # veto is only defensible if it is confined to pools that actually hold a foreign payment.
+    domestic_unique = dataset(
+        [payment("pay_0001", 99_999)],
+        [settlement("setl_0005", mon, 99_999, "8104")],
+        [credit("C0001", mon, 99_999)],
+        {},
+    )
+    v = verdict_of(domestic_unique, "C0001")
+    assert v.outcome is Outcome.RESOLVED, (
+        f"an all-domestic pool with one exact subset must still resolve -- the veto is keyed on "
+        f"the currency column, not on the search succeeding: {v.outcome} / {v.reason}"
+    )
+    assert v.payment_ids == ("pay_0001",), v.payment_ids
+
+    # (3b) A withheld settlement whose shortfall is a **declared** orphan refund ->
+    # REFUND_UNLINKED, not FX_RATE_GAP and not NO_CANDIDATE. ``refunds_by_payment`` keys only
+    # payments present in the file, so rfnd_0001 is subtracted from no member and every reading
+    # sums to 50_000 while the credit is 30_000 -- short by exactly the refund.
+    orphan_withheld = dataset(
+        [payment("pay_0001", 50_000)],
+        [settlement("setl_0005", mon, 30_000, "8104")],
+        [credit("C0001", mon, 30_000)],
+        {},
+        refunds=[R("rfnd_0001", "pay_9999", when, 20_000)],
+    )
+    v = verdict_of(orphan_withheld, "C0001")
+    assert v.outcome is Outcome.EXCEPTION
+    assert v.reason is Reason.REFUND_UNLINKED, v.reason
+    assert "rfnd_0001" in (v.note or "") and "pay_9999" in (v.note or ""), (
+        f"the note must name the refund and the payment it cites, which is what makes this a "
+        f"lookup a human can verify rather than a magnitude the matcher fitted: {v.note}"
+    )
+    # **Which branch produced this, asserted rather than assumed.** ``REFUND_UNLINKED`` is
+    # raised from *two* sites -- here (membership withheld, the bump revealed a set) and the
+    # declared-membership path further down (a gap that closes only if an orphan is assumed) --
+    # and both notes name the refund and the payment it cites. So the assertions above cannot
+    # tell them apart, and this fixture was **measured passing against a mutant that returned
+    # the revealed set** (`.plan/probe_phase8_branch_mutants.py`): the row resolved, the money
+    # proof failed to close the 20,000p gap, the declared path then named the same orphan, and
+    # every assertion above still held. The verdict was right by accident.
+    #
+    # This is the ``check-must-fire-its-own-assertion`` failure exactly: one code from many
+    # sites hides which one fired. The withheld-path note is the only thing that distinguishes
+    # them, so it is what gets asserted.
+    assert "its membership is undeclared" in (v.note or ""), (
+        f"this must be the withheld-membership branch, not the declared-membership orphan "
+        f"branch that emits the same code: {v.note}"
+    )
+    assert "no subset sums to" in (v.note or ""), v.note
+    # **The bump revealed pay_0001, and the verdict must still carry nothing.** This is the
+    # assertion that keeps the withheld path from being more confident than the declared path,
+    # which names the same orphan and also refuses to resolve on it. Resolving here would mean
+    # subtracting money the inputs say left *some* settlement without saying it left this one.
+    assert v.payment_ids == () and v.settlement_ids == (), (
+        f"the revealed set must be discarded, not returned: {v.payment_ids}"
+    )
+    assert v.tier is None, "an abstention claims no tier"
+
+    # (3c) The ordering itself, and it is the fixture the whole decision rests on: the same row
+    # as (3b) with the member *also* foreign, so **both** causes are present. Declared wins --
+    # an amount ``refunds.csv`` states beats a rate no file carries. Reversed, every
+    # orphan-refund row on an FX run would be relabelled as an unpriceable currency gap and the
+    # named, checkable cause would be lost.
+    both_causes = dataset(
+        [payment("pay_0001", 50_000, currency="USD")],
+        [settlement("setl_0005", mon, 30_000, "8104")],
+        [credit("C0001", mon, 30_000)],
+        {},
+        refunds=[R("rfnd_0001", "pay_9999", when, 20_000)],
+    )
+    v = verdict_of(both_causes, "C0001")
+    assert v.reason is Reason.REFUND_UNLINKED, (
+        f"a declared orphan refund must outrank an undeclared FX rate, got {v.reason}"
+    )
+
+    # (3d) The control on the refund test: an orphan refund whose amount closes *nothing*.
+    # Bumping by 777p makes no reading sum, so the branch must decline and fall through --
+    # here to NO_CANDIDATE, because the member is domestic. Without this, "an orphan refund
+    # exists on the file" would be indistinguishable from "an orphan refund explains this gap",
+    # and the refunds branch would be a rubber stamp on every run that has one.
+    orphan_irrelevant = dataset(
+        [payment("pay_0001", 50_000)],
+        [settlement("setl_0005", mon, 30_000, "8104")],
+        [credit("C0001", mon, 30_000)],
+        {},
+        refunds=[R("rfnd_0001", "pay_9999", when, 777)],
+    )
+    v = verdict_of(orphan_irrelevant, "C0001")
+    assert v.reason is Reason.NO_CANDIDATE, (
+        f"an orphan refund that closes nothing must not be named as the cause, got {v.reason}"
+    )
     assert "window stays fixed" in (v.note or ""), v.note
 
     # (4) the pool is over the cap -> refused before the search runs, and the code is

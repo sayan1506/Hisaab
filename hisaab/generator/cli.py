@@ -50,7 +50,7 @@ FLAG_HELP: dict[str, str] = {
     "fx": "rate moves between capture and settlement (Phase 8)",
     "rounding_edge": "amounts where fee x GST lands on a half-paisa (Phase 8)",
     "settlement_report_late": "withhold settlement_items.csv, forcing subset-sum (Phase 8)",
-    "utr_patchy": "UTR missing or truncated on some rows (Phase 8)",
+    "utr_patchy": "UTR removed from the bank narration on some rows (Phase 8)",
 }
 
 
@@ -155,8 +155,14 @@ def build_parser() -> argparse.ArgumentParser:
             f"--{f.name.replace('_', '-')}", dest=f.name, action="store_true",
             help=FLAG_HELP[f.name],
         )
+    # Said "turn on every mess flag at once" until Phase 8 step 9. That described a config the
+    # config layer refuses -- latent since Phase 1, and invisible until now only because the
+    # inert-flag refusal fired first and the exclusivity was never reached. No count here: how
+    # many flags compose is derived, and a number in help text goes stale silently.
     mess.add_argument("--all-mess", action="store_true",
-                     help="turn on every mess flag at once (not Phase 1)")
+                     help="turn on every mess flag that composes -- drops any flag that is inert "
+                          "or mutually exclusive with another, naming each and why on stderr "
+                          "(not Phase 1)")
     return p
 
 
@@ -184,11 +190,33 @@ def _utf8_stdout() -> None:
 def config_from_args(args: argparse.Namespace) -> GenConfig:
     year, month = args.month
     flag_names = MessFlags.names()
-    flags = (
-        MessFlags.all_on()
-        if args.all_mess
-        else MessFlags(**{n: getattr(args, n) for n in flag_names})
-    )
+    # ``--all-mess`` is ``composable()``, not ``all_on()`` (Phase 8 step 9). ``all_on()`` names
+    # all thirteen, and thirteen has never been a runnable set: ``rounding_edge`` is declared and
+    # inert, and ``dup_amounts`` conflicts with four others. Until this edit the switch resolved
+    # to it and exited 2 on the inertness refusal -- which was at least not a *silent* drop, but
+    # the message named only ``--rounding-edge``, implying that landing that one flag would make
+    # the switch work. It would not: the first exclusivity rule would refuse next. So the switch
+    # now reduces to the largest set the config accepts and ``main`` announces every drop.
+    #
+    # ``all_on()`` is kept, and is now used only by ``config.py``'s self-check, where "every flag
+    # at once" is still the thing worth constructing.
+    if args.all_mess:
+        flags, dropped = MessFlags.composable()
+        # A flag named *explicitly* on the same command line that ``--all-mess`` then drops is a
+        # contradiction between two explicit requests, not a default being overridden -- so it is
+        # refused rather than announced. Announcing would leave the user's own switch silently
+        # absent from the run, which is the failure this whole mechanism exists to prevent.
+        conflict = sorted({n for n, _ in dropped} & {n for n in flag_names if getattr(args, n)})
+        if conflict:
+            reasons = dict(dropped)
+            raise ValueError(
+                "--all-mess drops "
+                + ", ".join(f"--{n.replace('_', '-')} ({reasons[n]})" for n in conflict)
+                + ", but the command line asks for it explicitly. Drop --all-mess and name the "
+                "flags you want, or drop the conflicting switch."
+            )
+    else:
+        flags = MessFlags(**{n: getattr(args, n) for n in flag_names})
     # Decision 3: --batching raises the default ``n``, because ``n`` counts payments while
     # the track's 50-record floor is counted in *bank rows*, and batching makes those two
     # different numbers. At mean 1.60 payments per settlement, n=60 yields ~37 bank rows --
@@ -292,6 +320,35 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:  # GenConfig validation
         parser.error(str(e))
         return EXIT_USAGE  # unreachable; parser.error exits 2
+
+    # ``--all-mess`` keeps eleven of thirteen flags, so it says which two it dropped and why
+    # (Phase 8 step 9). A switch whose name promises "every flag" and delivers a subset without
+    # saying so is the mislabelled-run failure ``MessFlags.IMPLEMENTED`` exists to prevent.
+    #
+    # **On stderr, and deliberately not gated behind ``--quiet``.** ``--quiet`` promises to print
+    # only the resolved-config JSON line, and it returns before the summary block below -- so a
+    # notice printed there would vanish on exactly the invocation a script uses, leaving the flag
+    # set reduced with nothing on either stream to say so. This is a warning about the *request*,
+    # not a summary of results, so it does not belong to what ``--quiet`` silences. stdout stays
+    # byte-for-byte what it was: line 1 is still the JSON.
+    #
+    # ``composable()`` is recomputed rather than threaded out of ``config_from_args``, whose
+    # signature has callers. It is pure and deterministic, and the assertion states the coupling
+    # that makes recomputing safe rather than leaving it to be noticed.
+    if args.all_mess:
+        kept, dropped = MessFlags.composable()
+        assert kept == cfg.flags, "config_from_args and this notice disagree about --all-mess"
+        print(
+            f"--all-mess: running {len(kept.enabled())} of {len(MessFlags.names())} mess flags. "
+            f"Dropped {len(dropped)}:",
+            file=sys.stderr,
+        )
+        for name, reason in dropped:
+            print(f"  --{name.replace('_', '-')}: {reason}", file=sys.stderr)
+        print(
+            f"  running: {' '.join('--' + n.replace('_', '-') for n in kept.enabled())}",
+            file=sys.stderr,
+        )
 
     # Line 1 of stdout: the resolved config, as JSON.
     print(json.dumps(cfg.resolved(), ensure_ascii=False))
