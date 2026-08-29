@@ -45,6 +45,12 @@ from .config import (
     REFUND_SHARE,
     RESERVE_BPS_BAND,
     RESERVE_SHARE,
+    UNSETTLED_SHARE,
+    NOISE_AMOUNT_BAND_RUPEES,
+    NOISE_FOREIGN_COUNTERPARTIES,
+    NOISE_SHARE,
+    NOISE_STRATA_SPLIT,
+    NOISE_TEMPLATES,
     CAPTURE_HOUR_MAX,
     CAPTURE_HOUR_MIN,
     COUNTERPARTY,
@@ -57,7 +63,7 @@ from .config import (
     GenConfig,
 )
 from ..common.money import RUPEE, mul_bps, rupees
-from .model import Credit, Decomposition, Payment, Refund, Settlement, Story
+from .model import Credit, Decomposition, NoiseRow, Payment, Refund, Settlement, Story
 from .rng import substream, weighted_choice
 
 #: UTR tails are 4 digits, matching the ``XXXX4471`` shape in Appendix A. Drawn
@@ -728,6 +734,254 @@ def _draw_tails(rng: random.Random, n: int) -> list[int]:
     return rng.sample(range(TAIL_MIN, TAIL_MAX + 1), pool_size)
 
 
+def _draw_unsettled(
+    cfg: GenConfig,
+    rng: random.Random,
+    groups: list[list[int]],
+    netted_by_index: dict[int, int],
+    planted_keys: set[tuple[date, int]],
+    capture_dates: list[date],
+    grosses: list[int],
+) -> set[int]:
+    """Payment indices that are captured but never paid out. ``--unsettled``.
+
+    Returns indices into the parallel draft lists, **not** payment ids: the caller removes them
+    from ``groups`` before any settlement is built, so the settlement they would have joined
+    either shrinks by one member or -- if they were its only member -- never exists.
+
+    **This flag converts a payment, it does not add one.** ``payments.csv`` still carries
+    ``cfg.n`` rows and I13 pins that unconditionally. What changes is whether any settlement
+    *claims* the payment, which is why the Tier 2 pool grows by less than the unsettled count:
+    the orphan stops being claimed, and the settlement it left shrinks.
+
+    Three exclusions, and the middle one is the one that was a live hazard rather than a
+    tidy-up:
+
+      * **Payments carrying a refund**, linked or planted. ``_draw_refunds`` samples over every
+        payment index independently of ``groups``, so without this exclusion two things break.
+        Orphaning the payment that carries the *planted unlinked* refund deletes
+        ``REFUND_UNLINKED`` from the run outright -- gate 13 asserts it is present on seeds 1,
+        2 and 3, so the flag would turn a Phase 6 mess off by accident. Orphaning a
+        *linked*-refund payment that is its settlement's only member vanishes that settlement
+        while ``refunds.csv`` still declares the refund, leaving money deducted from nothing.
+        The cost of the exclusion is a correlation -- no orphan is ever refunded -- and it is
+        stated rather than hidden. It is accepted here only because the alternative silently
+        rewrites Phase 6's refund mess, and because a config-time refusal is not available: the
+        Phase 7 deliverable runs ``--netted-refunds`` and ``--unsettled`` together.
+      * **Planted ``--dup-amounts`` members.** A planted pair is unresolvable because two
+        settlements share one net, one date and one UTR; orphaning half of it removes one of
+        those settlements and the pair stops being a pair, at which point ``resolvable=false``
+        is a false statement about the data. Same standard as the batching and refund refusals
+        in ``config.py``, applied inside the draw because the combination is legal.
+      * **The last member of the last settlement.** A run whose every payment is an orphan has
+        no settlements, no credits and nothing to reconcile; the clamp below keeps the
+        population partial in the sense ``UNSETTLED_SHARE`` describes.
+
+    One ``sample`` call, so the stream's consumption is a function of the eligible population
+    and the count alone (``rng.py`` rule 2) rather than of the amount distribution. Drawn on the
+    ``unsettled`` stream, reserved since Phase 1, so turning the flag on perturbs no other draw
+    and a run without it stays byte-identical.
+    """
+    if not cfg.flags.unsettled:
+        return set()
+
+    refunded = {i for i, amount in netted_by_index.items() if amount}
+    eligible = [
+        i
+        for group in groups
+        for i in group
+        if i not in refunded and (capture_dates[i], grosses[i]) not in planted_keys
+    ]
+    if not eligible:
+        raise ValueError(
+            f"--unsettled has no payment it can orphan at n={cfg.n}: every payment either "
+            f"carries a refund or belongs to a planted --dup-amounts pair, and orphaning "
+            f"either one would turn off a mess another flag declares. Raise --n."
+        )
+
+    k = round(cfg.n * UNSETTLED_SHARE)
+    # At least one, or the run is labelled with a mess it does not have -- the same standard
+    # ``_draw_refunds`` and ``_withhold_membership`` hold. Never so many that no settlement
+    # survives: ``len(groups) - 1`` bounds it below the point where the run has nothing left to
+    # reconcile, and the eligible population bounds it above.
+    k = max(1, min(k, len(eligible), max(1, len(groups) - 1)))
+    return set(rng.sample(eligible, k))
+
+
+def _allocate_strata(k: int) -> dict[str, int]:
+    """Split ``k`` noise rows across the three strata **by count, never by draw**.
+
+    Largest-remainder over ``NOISE_STRATA_SPLIT``, iterated in a fixed key order, so the split
+    is a function of ``k`` alone and identical on every seed. That is the whole point: the
+    ``noise_recall`` floor gate 14 asserts is the plainly-foreign share, and a randomly drawn
+    split would make that floor wobble seed to seed -- forcing the gate to assert a number loose
+    enough to survive the wobble, which is a weaker gate bought for nothing.
+
+    The realised counts are published (``run_manifest.json``), so the gate reads what the run
+    actually produced rather than recomputing this arithmetic and hoping the two agree.
+    """
+    names = sorted(NOISE_STRATA_SPLIT)
+    exact = {name: k * NOISE_STRATA_SPLIT[name] for name in names}
+    counts = {name: int(exact[name]) for name in names}
+    # Hand out what flooring dropped, largest fractional part first; ties by name so the result
+    # never depends on dict order.
+    short = k - sum(counts.values())
+    for name in sorted(names, key=lambda n: (-(exact[n] - int(exact[n])), n))[:short]:
+        counts[name] += 1
+    assert sum(counts.values()) == k, (counts, k)
+    return counts
+
+
+def _noise_narration(
+    rng: random.Random, stratum: str, tail: int | None, foreign: str
+) -> str:
+    """One noise narration. The stratum decides what the row *offers* a matcher.
+
+    Three shapes, and only the first is separable by the ``IGNORED`` rule in ``tier1``:
+
+      * ``plainly_foreign`` -- a real counterparty that is not the gateway, so both of
+        decision 4's evidence tests fail and the row can be honestly ignored.
+      * ``gateway_plausible`` -- a gateway spelling and **no digit run at all**, so
+        ``normalize.parse`` reports ``ref_tail=None``. The counterparty test passes, so the row
+        is *not* ignored and falls through to the reserve diagnostic.
+      * ``look_alike`` -- a gateway spelling **and** a 4-digit tail that hits no settlement.
+
+    The last two being un-ignorable is deliberate, not a shortfall: see ``NOISE_STRATA_SPLIT``
+    on why relaxing decision 4 to catch them would convert this phase's ``noise_recall`` into
+    Phase 8's ``WRONG_IGNORE``.
+    """
+    template = NOISE_TEMPLATES[stratum][rng.randrange(len(NOISE_TEMPLATES[stratum]))]
+    channel = weighted_choice(rng, BANK_CHANNELS)
+    # A gateway-plausible row spells the gateway three ways, exactly as a real credit does --
+    # drawn from the same constants, so a matcher cannot separate noise by spelling.
+    spelling = (COUNTERPARTY, COUNTERPARTY_SPACED, COUNTERPARTY_SHORT)[rng.randrange(3)]
+    counterparty = foreign if stratum == "plainly_foreign" else spelling
+    return template.format(
+        channel=channel, counterparty=counterparty, tail=tail if tail is not None else "",
+    )
+
+
+def _draw_noise_rows(
+    cfg: GenConfig,
+    rng: random.Random,
+    credit_count: int,
+    credit_keys: set[tuple[date, int]],
+    value_dates: list[date],
+    settlement_tails: set[int],
+) -> list[tuple[date, int, float, str, str]]:
+    """``(value_date, amount, tiebreak, stratum, narration)`` per row that is not gateway money.
+
+    Returns drafts rather than rows: the caller merges them into the credit sort so a noise row
+    is numbered **in bank-file order alongside real credits**. That interleaving is the single
+    most important property here. Appending them would put every noise row at the end of the
+    file with the highest ids and an out-of-order date -- the answer key in a column, and
+    Phase 4b's exact failure mode: a matcher could score a perfect ``noise_recall`` by ignoring
+    the tail of the file and demonstrate nothing.
+
+    Three exclusions on the ``(value_date, amount)`` key, and the second is the one the plan
+    called for:
+
+      * **Every existing credit's key.** A noise row that duplicates a real credit's date and
+        amount is indistinguishable from it, and would be resolved to that credit's settlement
+        by coincidence -- scoring ``NOISE_MISHANDLED`` for a reason that has nothing to do with
+        the narration this flag is about. Gateway correctness survives it (both rows still find
+        the same settlement, and the real one still matches), so this is not a correctness
+        guard; it keeps the *axis* clean. Note that ``I3.unique_date_amount`` would **not**
+        catch it: that check iterates ``story.credits``, which stays gateway-only.
+      * **Planted ``--dup-amounts`` keys**, per `.plan/phase7.md` correction (f). A third row on
+        a planted pair's key makes the collision three-way, which I12 refuses at generation
+        time. One set membership test, done unconditionally rather than measured first, because
+        the alternative is a config-time refusal that removes a legal combination for no gain.
+      * **Keys already taken by another noise row**, so two noise rows never collide with each
+        other either.
+
+    ``value_date`` is drawn from the dates the bank file already carries, never from the
+    calendar at large: a noise row on a day with no gateway activity would be separable by date
+    alone, which is the same cheat as a distinguishing id.
+
+    Draw count per row is **variable** (the rejection loop above, and the tail redraw below).
+    That is safe here for the reason ``_draw_unsettled`` gives: ``noise`` is its own reserved
+    stream, so a variable consumption perturbs no other draw and a run without the flag stays
+    byte-identical.
+    """
+    if not cfg.flags.noise_rows:
+        return []
+
+    lo_r, hi_r = NOISE_AMOUNT_BAND_RUPEES
+    taken = set(credit_keys)
+    # A share of the **credits**, not of ``cfg.n`` and not of the distinct value dates.
+    # ``NOISE_SHARE``'s docstring argues the first: under ``--batching`` payments and credits
+    # differ by ~1.6x, so a share of ``n`` would make noise a third of a batched statement
+    # instead of a fringe. Dates would be worse again -- a month has ~21 business days at every
+    # size, so the count would stop scaling with ``n`` altogether.
+    k = max(1, round(credit_count * NOISE_SHARE))
+    strata = _allocate_strata(k)
+
+    drafts: list[tuple[date, int, str, str]] = []
+    for stratum in sorted(strata):
+        for _ in range(strata[stratum]):
+            for _attempt in range(1_000):
+                when = value_dates[rng.randrange(len(value_dates))]
+                amount = rng.randint(lo_r, hi_r) * RUPEE
+                if (when, amount) not in taken:
+                    break
+            else:
+                raise ValueError(
+                    f"--noise-rows could not place a row outside the "
+                    f"{len(taken)} (date, amount) keys already taken at n={cfg.n}; the "
+                    f"amount band {NOISE_AMOUNT_BAND_RUPEES} is too narrow for this size"
+                )
+            taken.add((when, amount))
+
+            # The reference tail, and both constraints on it are load-bearing.
+            #
+            #   * **It must hit no settlement's UTR.** For ``look_alike`` that is the stratum's
+            #     definition; for ``plainly_foreign`` it is what protects the floor. Decision 4
+            #     ignores a row only when *both* evidence tests fail, and the first test is
+            #     "does the tail hit some settlement?" -- so a plainly-foreign row that drew a
+            #     live tail by chance would stop being ignorable, and ``noise_recall`` would
+            #     fall below the share this run declares. Rare and seed-dependent, which is
+            #     exactly the kind of defect that passes review and fails on someone else's
+            #     seed.
+            #   * **It must not echo its own amount.** I7 compares whole digit runs against the
+            #     row's rupee figure, and the tail is the only digit run these narrations carry.
+            #     A 4-digit tail collides with any amount from 1000 to 9999 rupees -- squarely
+            #     inside ``NOISE_AMOUNT_BAND_RUPEES`` -- so this is a live case, not a
+            #     defensive one. ``_tail_echoes_amount`` is the same helper the credit fixup
+            #     uses, so both paths answer the question one way.
+            #
+            # ``gateway_plausible`` draws no tail at all: its templates carry no digit run, so
+            # ``normalize.parse`` reports ``ref_tail=None`` and the row offers nothing to join.
+            tail: int | None = None
+            if stratum != "gateway_plausible":
+                for _attempt in range(1_000):
+                    tail = rng.randint(TAIL_MIN, TAIL_MAX)
+                    if tail not in settlement_tails and not _tail_echoes_amount(tail, amount):
+                        break
+                else:
+                    raise ValueError(
+                        f"--noise-rows could not find a 4-digit tail outside the "
+                        f"{len(settlement_tails)} settlement UTRs at n={cfg.n}: the tail space "
+                        f"is {TAIL_SPACE} and this run has consumed too much of it"
+                    )
+            # Drawn for every stratum, including the one that does not use it, so the per-row
+            # draw count stays uniform across strata (``rng.py`` rule 2). The stream is
+            # ``noise``'s own, so the spare draw perturbs nothing else.
+            foreign = NOISE_FOREIGN_COUNTERPARTIES[
+                rng.randrange(len(NOISE_FOREIGN_COUNTERPARTIES))
+            ]
+            narration = _noise_narration(rng, stratum, tail, foreign)
+            # The sort tiebreak, drawn from **this** stream rather than ``bank_order``. Trap 2's
+            # shape: without it a stable sort would preserve draw order among same-date
+            # same-amount rows, and since the sort decides numbering, the strata would appear in
+            # allocation order inside a tied block. Drawn here rather than from ``rng_bank``
+            # because that stream's draws are what order the gateway rows -- borrowing it would
+            # make turning this flag on perturb credit numbering on runs that have no noise at
+            # all, which is exactly what ``rng.py``'s named streams exist to prevent.
+            drafts.append((when, amount, rng.random(), stratum, narration))
+    return drafts
+
+
 def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     """Generate one month's story. Pure: same config in, same story out."""
     cal = calendar or BusinessCalendar()
@@ -745,6 +999,8 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
     rng_batching = substream(cfg.seed, "batching")
     rng_refunds = substream(cfg.seed, "refunds")
     rng_reserve = substream(cfg.seed, "reserve")
+    rng_unsettled = substream(cfg.seed, "unsettled")
+    rng_noise = substream(cfg.seed, "noise")
 
     # --- Step 4: invent the payments -------------------------------------
     # Drawn first, then sorted by capture time, then numbered -- a real gateway
@@ -811,6 +1067,34 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         i: refunded.get(i, 0) + unlinked.get(i, 0)
         for i in set(refunded) | set(unlinked)
     }
+
+    # --- Step 6c: --unsettled orphans the payments that never pay out -----
+    # **After the refunds and before the uniqueness nudge, and both halves of that are
+    # load-bearing.** After, so the draw can see which payments carry a refund and exclude them
+    # -- orphaning the payment holding the *planted* unlinked refund would delete a Phase 6 mess
+    # from the run, and orphaning a linked one could vanish the settlement its refund was netted
+    # against (see ``_draw_unsettled``). Before, so ``_make_nets_unique`` places its nets against
+    # the memberships that actually reach disk rather than against a member about to leave.
+    #
+    # Neither ordering costs reproducibility: ``refunds`` and ``unsettled`` are separate
+    # substreams, so removing a member here shifts no value the other draw produced. That
+    # independence is what ``rng.py``'s named streams exist to give.
+    unsettled_idx = _draw_unsettled(
+        cfg, rng_unsettled, groups, netted_by_index, planted_keys, capture_dates, grosses,
+    )
+    if unsettled_idx:
+        # **The orphan leaves its settlement, not the file.** ``payments`` below is still built
+        # from every draft, so ``payments.csv`` carries ``cfg.n`` rows and I13's unconditional
+        # count holds -- this flag changes which payments get *settled*, never how many were
+        # captured. A group that loses its only member disappears outright, which is what makes
+        # an orphan's settlement *absent* rather than short: money that never moved has no bank
+        # row, so nothing downstream has a verdict slot to fill for it.
+        groups = [[i for i in group if i not in unsettled_idx] for group in groups]
+        groups = [group for group in groups if group]
+        assert groups, (
+            "--unsettled orphaned every payment, so the run has no settlements at all -- the "
+            "clamp in _draw_unsettled is meant to make that unreachable"
+        )
 
     if cfg.flags.batching:
         # ``taken`` still holds every (capture_date, gross) the draw loop reserved, so the
@@ -1138,10 +1422,69 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         # be assigned in an order no reader of the CSV could reconstruct.
         drafted_credits.append((value_date, credit_amount, rng_bank.random(), s, narration))
 
-    drafted_credits.sort(key=lambda c: (c[0], c[1], c[2]))
+    # --- Step 6d: --noise-rows, drawn against the credits that now exist ----------------
+    # **Drawn here, after the credit drafts and before the sort**, and both halves matter.
+    # After, because the draw needs every credit's ``(value_date, amount)`` key to avoid
+    # colliding with one, and needs the value dates the bank file actually carries. Before,
+    # because the rows have to enter the *same* sort as the credits -- see the merge below.
+    #
+    # ``credit_keys`` subsumes `.plan/phase7.md` correction (f) rather than implementing it
+    # separately, and it is worth saying why the separate check is unnecessary: correction (f)
+    # asks that planted ``--dup-amounts`` keys be excluded so a noise row cannot make a planted
+    # collision three-way. A planted pair's two credits *share* one ``(value_date, amount)``
+    # key by construction -- that is what I12 asserts -- so that key is already in this set.
+    # Excluding every credit key excludes the planted ones a fortiori. Note the planted keys
+    # held in ``planted_keys`` are ``(capture_date, gross)``, a different space, which is why
+    # reusing that set here would have been the wrong fix.
+    noise_drafts = _draw_noise_rows(
+        cfg,
+        rng_noise,
+        credit_count=len(drafted_credits),
+        credit_keys={(vd, amount) for vd, amount, _tb, _s, _n in drafted_credits},
+        value_dates=sorted({vd for vd, _a, _tb, _s, _n in drafted_credits}),
+        settlement_tails={int(s.utr.removeprefix("XXXX")) for s in settlements},
+    )
+
+    # **One list, one sort, one numbering pass**, and this interleaving is the most important
+    # property in step 4. A noise row must be indistinguishable from a credit *on disk*, and an
+    # id is on disk: appending the noise rows after the credits would give every one of them a
+    # higher ``C####`` than every real credit, and an out-of-order value date to go with it.
+    # That is the answer key in a column -- a matcher could score a perfect ``noise_recall`` by
+    # ignoring the tail of the file, exactly the cheat Phase 4b's shared-UTR requirement exists
+    # to refuse. Merged into the same sort, a noise row lands wherever its date and amount put
+    # it, and its id says nothing about what it is.
+    #
+    # The ``kind`` tag rides along rather than being re-derived by type inspection: the payload
+    # is a ``Settlement`` for a credit and a stratum name for a noise row, and dispatching on
+    # ``isinstance`` would make the loop below depend on a coincidence of types.
+    merged: list[tuple[date, int, float, str, object, str]] = [
+        (vd, amount, tb, "gateway", s, narr)
+        for vd, amount, tb, s, narr in drafted_credits
+    ] + [
+        (vd, amount, tb, "noise", stratum, narr)
+        for vd, amount, tb, stratum, narr in noise_drafts
+    ]
+    merged.sort(key=lambda r: (r[0], r[1], r[2]))
 
     credits: list[Credit] = []
-    for seq, (value_date, amount, _tiebreak, s, narration) in enumerate(drafted_credits, start=1):
+    noise_rows: list[NoiseRow] = []
+    for seq, (value_date, amount, _tiebreak, _kind, _payload, narration) in enumerate(
+        merged, start=1
+    ):
+        if _kind == "noise":
+            # Numbered from the same counter as the credits, so ``C0007`` may be either.
+            noise_rows.append(
+                NoiseRow(
+                    row_id=ids.credit_id(seq),
+                    value_date=value_date,
+                    amount_paise=amount,
+                    narration=narration,
+                    stratum=str(_payload),
+                )
+            )
+            continue
+        assert isinstance(_payload, Settlement), _payload
+        s = _payload
         # The decomposition is the *answer key's* arithmetic, and it must close to the
         # credit exactly: gross - fee - gst == amount. Phase 1 could write
         # ``Decomposition(gross_paise=amount)`` because gross, net and credit were one
@@ -1354,6 +1697,15 @@ def build(cfg: GenConfig, calendar: BusinessCalendar | None = None) -> Story:
         settlements=settlements,
         credits=credits,
         refunds=refunds,
+        # Read off the frozen list rather than re-derived from the index, so the id convention
+        # lives in exactly one place (``ids.payment_id`` is 1-based over a 0-based draft list,
+        # and a second copy of that arithmetic is a second chance to get it wrong). Sorted for a
+        # stable truth file; the ids are zero-padded, so this is payment order.
+        unsettled_payment_ids=sorted(payments[i].payment_id for i in unsettled_idx),
+        # In bank-file order, not sorted separately: these rows were numbered from the same
+        # counter as the credits and ``Story.non_gateway_credit_ids`` reads their ids straight
+        # off this list, so file order and answer-key order are the same order by construction.
+        noise_rows=noise_rows,
         membership_withheld=withheld,
     )
 

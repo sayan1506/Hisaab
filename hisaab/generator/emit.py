@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..common import ids
 from .config import GenConfig
 from .model import (
     BANK_HEADER,
@@ -163,6 +164,19 @@ def build_manifest(
         # announced rather than left to be inferred from a row count. ``[]`` on every run
         # without ``--settlement-report-late``.
         "membership_withheld": list(story.membership_withheld),
+        # The **realised** strata counts for ``--noise-rows``, not the declared split. Gate 14's
+        # ``noise_recall`` floor is the plainly-foreign share, and it must be read from what the
+        # run actually produced rather than recomputed from ``NOISE_STRATA_SPLIT``: a gate that
+        # re-derives the allocation would agree with a broken allocator about a wrong answer.
+        # ``{}`` on every run without the flag, like ``membership_withheld``'s ``[]``.
+        #
+        # Here rather than in ``truth.json`` because it is diagnostic rather than scored -- the
+        # scorer keys ``noise_recall`` on ``orphans.non_gateway_credit_ids``, which is a list of
+        # ids and needs no stratum. Both files are truth-side, so neither reaches the matcher.
+        "noise_strata": {
+            stratum: sum(1 for r in story.noise_rows if r.stratum == stratum)
+            for stratum in sorted({r.stratum for r in story.noise_rows})
+        },
         "totals_paise": {
             "gross": story.total_gross_paise(),
             "net": story.total_net_paise(),
@@ -228,7 +242,25 @@ def emit(
     )
     rows[SETTLEMENT_ITEMS_CSV] = len(items)
 
-    bank = [c.csv_row() for c in story.credits]
+    # **Gateway credits and ``--noise-rows`` rows go into one file, ordered by the id they were
+    # both numbered from.** ``story.build`` assigned those ids from a single counter over the
+    # merged, date-and-amount-sorted draft list, so re-sorting on the sequence number here
+    # restores exactly that order -- and a noise row sits wherever its date and amount put it
+    # rather than in a block at the end. That is the property that keeps the row id from being
+    # the answer key; see ``model.NoiseRow`` and the merge comment in ``story.build``.
+    #
+    # Sorted on the **integer** sequence rather than the id string: ``ids.credit_id`` pads to
+    # four digits, so a run large enough to reach C10000 would sort lexically before C9999 and
+    # silently reorder the file. The generator's own ceiling makes that unreachable today, which
+    # is precisely why a lexical sort would have looked correct indefinitely.
+    bank_rows: list[tuple[str, tuple[str, ...]]] = [
+        (c.credit_id, c.csv_row()) for c in story.credits
+    ] + [(r.row_id, r.csv_row()) for r in story.noise_rows]
+    # ``removeprefix``, not ``lstrip``: ``lstrip`` takes a character *set* and strips greedily,
+    # so it happens to work for a one-character prefix and would silently eat digits the day
+    # ``CREDIT_PREFIX`` gained a second character.
+    bank_rows.sort(key=lambda pair: int(pair[0].removeprefix(ids.CREDIT_PREFIX)))
+    bank = [row for _id, row in bank_rows]
     hashes[BANK_CSV] = write_csv(data_dir / BANK_CSV, BANK_HEADER, bank)
     rows[BANK_CSV] = len(bank)
 

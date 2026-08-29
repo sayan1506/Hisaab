@@ -42,7 +42,14 @@ from datetime import date
 from ..common import ids
 from ..common.bizdays import BusinessCalendar
 from ..common.reasons import Reason
-from .config import GenConfig, MessFlags
+from .config import (
+    COUNTERPARTY,
+    COUNTERPARTY_SHORT,
+    COUNTERPARTY_SPACED,
+    NOISE_STRATA_SPLIT,
+    GenConfig,
+    MessFlags,
+)
 from .model import (
     BANK_HEADER,
     PAYMENTS_HEADER,
@@ -110,7 +117,13 @@ from ..common.money import RUPEE
 #: check. If it ever does fire unexpectedly, the failure message below carries D6's instruction
 #: rather than leaving a reader to invent the wrong fix.
 SUSPENDED_BY: dict[str, tuple[str, ...]] = {
-    "I3.cardinality":                ("batching", "noise_rows", "unsettled"),
+    # **``noise_rows`` was removed here in Phase 7 step 4, and again by measurement.** The
+    # prediction was written when a noise row was assumed to be a ``Credit`` with empty
+    # provenance; it is not (``model.NoiseRow``), so ``story.credits`` stays gateway-only and
+    # this check never sees one. Forced to run on a real noisy story it **passes** at every seed
+    # and size tried (`.plan/probe_phase7_noise_suspensions.py`). That makes the fourth wrong
+    # guess in this cluster, after ``--reserve`` falsified two of its own and ``--unsettled`` one.
+    "I3.cardinality":                ("batching",),
     "I3.no_refunds":                 ("netted_refunds",),
     # **``reserve`` was removed from the next two entries in Phase 6 step 7, and the removal is
     # the correction rather than an omission.** Both listed it as a *prediction*, written phases
@@ -128,10 +141,43 @@ SUSPENDED_BY: dict[str, tuple[str, ...]] = {
     # What ``--reserve`` genuinely does break is Strategy D in ``tools/verify_output.py``, which
     # was *strengthened* into an equality on identities rather than added to that file's
     # suspension list. Three checks touched, none of them the two predicted here.
+    # **Phase 7 step 1 re-derived the five ``unsettled`` predictions by measurement, and only
+    # one of them survives as a suspension.** All five were written phases before the flag
+    # existed. Forcing every suspended check to run on a real ``--unsettled`` story
+    # (`.plan/probe_phase7_unsettled.py`) showed: four genuinely fail, one passes -- and of the
+    # four, three fail in a way truth can *name*, so they are strengthened rather than stood
+    # down. That is the third time this cluster's guesses have been corrected by building the
+    # flag, after ``--reserve`` falsified two of its own in Phase 6.
+    #
+    #   * ``I3.no_orphans`` -- the only real suspension. The check asserts orphans do not
+    #     exist, so a flag whose whole job is creating them cannot leave it standing.
+    #   * ``I2.every_payment_settled`` and ``I6.all_payments_cited`` -- **strengthened below**
+    #     to "the payments in no settlement are *exactly* the ones truth names", which is
+    #     strictly stronger than the old unconditional form plus a suspension: it still catches
+    #     a payment going missing for any other reason while the flag is on.
+    #   * ``I3.cardinality`` -- **strengthened** to subtract the orphan count, so 1:1:1 becomes
+    #     1:1:1-minus-the-orphans. At zero orphans it is character-for-character the old
+    #     assertion.
+    #   * ``I2.every_settlement_credited`` -- **the wrong prediction, removed.** It passes on an
+    #     unsettled run untouched, because an orphan is removed from its group *before* any
+    #     settlement is derived (``story.build`` step 6c): a group that loses its only member
+    #     never becomes a settlement, so no settlement is ever left without a credit. Left in
+    #     place it would have been the footgun this docstring warns about -- the check that
+    #     catches a generator dropping a credit outright, standing down on every unsettled run.
+    # ``noise_rows`` stays here and is the **one** real suspension it has: this check's whole
+    # assertion is that no orphan and no noise row exists, so a flag whose job is creating them
+    # cannot leave it standing. I18 is its successor on the noise side, exactly as I17 is on the
+    # orphan side -- a suspension with no successor is how a flag switches off the checks that
+    # would have caught its own bugs.
     "I3.no_orphans":                 ("unsettled", "noise_rows"),
-    "I2.every_payment_settled":      ("unsettled",),
-    "I2.every_settlement_credited":  ("unsettled",),
-    "I6.all_payments_cited":         ("unsettled", "noise_rows"),
+    # **Emptied in Phase 7 step 4, and the key is kept deliberately.** ``_suspended`` raises
+    # ``KeyError`` on an unknown key -- that is the typo guard this table's docstring describes --
+    # so deleting the entry would break the call site rather than un-suspend the check. An empty
+    # tuple is the honest statement: nothing suspends this any more. Measured: with ``noise_rows``
+    # removed it passes on real noisy stories, because a noise row cites no payments and
+    # ``story.credits`` never contains one, so "every payment is cited by some credit" is
+    # untouched by rows that are not credits.
+    "I6.all_payments_cited":         (),
     "I3.unique_date_amount":         ("dup_amounts",),
 }
 
@@ -283,24 +329,50 @@ def check_totals(
     tds_cells: list[int],
     refund_cells: list[int],
     reserve_cells: list[int],
+    unsettled_cells: list[int],
     *,
+    noise_cells: tuple[int, ...] | list[int] = (),
     fees_on: bool = False,
     tds_on: bool = False,
     refunds_on: bool = False,
     reserve_on: bool = False,
+    unsettled_on: bool = False,
+    noise_on: bool = False,
 ) -> None:
     """I4 — the money adds up in aggregate, and deductions exist only when asked for.
 
-    Six assertions, and only the last four are conditional:
+    Eight assertions, and only the last six are conditional. (It read "six" until Phase 7,
+    which is what a count in a docstring does when two terms arrive and the prose does not --
+    ``unsettled_cells`` landed in step 1 and ``noise_cells`` in step 4, each adding a
+    zero-guard nobody added to this list.)
 
-      * ``net_total - reserve == credit_total`` -- every settled paisa reached the bank
-        except what was deliberately held back.
-      * ``gross_total - (every fee/gst/tds/refund cell) == net_total`` -- the wedge between
-        gross and net is *exactly* the declared deductions and nothing else.
+      * ``net_total - reserve == credit_total - non-gateway`` -- every settled paisa reached
+        the bank except what was deliberately held back, and every paisa in the bank file is
+        either that money or a row this gateway never settled.
+      * ``gross_total - never-settled - (every fee/gst/tds/refund cell) == net_total`` -- the
+        wedge between gross and net is *exactly* the declared deductions and nothing else.
       * with ``--fees`` off, every fee and GST cell is zero.
       * with ``--tds`` off, every TDS cell is zero.
       * with ``--netted-refunds`` off, every refund cell is zero.
       * with ``--reserve`` off, every reserve cell is zero.
+      * with ``--unsettled`` off, every never-settled cell is zero.
+      * with ``--noise-rows`` off, every non-gateway cell is zero.
+
+    **``noise_cells`` is Phase 7 step 4, and it is subtracted from the *credited* side rather
+    than added to a wedge.** A noise row is money that arrived in the bank and was never
+    settled by this gateway, so it belongs on neither side of gross/net -- putting it in
+    ``deducted`` would assert the gateway deducted it from a payout, which is a claim about
+    money that was never ours.
+
+    It is **defaulted**, and that is the opposite of the choice ``tds_cells`` makes two
+    paragraphs down, for a reason worth stating. A caller omitting TDS still passes the first
+    two assertions on clean data, so the omission is silent -- hence "required". A caller
+    omitting *noise* on a noisy run fails the first assertion immediately, by exactly the noise
+    total, because the bank file carries money the settlements do not. The failure is loud, so
+    the default costs nothing; and the default is what keeps the **in-memory** caller honest,
+    since ``story.credits`` is gateway-only and must pass no noise term at all. Two callers,
+    two different correct arguments -- see the ``story.NoiseRow`` docstring on why the in-memory
+    credit list stays free of noise rows.
 
     Note which assertion ``reserve_cells`` appears in and which it does not: it is subtracted
     in the *first* and absent from the *second*. See the ``--reserve`` paragraph at the end of
@@ -379,25 +451,34 @@ def check_totals(
     """
     deducted = sum(fee_cells) + sum(tds_cells) + sum(refund_cells)
     held = sum(reserve_cells)
+    never_settled = sum(unsettled_cells)
+    # Money in the bank file that is not gateway income at all (``--noise-rows``). Subtracted
+    # from the **credited** side rather than added to any wedge: it arrived in the bank and was
+    # never settled by this gateway, so it belongs on neither side of gross/net.
+    not_ours = sum(noise_cells)
     _require(
-        net_total - held == credit_total,
+        net_total - held == credit_total - not_ours,
         "I4",
         f"settled and credited disagree: net={net_total} - reserve={held} = "
-        f"{net_total - held} credited={credit_total} "
-        f"({net_total - held - credit_total:+d} paise never reached the bank)",
+        f"{net_total - held} credited={credit_total} - non-gateway={not_ours} = "
+        f"{credit_total - not_ours} "
+        f"({net_total - held - credit_total + not_ours:+d} paise never reached the bank)",
     )
     _require(
-        gross_total - deducted == net_total,
+        gross_total - never_settled - deducted == net_total,
         "I4",
         f"the gross/net wedge is not the declared deductions: gross={gross_total} "
-        f"- deductions={deducted} = {gross_total - deducted}, but net={net_total} "
-        f"({gross_total - deducted - net_total:+d} paise unaccounted for)",
+        f"- never-settled={never_settled} - deductions={deducted} = "
+        f"{gross_total - never_settled - deducted}, but net={net_total} "
+        f"({gross_total - never_settled - deducted - net_total:+d} paise unaccounted for)",
     )
     for label, cells, on in (
         ("fee/gst", fee_cells, fees_on),
         ("tds", tds_cells, tds_on),
         ("refund", refund_cells, refunds_on),
         ("reserve", reserve_cells, reserve_on),
+        ("never-settled gross", unsettled_cells, unsettled_on),
+        ("non-gateway credit", noise_cells, noise_on),
     ):
         if on:
             continue
@@ -740,6 +821,409 @@ def check_reserves(story: Story, cfg: GenConfig) -> None:
     )
 
 
+def check_orphans(story: Story, cfg: GenConfig) -> None:
+    """I17 — the payments that never paid out, stated positively rather than excused.
+
+    **The successor to ``I3.no_orphans``**, which asserts only that orphans do not exist and is
+    the one check ``--unsettled`` genuinely suspends (``SUSPENDED_BY``). A suspension with no
+    successor is how a flag switches off the checks that would have caught its own bugs, which
+    is the pattern I15 established for refunds and I16 for the reserve. So this is a *positive*
+    statement about the orphan population, not a relaxation of anything.
+
+    Six assertions, listed in the order they run. **Indistinguishability is the one that makes
+    the flag mean something**; partiality runs earlier than its number suggests, for a measured
+    reason recorded at the assertion itself.
+
+      * **The flag produced its mess.** A run labelled ``--unsettled`` with no orphan is a run
+        whose name is a false statement about its data.
+      * **Every named orphan is in ``payments.csv``, once.** The flag converts a payment; it
+        never removes one. I13 pins the count unconditionally, so a name truth carries that the
+        file does not is the answer key and the data disagreeing about which payments exist.
+      * **Strictly partial.** At least one payment must still settle. If every payment were an
+        orphan, "the unsettled ones" and "every payment" would be the same set and nothing
+        downstream could tell a matcher that handles orphans from one with no concept of them --
+        the same requirement ``REFUND_SHARE`` and ``RESERVE_SHARE`` carry.
+      * **No settlement claims an orphan, and no credit cites one.** This is what "never paid
+        out" *means*, and it is checked on both sides because the two are separate structures:
+        a settlement could list the payment while truth's credit entry omits it, and the
+        gross/net wedge would still close.
+      * **An orphan is indistinguishable from a settled payment in every column
+        ``payments.csv`` carries.** `.plan/phase7.md` decision 3, expressed as an assertion
+        rather than left as a comment. ``_tier2_pool``'s docstring floats a ``status`` guard and
+        names Phase 7 as where it "earns a place"; that is refused, because a distinct status on
+        exactly the payments that never settled is the generator publishing the answer key in a
+        column -- a matcher filtering on it would score perfect coverage while demonstrating
+        nothing, which is Phase 4b's standard applied to a payments-side flag. The honest
+        consequence is that the Tier 2 pool grows and ``MAX_POOL`` had to be raised to 80.
+        **This assertion is the thing that would fail if a later phase "optimised" the generator
+        by marking orphans**, and it is why the raise is not negotiable.
+      * **No orphan carries a refund.** A property of ``_draw_unsettled``'s exclusion rather
+        than of the data, and asserted here because the exclusion is load-bearing in two
+        directions: orphaning the payment that holds the *planted* unlinked refund would delete
+        ``REFUND_UNLINKED`` from the run, and orphaning a linked one could vanish the settlement
+        its refund was netted against, leaving money deducted from nothing. The cost is a
+        correlation -- no orphan is ever refunded -- which is stated in ``ASSUMPTIONS.md``
+        rather than hidden.
+
+    ``cfg`` is read only to decide whether the flag is on, so a clean-mode story reaches this
+    function and leaves it having asserted the honest thing: there are no orphans and no
+    settlement or credit behaves as though there were.
+    """
+    payment_of = {p.payment_id: p for p in story.payments}
+    orphans = list(story.unsettled_payment_ids)
+
+    if not cfg.flags.unsettled:
+        # Not merely skipped. With the flag off nothing may be named an orphan -- the same
+        # statement ``I3.no_orphans`` makes, asserted here too so this function is a total
+        # check rather than one that only runs on the messy path.
+        _require(
+            not orphans,
+            "I17",
+            f"{len(orphans)} payment(s) named unsettled without --unsettled: {orphans[:5]}",
+        )
+        return
+
+    _require(bool(orphans), "I17", "--unsettled left every payment settled")
+
+    # Assertion 2: named, and actually present.
+    unknown = sorted(set(orphans) - set(payment_of))
+    _require(
+        not unknown,
+        "I17",
+        f"truth names {len(unknown)} unsettled payment(s) absent from payments.csv: "
+        f"{unknown[:5]} -- the flag converts a payment, it never removes one",
+    )
+    # Named twice is not a second orphan; it is an answer key that cannot be counted.
+    _require(
+        len(set(orphans)) == len(orphans),
+        "I17",
+        f"the unsettled list repeats an id: "
+        f"{sorted({o for o in orphans if orphans.count(o) > 1})[:5]}",
+    )
+
+    # Assertion 5, hoisted -- **it was unreachable where it used to sit, three checks further
+    # down.** Numbers here are identities, not positions (the docstring's "the fourth" still
+    # means indistinguishability); this one runs early because it otherwise cannot fire at all.
+    # Measured in `.plan/probe_phase7_i17c.py`: firing it needs ``len(orphans) >= len(payments)``,
+    # and the two assertions above force ``orphans`` to be a deduped subset of ``payments``, so
+    # that means *every* payment orphaned -- a story in which every payment is still claimed by
+    # its real settlement, so assertion 3 fired first every time, and assertion 4's
+    # settled-population guard would have caught what was left. A check that no input can reach
+    # is decoration, which is the one thing this file's self-check exists to prevent. Ordered
+    # ahead of the claim checks it makes the population statement they then range over.
+    _require(
+        len(orphans) < len(story.payments),
+        "I17",
+        f"every one of {len(story.payments)} payments is unsettled, so 'the unsettled ones' "
+        f"and 'every payment' are the same set and no comparison downstream can tell an "
+        f"orphan-aware matcher from one with no concept of them",
+    )
+
+    # Assertion 3: claimed by nothing, on both sides.
+    claimed = {pid: s.settlement_id for s in story.settlements for pid in s.payment_ids}
+    wrongly_settled = sorted(set(orphans) & set(claimed))
+    _require(
+        not wrongly_settled,
+        "I17",
+        f"{len(wrongly_settled)} payment(s) are named unsettled and yet declared by a "
+        f"settlement: "
+        f"{[(pid, claimed[pid]) for pid in wrongly_settled[:3]]}",
+    )
+    cited = {pid: c.credit_id for c in story.credits for pid in c.payment_ids}
+    wrongly_cited = sorted(set(orphans) & set(cited))
+    _require(
+        not wrongly_cited,
+        "I17",
+        f"{len(wrongly_cited)} payment(s) are named unsettled and yet cited by a credit's "
+        f"truth entry: {[(pid, cited[pid]) for pid in wrongly_cited[:3]]}",
+    )
+
+    # Assertion 4 -- decision 3. Compared against the settled population rather than against a
+    # hard-coded ``"captured"``: the claim is *indistinguishability*, so it must keep holding if
+    # a later phase legitimately changes what every payment's status says.
+    settled = [p for pid, p in payment_of.items() if pid not in set(orphans)]
+    # Kept as a guard on the comparison below rather than as the partiality statement, which now
+    # runs above. Reaching it means the two disagree -- orphans outnumbering the payment ids they
+    # are drawn from -- so it says that rather than repeating a check that already passed.
+    _require(
+        bool(settled),
+        "I17",
+        f"no settled payment remains to compare against, yet only {len(orphans)} of "
+        f"{len(story.payments)} payments are named unsettled -- the orphan list and "
+        f"payments.csv disagree about which payments exist",
+    )
+    orphan_statuses = {payment_of[pid].status for pid in orphans}
+    settled_statuses = {p.status for p in settled}
+    _require(
+        orphan_statuses <= settled_statuses,
+        "I17",
+        f"an unsettled payment carries a status no settled payment has "
+        f"({sorted(orphan_statuses - settled_statuses)} against {sorted(settled_statuses)}) -- "
+        f"decision 3: a distinct status on exactly the payments that never settled publishes "
+        f"the answer key in a column, and a matcher filtering on it would score perfect "
+        f"coverage while demonstrating nothing",
+    )
+    orphan_currencies = {payment_of[pid].currency for pid in orphans}
+    settled_currencies = {p.currency for p in settled}
+    _require(
+        orphan_currencies <= settled_currencies,
+        "I17",
+        f"an unsettled payment carries a currency no settled payment has "
+        f"({sorted(orphan_currencies - settled_currencies)}) -- same leak as a distinct "
+        f"status, in the other column --fx will move",
+    )
+
+    # Assertion 6: the refund exclusion.
+    refunded = {r.payment_id for r in story.refunds}
+    both = sorted(set(orphans) & refunded)
+    _require(
+        not both,
+        "I17",
+        f"{len(both)} payment(s) are both unsettled and refunded: {both[:5]} -- "
+        f"_draw_unsettled excludes refunded payments because orphaning the planted unlinked "
+        f"refund's payment would delete REFUND_UNLINKED from the run, and orphaning a linked "
+        f"one can vanish the settlement its refund was netted against",
+    )
+
+
+def check_noise(story: Story, cfg: GenConfig) -> None:
+    """I18 — the bank rows that are not gateway money, stated positively.
+
+    **The successor to ``I3.no_orphans``'s noise clause**, which is the one check
+    ``--noise-rows`` genuinely suspends (``SUSPENDED_BY``). Same pattern as I15 for refunds,
+    I16 for the reserve and I17 for orphans: a suspension with no successor is how a flag
+    switches off the checks that would have caught its own bugs.
+
+    Every assertion below was **measured before it was written**, in
+    `.plan/probe_phase7_i18_candidates.py`, across eight flag/size combinations to n=1000. That
+    order matters here more than usual: two of the five ``SUSPENDED_BY`` predictions this phase
+    inherited turned out to be false, and an assertion derived by reasoning about the generator
+    is one that agrees with the generator by construction.
+
+    Ten assertions, in the order they run. **Interleaving is the one that makes the flag mean
+    something**, and the two stratum-shape assertions are what keep ``noise_recall`` honest:
+
+      * **The flag produced its mess**, and **a gateway credit remains**. A run labelled
+        ``--noise-rows`` with no noise row is a run whose name is a false statement about its
+        data; an all-noise statement would make "the rows in scope" and "no rows" the same set,
+        so nothing downstream could tell a matcher that handles scope from one with no concept
+        of it. The same partiality requirement ``REFUND_SHARE`` and ``RESERVE_SHARE`` carry.
+      * **No noise id is a credit id.** The two are numbered from one counter, so a collision
+        means the counter was split -- and two bank rows sharing an id is an unloadable file,
+        not merely a mislabelled one.
+      * **Every row's stratum is one of the three declared**, and at three rows or more all
+        three are populated. Below three, largest-remainder cannot fill three buckets, so the
+        assertion would fail on honest data at very small ``n``.
+      * **No noise row shares a ``(value_date, amount_paise)`` key with a credit, or with
+        another noise row.** This is also where `.plan/phase7.md` correction (f) lands: a
+        planted ``--dup-amounts`` pair's two credits *share* one key by construction, so
+        excluding every credit key excludes the planted keys a fortiori. A third row on a
+        planted key would make the collision three-way, which I12 refuses -- and note that
+        ``I3.unique_date_amount`` would **not** catch it, because that check iterates
+        ``story.credits``, which stays gateway-only.
+      * **Every noise value date is a date the gateway credits already occupy.** A noise row on
+        a day with no gateway activity is separable by date alone, which is the same cheat as a
+        distinguishing id.
+      * **No noise tail hits a live settlement UTR.** For ``look_alike`` that is the stratum's
+        definition; for ``plainly_foreign`` it is what protects the ``noise_recall`` floor.
+        Decision 4 ignores a row only when *both* evidence tests fail, and the first test is
+        "does the tail hit some settlement?" -- so a plainly-foreign row that drew a live tail
+        by chance would stop being ignorable and the floor would fall below the share the run
+        declares. Seed-dependent and rare, which is exactly the defect that passes review here
+        and fails on a judge's seed.
+      * **``gateway_plausible`` carries no digit run at all**, which is what makes
+        ``normalize.parse`` report ``ref_tail=None`` -- the row offers the gateway's name and
+        nothing to join on.
+      * **``plainly_foreign`` carries no gateway spelling, in any of the three.** This is the
+        assertion the floor rests on: the stratum is ignorable *because* both evidence tests
+        fail, and a foreign counterparty list that grew a "RAZORPAY REFUND" entry would quietly
+        convert the floor into ``NOISE_MISHANDLED``. Asserted rather than trusted to the
+        constant, per its own docstring.
+      * **The bank file's id order is its ``(date, amount)`` order, and the noise rows are not
+        a trailing block.** The most important assertion in step 4. Appending noise after the
+        credits would give every noise row a higher ``C####`` than every real credit and an
+        out-of-order value date to go with it -- the answer key in a column, and a matcher could
+        score a perfect ``noise_recall`` by ignoring the tail of the file. That is Phase 4b's
+        exact failure mode, and its shared-UTR requirement exists to refuse it.
+
+    Non-strict on the order comparison (``<=``, not ``<``), because ``--dup-amounts`` plants two
+    credits on one key legitimately.
+
+    ``cfg`` is read only to decide whether the flag is on, so a clean-mode story reaches this
+    function and leaves it having asserted the honest thing: there are no noise rows.
+    """
+    noise = story.noise_rows
+
+    if not cfg.flags.noise_rows:
+        # Not merely skipped. With the flag off no row may be named non-gateway -- the same
+        # statement ``I3.no_orphans`` makes, asserted here too so this function is a total
+        # check rather than one that only runs on the messy path.
+        _require(
+            not noise,
+            "I18",
+            f"{len(noise)} bank row(s) are named non-gateway without --noise-rows: "
+            f"{story.non_gateway_credit_ids[:5]}",
+        )
+        return
+
+    _require(bool(noise), "I18", "--noise-rows produced no non-gateway row")
+    _require(
+        bool(story.credits),
+        "I18",
+        f"every bank row is noise ({len(noise)} rows, no gateway credit) -- with nothing left "
+        f"to reconcile, a matcher with no concept of scope scores the same as one that has it",
+    )
+
+    # Assertion 3: ids. ``non_gateway_credit_ids`` is derived from these rows (see ``Story``),
+    # so the answer key cannot drift from them; what is checked here is the *collision* the
+    # single numbering counter is supposed to make impossible.
+    credit_ids = {c.credit_id for c in story.credits}
+    shared = sorted(credit_ids & set(story.non_gateway_credit_ids))
+    _require(
+        not shared,
+        "I18",
+        f"{len(shared)} id(s) name both a gateway credit and a noise row: {shared[:5]} -- "
+        f"both kinds are numbered from one counter over the merged sort, so a collision means "
+        f"that counter was split and bank_statement.csv now has duplicate ids",
+    )
+
+    # Assertion 4: the strata.
+    seen = {r.stratum for r in noise}
+    unknown = sorted(seen - set(NOISE_STRATA_SPLIT))
+    _require(
+        not unknown,
+        "I18",
+        f"noise row(s) carry undeclared stratum {unknown} -- the manifest publishes realised "
+        f"counts per stratum and gate 14 reads the plainly-foreign share off it, so a stratum "
+        f"outside NOISE_STRATA_SPLIT would be published as a share of nothing",
+    )
+    if len(noise) >= len(NOISE_STRATA_SPLIT):
+        # Only above the bucket count: largest-remainder cannot populate three strata from two
+        # rows, so asserting this unconditionally would fail on honest data at tiny ``n``.
+        _require(
+            seen == set(NOISE_STRATA_SPLIT),
+            "I18",
+            f"{len(noise)} noise rows populate only {sorted(seen)}; "
+            f"{sorted(set(NOISE_STRATA_SPLIT) - seen)} is empty -- the two un-ignorable strata "
+            f"are what stop noise_recall from being a measure of how easy the noise is",
+        )
+
+    # Assertion 5: key disjointness, in both directions.
+    credit_keys = {(c.value_date, c.amount_paise) for c in story.credits}
+    noise_keys = [(r.value_date, r.amount_paise) for r in noise]
+    clash = sorted(
+        r.row_id for r in noise if (r.value_date, r.amount_paise) in credit_keys
+    )
+    _require(
+        not clash,
+        "I18",
+        f"{len(clash)} noise row(s) share a (value_date, amount) with a gateway credit: "
+        f"{clash[:5]} -- such a row resolves to that credit's settlement by coincidence and "
+        f"scores NOISE_MISHANDLED for a reason that has nothing to do with its narration. A "
+        f"planted --dup-amounts pair shares one key, so this also refuses the three-way "
+        f"collision I12 rejects at generation time",
+    )
+    dupes = sorted(k for k in set(noise_keys) if noise_keys.count(k) > 1)
+    _require(
+        len(set(noise_keys)) == len(noise_keys),
+        "I18",
+        f"{len(noise_keys) - len(set(noise_keys))} noise row(s) share a (value_date, amount) "
+        f"with another noise row: {dupes[:3]}",
+    )
+
+    # Assertion 6: dates the gateway already occupies.
+    credit_dates = {c.value_date for c in story.credits}
+    off_date = sorted({r.value_date for r in noise} - credit_dates)
+    _require(
+        not off_date,
+        "I18",
+        f"{len(off_date)} noise value date(s) carry no gateway credit at all "
+        f"({[d.isoformat() for d in off_date[:3]]}) -- a row on an otherwise empty day is "
+        f"separable by date without reading its narration, which is the cheat this flag exists "
+        f"to avoid",
+    )
+
+    # Assertion 7: no live tail. Read as ``normalize.parse`` reads it -- the **last** digit run
+    # -- but via ``ids.digit_runs`` rather than by importing the parser, because the generator
+    # must not depend on the matcher. That coupling is real: if ``parse`` ever took a different
+    # run, this assertion would drift from what the matcher actually sees, and the symptom would
+    # be a silently sunk noise_recall rather than a failure here.
+    settlement_tails = {int(s.utr.removeprefix("XXXX")) for s in story.settlements}
+    live: list[tuple[str, str]] = []
+    for r in noise:
+        runs = ids.digit_runs(r.narration)
+        if runs and int(runs[-1]) in settlement_tails:
+            live.append((r.row_id, runs[-1]))
+    live.sort()
+    _require(
+        not live,
+        "I18",
+        f"{len(live)} noise row(s) carry a tail that hits a live settlement UTR: {live[:3]} -- "
+        f"decision 4 ignores a row only when both evidence tests fail, so such a row stops "
+        f"being ignorable and noise_recall falls below the plainly-foreign share this run "
+        f"declares (seed-dependent, so it passes review and fails on a judge's seed)",
+    )
+
+    # Assertion 8: the masked stratum offers nothing to join on.
+    with_digits = sorted(
+        r.row_id
+        for r in noise
+        if r.stratum == "gateway_plausible" and ids.digit_runs(r.narration)
+    )
+    _require(
+        not with_digits,
+        "I18",
+        f"{len(with_digits)} gateway_plausible row(s) carry a digit run: {with_digits[:5]} -- "
+        f"the stratum is defined by parse() reporting ref_tail=None, and a tail turns it into "
+        f"a look_alike while the manifest still counts it as gateway_plausible",
+    )
+
+    # Assertion 9: the stratum the floor rests on is actually foreign. Checks every spelling
+    # the generator can emit *and* the two bare brand forms, so adding a fourth spelling to
+    # ``config`` cannot silently weaken this.
+    spellings = ("RAZORPAY", "RZRPAY", COUNTERPARTY, COUNTERPARTY_SPACED, COUNTERPARTY_SHORT)
+    spelled = sorted(
+        r.row_id
+        for r in noise
+        if r.stratum == "plainly_foreign"
+        and any(s in r.narration.upper() for s in spellings)
+    )
+    _require(
+        not spelled,
+        "I18",
+        f"{len(spelled)} plainly_foreign row(s) name the gateway: {spelled[:5]} -- this is the "
+        f"stratum noise_recall's floor is made of, and it is ignorable only because *both* of "
+        f"decision 4's evidence tests fail. A gateway spelling passes the counterparty test, "
+        f"so the row stops being ignorable and the floor becomes NOISE_MISHANDLED",
+    )
+
+    # Assertion 10: interleaving. Sorted on the **integer** sequence for the reason ``emit``
+    # gives: ``credit_id`` pads to four digits, so a lexical sort would put C10000 before C9999.
+    rows = [(c.credit_id, c.value_date, c.amount_paise) for c in story.credits] + [
+        (r.row_id, r.value_date, r.amount_paise) for r in noise
+    ]
+    rows.sort(key=lambda t: int(t[0].removeprefix(ids.CREDIT_PREFIX)))
+    keys = [(d, a) for _rid, d, a in rows]
+    _require(
+        keys == sorted(keys),
+        "I18",
+        f"bank row id order is not (value_date, amount) order -- the noise rows did not enter "
+        f"the credits' sort, so an id says which kind of row it is. First inversion at "
+        f"{next((i for i in range(1, len(keys)) if keys[i] < keys[i - 1]), None)} of "
+        f"{len(keys)} rows",
+    )
+    noise_seqs = [int(r.row_id.removeprefix(ids.CREDIT_PREFIX)) for r in noise]
+    credit_seqs = [int(c.credit_id.removeprefix(ids.CREDIT_PREFIX)) for c in story.credits]
+    _require(
+        min(noise_seqs) < max(credit_seqs),
+        "I18",
+        f"every noise row is numbered above every gateway credit (noise "
+        f"{min(noise_seqs)}-{max(noise_seqs)}, credits {min(credit_seqs)}-{max(credit_seqs)}) "
+        f"-- appended rather than interleaved, so a matcher scores a perfect noise_recall by "
+        f"ignoring the tail of the file and demonstrates nothing",
+    )
+
+
 def check_int_money(values: dict[str, object]) -> None:
     """I5 — every monetary value is an ``int`` (trap 9).
 
@@ -850,7 +1334,18 @@ def check_story(
     check_unique_ids("I1", "payment", [p.payment_id for p in payments])
     check_unique_ids("I1", "order", [p.order_id for p in payments])
     check_unique_ids("I1", "settlement", [s.settlement_id for s in settlements])
-    check_unique_ids("I1", "credit", [c.credit_id for c in credits])
+    # **The union, not ``credits`` alone.** ``bank_statement.csv`` is gateway credits *plus*
+    # ``--noise-rows`` rows, both numbered from one counter over one merged sort, and this check
+    # is the only thing standing between a split counter and a file with duplicate ids. Checking
+    # ``credits`` alone passed vacuously on every noisy run -- the population had grown and the
+    # check had not, which is the failure mode a suspension announces and a stale population does
+    # not. Strictly stronger: a unique union implies unique credits, so nothing is given up.
+    # Measured to pass on eight flag/size combinations to n=1000 before being tightened here
+    # (`.plan/probe_phase7_i18_candidates.py`); I18 separately asserts the two id sets are
+    # disjoint, so this cannot pass by the two lists having drifted apart.
+    check_unique_ids(
+        "I1", "bank row", [c.credit_id for c in credits] + story.non_gateway_credit_ids
+    )
     check_unique_ids("I1", "refund", [r.refund_id for r in story.refunds])
 
     #: Conditional checks that did not run, and the flag that excused each. Echoed by
@@ -861,10 +1356,16 @@ def check_story(
     # I3 — cardinality, refunds and orphans. Three checks, three different flag sets:
     # --fees breaks none of them, which is the whole point of splitting the old gate.
     if not _suspended(cfg, "I3.cardinality", skipped):
+        # ``--unsettled`` no longer suspends this: it subtracts. Every payment is still in the
+        # file (I13 pins that unconditionally), and without batching each orphan removes exactly
+        # the one-member group it was in, so the settlement and credit counts fall by the orphan
+        # count and nothing else. At zero orphans this is the old 1:1:1 assertion unchanged.
+        settled_n = cfg.n - len(story.unsettled_payment_ids)
         _require(
-            len(payments) == len(settlements) == len(credits) == cfg.n,
+            len(payments) == cfg.n and len(settlements) == len(credits) == settled_n,
             "I3",
-            f"expected 1:1:1 cardinality at n={cfg.n}, got "
+            f"expected {cfg.n} payments and {settled_n} settlements/credits "
+            f"(n={cfg.n} less {len(story.unsettled_payment_ids)} never settled), got "
             f"{len(payments)}/{len(settlements)}/{len(credits)}",
         )
     if not _suspended(cfg, "I3.no_refunds", skipped):
@@ -885,9 +1386,22 @@ def check_story(
     payment_ids = {p.payment_id for p in payments}
     unknown = sorted(set(settled_count) - payment_ids)
     _require(not unknown, "I2", f"settlements reference unknown payments: {unknown[:5]}")
-    if not _suspended(cfg, "I2.every_payment_settled", skipped):
-        missing = sorted(payment_ids - set(settled_count))
-        _require(not missing, "I2", f"payments never settled: {missing[:5]}")
+    # Runs **unconditionally**, including under ``--unsettled``. The flag was predicted to
+    # suspend this check; instead the assertion is strengthened to an equality against the ids
+    # truth publishes, which at zero orphans is the old ``not missing`` unchanged. The
+    # difference is what it still catches: a batching loop or an orphan draw that loses a
+    # payment truth did *not* name is caught even on a run where payments are allowed to go
+    # unsettled -- and that is exactly the run where the old suspension would have been blind.
+    missing = sorted(payment_ids - set(settled_count))
+    orphans = sorted(story.unsettled_payment_ids)
+    _require(
+        missing == orphans,
+        "I2",
+        f"the payments in no settlement are not the ones truth names as unsettled: "
+        f"{len(missing)} unsettled in the data ({missing[:5]}) against {len(orphans)} in "
+        f"truth ({orphans[:5]}) -- unexpected: {sorted(set(missing) - set(orphans))[:5]}, "
+        f"claimed but settled: {sorted(set(orphans) - set(missing))[:5]}",
+    )
     multi = sorted(pid for pid, k in settled_count.items() if k > 1)
     _require(not multi, "I2", f"payments in more than one settlement: {multi[:5]}")
 
@@ -898,9 +1412,15 @@ def check_story(
     settlement_ids = {s.settlement_id for s in settlements}
     unknown_s = sorted(set(credited_count) - settlement_ids)
     _require(not unknown_s, "I2", f"credits reference unknown settlements: {unknown_s[:5]}")
-    if not _suspended(cfg, "I2.every_settlement_credited", skipped):
-        uncredited = sorted(settlement_ids - set(credited_count))
-        _require(not uncredited, "I2", f"settlements never credited: {uncredited[:5]}")
+    # **Unconditional as of Phase 7 step 1**, having lost its last suspension. ``--reserve``
+    # was removed from this entry in Phase 6 and ``--unsettled`` is removed now, both for the
+    # same measured reason: neither flag leaves a settlement without a credit. An orphan is
+    # dropped from its group *before* any settlement is derived, so a group that loses its only
+    # member never becomes a settlement rather than becoming an uncredited one. This is the
+    # check that catches a generator dropping a credit outright, so it standing down on every
+    # unsettled run would have been the footgun ``SUSPENDED_BY``'s docstring warns about.
+    uncredited = sorted(settlement_ids - set(credited_count))
+    _require(not uncredited, "I2", f"settlements never credited: {uncredited[:5]}")
     multi_s = sorted(sid for sid, k in credited_count.items() if k > 1)
     _require(not multi_s, "I2", f"settlements in more than one credit: {multi_s[:5]}")
 
@@ -918,6 +1438,18 @@ def check_story(
     # decomposition is the only place it exists. I16 independently checks these terms against
     # the per-credit shortfall, so this sum cannot quietly agree with a wrong attribution.
     reserve_cells = [c.decomposition.reserve_paise for c in credits]
+    # The never-settled term (``--unsettled``, Phase 7). Sourced from the payments rather than
+    # from any settlement or credit, because that is the whole point of an orphan: **no
+    # settlement and no credit mentions it at all**, so there is no cell anywhere downstream to
+    # sum. ``gross_total`` counts every payment while ``net_total`` counts only settled money,
+    # and this is exactly the difference.
+    #
+    # Named as a term instead of quietly dropped from ``gross_total``: money that was captured
+    # and never paid out is a *fact about the month*, and a wedge that silently stopped counting
+    # it would let a generator lose a payment with no check noticing. Same reasoning that put
+    # the reserve on one side of the net and the refund on the other -- a deduction this project
+    # models is one it can name.
+    unsettled_cells = [gross_of[pid] for pid in story.unsettled_payment_ids]
     check_totals(
         story.total_gross_paise(),
         story.total_net_paise(),
@@ -926,10 +1458,12 @@ def check_story(
         [s.tds_paise for s in settlements],
         refund_cells,
         reserve_cells,
+        unsettled_cells,
         fees_on=cfg.flags.fees,
         tds_on=cfg.flags.tds,
         refunds_on=cfg.flags.netted_refunds,
         reserve_on=cfg.flags.reserve,
+        unsettled_on=cfg.flags.unsettled,
     )
     # I15 — the refund term is not merely *a* number that balances: every refund in the file
     # is accounted for exactly once, and each settlement's term equals the refunds truly
@@ -941,6 +1475,17 @@ def check_story(
     # ``I2.every_settlement_credited`` rather than a successor to it, because that check turns
     # out to survive ``--reserve`` untouched.
     check_reserves(story, cfg)
+    # I17 — the orphan population, and the successor to ``I3.no_orphans``, which is the one
+    # check ``--unsettled`` genuinely suspends. Same pattern as I15 for refunds and I16 for the
+    # reserve: a suspension without a successor is how a flag switches off the checks that would
+    # have caught its own bugs. See ``check_orphans`` -- and note assertion 4, which pins
+    # decision 3's refusal to mark orphans with a distinct status.
+    check_orphans(story, cfg)
+    # I18 — the non-gateway bank rows, and the successor to ``I3.no_orphans``'s noise clause.
+    # Fourth in the same pattern (I15 refunds, I16 reserve, I17 orphans): the flag that suspends
+    # a check brings the check that replaces it. Runs after I17 because both read
+    # ``story``-level populations and I17's are the payments; nothing here depends on its result.
+    check_noise(story, cfg)
     # Per settlement, the refund term truth attributes to it. Sourced from the credits rather
     # than from a settlement column because ``settlements.csv``'s header is frozen (I9): a
     # netted refund is declared in ``refunds.csv`` and attributed by truth, which is exactly
@@ -985,8 +1530,24 @@ def check_story(
             f"{c.decomposition.expected_credit_paise} but the credit is {c.amount_paise}",
         )
 
-    # I7 — the leak check
-    check_no_leak([(c.credit_id, c.amount_paise, c.narration) for c in credits])
+    # I7 — the leak check, over **every row the bank file carries**, noise included.
+    #
+    # Same stale-population defect I1 had one screen up, and here it was load-bearing rather
+    # than theoretical. A noise narration is authored counterparty text plus a *drawn* 4-digit
+    # tail, and a 4-digit tail collides with any amount from 1000 to 9999 rupees -- squarely
+    # inside ``NOISE_AMOUNT_BAND_RUPEES``. ``story._draw_noise_rows`` redraws the tail when it
+    # would echo (``_tail_echoes_amount``), so the guard exists; auditing only ``credits`` meant
+    # **nothing checked the guard**, and a regression there would have written a bank row that
+    # states its own amount in its narration -- a genuine leak, on a rail whose whole purpose is
+    # that scope must be decided by reading the narration.
+    #
+    # ``NOISE_FOREIGN_COUNTERPARTIES`` is authored text, so the identifier half is a real
+    # exposure too: an entry gaining a ``C``-prefixed or ``pay_``-shaped token would leak the
+    # answer key's id shape into the input.
+    check_no_leak(
+        [(c.credit_id, c.amount_paise, c.narration) for c in credits]
+        + [(r.row_id, r.amount_paise, r.narration) for r in story.noise_rows]
+    )
 
     # I6 — truth references resolve in both directions
     for c in credits:
@@ -996,10 +1557,18 @@ def check_story(
             _require(pid in payment_ids, "I6", f"{c.credit_id} cites unknown {pid}")
     if not _suspended(cfg, "I6.all_payments_cited", skipped):
         cited = {pid for c in credits for pid in c.payment_ids}
+        # Strengthened rather than suspended under ``--unsettled`` (see ``SUSPENDED_BY``): an
+        # orphan is in no credit's entry *by definition*, so the claim is that the uncited
+        # payments are exactly the orphans. At zero orphans this is ``cited == payment_ids``,
+        # character-for-character the old assertion.
+        want = payment_ids - set(story.unsettled_payment_ids)
         _require(
-            cited == payment_ids,
+            cited == want,
             "I6",
-            f"{len(payment_ids - cited)} payments are in no credit's truth entry",
+            f"{len(want - cited)} payment(s) are in no credit's truth entry and are not "
+            f"named unsettled ({sorted(want - cited)[:5]}); "
+            f"{len(cited - want)} cited payment(s) are named unsettled "
+            f"({sorted(cited - want)[:5]})",
         )
 
     # I11 — both dates are exactly where the declared delays put them.
@@ -1413,18 +1982,20 @@ if __name__ == "__main__":
         "I4",
         "wedge is not the deductions",
         lambda: check_totals(
-            1_000_000, 976_400, 976_400, [20_000, 3_500], [0], [0], [0], fees_on=True
+            1_000_000, 976_400, 976_400, [20_000, 3_500], [0], [0], [0], [0], fees_on=True
         ),
     )
     must_raise(
         "I4",
         "settled but never credited",
         lambda: check_totals(
-            1_000_000, 976_400, 976_399, [20_000, 3_600], [0], [0], [0], fees_on=True
+            1_000_000, 976_400, 976_399, [20_000, 3_600], [0], [0], [0], [0], fees_on=True
         ),
     )
-    check_totals(1_000_000, 976_400, 976_400, [20_000, 3_600], [0], [0], [0], fees_on=True)
-    check_totals(1_000_000, 1_000_000, 1_000_000, [0, 0], [0], [0], [0])
+    check_totals(
+        1_000_000, 976_400, 976_400, [20_000, 3_600], [0], [0], [0], [0], fees_on=True
+    )
+    check_totals(1_000_000, 1_000_000, 1_000_000, [0, 0], [0], [0], [0], [0])
 
     # Phase 6: the per-column zero gate, probed in **both** directions. Until this phase all
     # three columns were gated on ``fees_on``, and both of these were measured against the old
@@ -1433,7 +2004,9 @@ if __name__ == "__main__":
     # A legal ``--tds`` run without ``--fees``: TDS cells are non-zero, fee and GST are not.
     # The old single gate reported "1 non-zero fee/gst/tds cells while --fees is off" and
     # refused a run this generator is required to support.
-    check_totals(10_000, 9_990, 9_990, [0, 0], [10], [0], [0], fees_on=False, tds_on=True)
+    check_totals(
+        10_000, 9_990, 9_990, [0, 0], [10], [0], [0], [0], fees_on=False, tds_on=True
+    )
     # ...and the hole, which is the half that mattered. A TDS cell on a run that never asked
     # for one: with ``fees_on`` true the old gate stood down for all three columns at once, so
     # this passed. A deduction appearing from nowhere is exactly what I4's zero clause exists
@@ -1442,7 +2015,7 @@ if __name__ == "__main__":
         "I4",
         "a TDS cell while --tds is off",
         lambda: check_totals(
-            10_000, 9_990, 9_990, [0, 0], [10], [0], [0], fees_on=True, tds_on=False
+            10_000, 9_990, 9_990, [0, 0], [10], [0], [0], [0], fees_on=True, tds_on=False
         ),
     )
     # The converse, for symmetry: a fee cell while --fees is off, with --tds legitimately on.
@@ -1451,7 +2024,7 @@ if __name__ == "__main__":
         "I4",
         "a fee cell while --fees is off",
         lambda: check_totals(
-            10_000, 9_800, 9_800, [200, 0], [0], [0], [0], fees_on=False, tds_on=True
+            10_000, 9_800, 9_800, [200, 0], [0], [0], [0], [0], fees_on=False, tds_on=True
         ),
     )
 
@@ -1462,7 +2035,7 @@ if __name__ == "__main__":
     # records -- a single gate covering N columns fails in both directions at once.
     #
     # A legal ``--netted-refunds`` run: a 1,000p refund inside the net, no fee and no tax.
-    check_totals(10_000, 9_000, 9_000, [0, 0], [0], [1_000], [0], refunds_on=True)
+    check_totals(10_000, 9_000, 9_000, [0, 0], [0], [1_000], [0], [0], refunds_on=True)
     # And the hole: the same refund on a run with the flag off. Before ``refund_cells`` existed
     # this was not merely unchecked, it was *unrepresentable* -- the wedge simply did not
     # include the term, so a refund had nowhere to be declared and I4 reported it as
@@ -1471,14 +2044,14 @@ if __name__ == "__main__":
         "I4",
         "a refund cell while --netted-refunds is off",
         lambda: check_totals(
-            10_000, 9_000, 9_000, [0, 0], [0], [1_000], [0], refunds_on=False
+            10_000, 9_000, 9_000, [0, 0], [0], [1_000], [0], [0], refunds_on=False
         ),
     )
     # The full six-term wedge, every flag on: fee 200p, GST 36p, TDS 10p, refund 1,000p.
     # Present so that the terms are proved to compose rather than merely to exist one at a
     # time -- four columns that each pass alone can still be summed wrongly.
     check_totals(
-        10_000, 8_754, 8_754, [200, 36], [10], [1_000], [0],
+        10_000, 8_754, 8_754, [200, 36], [10], [1_000], [0], [0],
         fees_on=True, tds_on=True, refunds_on=True,
     )
 
@@ -1488,7 +2061,7 @@ if __name__ == "__main__":
     # none of the four above can: ``net_total != credit_total`` and the run is still valid.
     # Every earlier fixture has those two equal, so this is the first case where the first
     # assertion does real work.
-    check_totals(10_000, 10_000, 9_000, [0, 0], [0], [0], [1_000], reserve_on=True)
+    check_totals(10_000, 10_000, 9_000, [0, 0], [0], [0], [1_000], [0], reserve_on=True)
     # **The asymmetry probe, and it is the one fixture here worth reading twice.** The reserve
     # is subtracted in the *first* assertion and deliberately absent from the *second*, because
     # it sits between net and credit rather than between gross and net -- that is design B
@@ -1507,7 +2080,7 @@ if __name__ == "__main__":
         "I4",
         "a reserve cell while --reserve is off",
         lambda: check_totals(
-            10_000, 10_000, 9_000, [0, 0], [0], [0], [1_000], reserve_on=False
+            10_000, 10_000, 9_000, [0, 0], [0], [0], [1_000], [0], reserve_on=False
         ),
     )
     # A shortfall the held amount does not account for: 1,000p held but 1,500p missing. This is
@@ -1518,7 +2091,7 @@ if __name__ == "__main__":
         "I4",
         "settled but never credited",
         lambda: check_totals(
-            10_000, 10_000, 8_500, [0, 0], [0], [0], [1_000], reserve_on=True
+            10_000, 10_000, 8_500, [0, 0], [0], [0], [1_000], [0], reserve_on=True
         ),
     )
     # The full seven-term case, every flag on: fee 200p, GST 36p, TDS 10p, refund 1,000p inside
@@ -1526,8 +2099,108 @@ if __name__ == "__main__":
     # is: terms that each pass alone can still be composed wrongly, and this is the only
     # fixture where both sides of the net carry a deduction at once.
     check_totals(
-        10_000, 8_754, 8_254, [200, 36], [10], [1_000], [500],
+        10_000, 8_754, 8_254, [200, 36], [10], [1_000], [500], [0],
         fees_on=True, tds_on=True, refunds_on=True, reserve_on=True,
+    )
+
+    # --- Phase 7 step 1: the never-settled term, probed in both directions ----------
+    # Same pair shape as the TDS, refund and reserve columns above, and it exists for the same
+    # measured reason: turning ``--unsettled`` on failed I4 with "+1684268 paise unaccounted
+    # for" at seed 1, n=200, and that number **is** the run's orphaned gross exactly
+    # (`.plan/probe_phase7_unsettled.py`). So the invariant caught the new term on the first run.
+    #
+    # **Extended rather than suspended, and that was a decision against the obvious move.**
+    # I4's own docstring predicted "``--unsettled`` voids that and belongs in ``SUSPENDED_BY``
+    # when it lands (Phase 7)" -- written phases before the flag existed. Suspending would have
+    # stood the whole check down on every unsettled run, at exactly the moment a payment can go
+    # missing, which is the footgun the ``SUSPENDED_BY`` docstring describes and which
+    # ``refund_cells`` and ``reserve_cells`` both declined. A never-settled gross is a term this
+    # project can name, so it is named.
+    #
+    # A legal ``--unsettled`` run: 10,000p captured, 1,000p of it never settled, no deduction of
+    # any other kind. Note the shape -- unlike the reserve, this term sits between the *gross*
+    # and the net, because the money never entered a settlement at all.
+    check_totals(10_000, 9_000, 9_000, [0, 0], [0], [0], [0], [1_000], unsettled_on=True)
+    # And the hole: an orphan on a run that never asked for one. Before ``unsettled_cells``
+    # existed this was unrepresentable in the same way the refund was -- the wedge had no term
+    # for it, so I4 could only report it as unaccounted-for money without saying what it was.
+    must_raise(
+        "I4",
+        "a never-settled payment while --unsettled is off",
+        lambda: check_totals(
+            10_000, 9_000, 9_000, [0, 0], [0], [0], [0], [1_000], unsettled_on=False
+        ),
+    )
+    # The orphan is on the gross side of the net, and this fixture is what pins that. With
+    # ``unsettled_cells`` wrongly folded into the *first* assertion instead (the reserve's
+    # position), this reads 9,000 - 0 == 9,000 and passes while the wedge below is left with
+    # 1,000p unexplained -- so the two terms cannot be swapped without a failure.
+    must_raise(
+        "I4",
+        "the gross/net wedge is not the declared deductions",
+        lambda: check_totals(
+            10_000, 9_000, 9_000, [0, 0], [0], [0], [1_000], [0], reserve_on=True
+        ),
+    )
+    # --- the non-gateway term, Phase 7 step 4 -------------------------------------------
+    # A legal ``--noise-rows`` run: 10,000p captured and settled, reaching the bank in full,
+    # **plus** a 400p bank row that was never gateway money. Note the direction -- this is the
+    # only term in this function that makes ``credited`` *larger* than the net. Every other one
+    # takes money away.
+    check_totals(
+        10_000, 10_000, 10_400, [0, 0], [0], [0], [0], [0],
+        noise_cells=[400], noise_on=True,
+    )
+    # And the hole: a non-gateway row on a run that never asked for one.
+    must_raise(
+        "I4",
+        "a non-gateway credit while --noise-rows is off",
+        lambda: check_totals(
+            10_000, 10_000, 10_400, [0, 0], [0], [0], [0], [0],
+            noise_cells=[400], noise_on=False,
+        ),
+    )
+    # **The term is on the credited side of the net, and this fixture pins that.** Fed as a
+    # never-settled gross instead -- the other "money outside the settlements" term, and so the
+    # tempting place to put it -- the first assertion is left 400p short (10,000 settled against
+    # 10,400 credited, with nothing declared non-gateway), so the two cannot be swapped without
+    # a failure. The mirror of the reserve/orphan swap test above.
+    #
+    # The label names the **first** assertion rather than the wedge, and that is measured rather
+    # than assumed: ``must_raise`` only checks the message's ``I4`` prefix, so it cannot tell
+    # this function's eight assertions apart, and an earlier draft of this fixture claimed the
+    # wedge. `.plan/probe_phase7_i4_noise.py` prints the message each of these four probes
+    # actually produces.
+    must_raise(
+        "I4",
+        "settled and credited disagree",
+        lambda: check_totals(
+            10_000, 10_000, 10_400, [0, 0], [0], [0], [0], [400], unsettled_on=True
+        ),
+    )
+    # A noisy run whose noise total is *misstated* still fails, which is what makes the term a
+    # check rather than a licence: truth claiming 300p of noise against a bank file carrying
+    # 400p leaves 100p unexplained. Without this, "subtract whatever truth says" would make the
+    # first assertion unfalsifiable on any noisy run.
+    must_raise(
+        "I4",
+        "settled and credited disagree",
+        lambda: check_totals(
+            10_000, 10_000, 10_400, [0, 0], [0], [0], [0], [0],
+            noise_cells=[300], noise_on=True,
+        ),
+    )
+
+    # The full nine-term case, every flag on at once: 1,000p never settled, then fee 200p,
+    # GST 36p and TDS 10p on the 9,000p that did settle, a 1,000p refund inside the net, 500p
+    # held back outside it, and a 400p bank row that was never ours. Present for the reason the
+    # six-, seven- and eight-term cases are: terms that each pass alone can still be composed
+    # wrongly, and this is the only fixture where money leaves on both sides of the net, before
+    # it, *and* arrives from outside it.
+    check_totals(
+        10_000, 7_754, 7_654, [200, 36], [10], [1_000], [500], [1_000],
+        noise_cells=[400], fees_on=True, tds_on=True, refunds_on=True, reserve_on=True,
+        unsettled_on=True, noise_on=True,
     )
 
     # I4 per settlement, with the refund term. The seventh element is optional, so the two
@@ -2002,6 +2675,422 @@ if __name__ == "__main__":
                 dataclasses.replace(story.credits[0], reserve_held_paise=1),
                 *story.credits[1:],
             ],
+        ),
+    )
+
+    # --- Phase 7 step 2: the orphans, and I17's ten negative cases ------------
+    #
+    # **Only three of these can be whole-story mutants, and the reason is worth recording.**
+    # Step 1 strengthened ``I3.cardinality`` to derive the settlement count from truth's orphan
+    # list, so *any* mutation of that list changes what I3 expects and dies there before
+    # ``check_orphans`` runs. `.plan/probe_phase7_i17.py` measured all nine candidates: seven
+    # were caught by I3 or I2 first. That is the same defence in depth I16's mutant 5 documents
+    # -- two independent checks catching one corruption is exactly what should happen -- but it
+    # means those seven cannot be demonstrated through ``check_story``, and a ``must_fail``
+    # written against a guessed code would either fail loudly or, worse, pass while testing a
+    # neighbour. So they use ``must_raise`` against ``check_orphans`` directly.
+    #
+    # One honest limit on those seven: ``check_orphans`` raises nothing but "I17", so the code
+    # assertion in ``must_raise`` is weak here in a way it is not for I4 and I14. What each
+    # direct probe buys is *isolation* -- proof that the specific assertion is reachable and
+    # fires on its own mutation, rather than sitting unexecuted behind a neighbour forever.
+    from .model import Refund
+
+    uns_cfg = GenConfig(seed=42, n=60, flags=MessFlags(unsettled=True))
+    uns = build(uns_cfg)
+    uns_rep = check_story(uns, uns_cfg)
+    # The one suspension ``--unsettled`` genuinely earns, pinned so a future edit cannot quietly
+    # widen it. Step 1 re-derived ``SUSPENDED_BY`` by measurement rather than trusting the five
+    # predictions written for this flag before it existed: one passes outright
+    # (``I2.every_settlement_credited``, the third wrong prediction in this cluster after
+    # ``--reserve`` falsified two of its own) and three more were *strengthened* into equalities
+    # against truth's orphan list instead of being stood down. ``I3.no_orphans`` is the only one
+    # that genuinely cannot hold once a payment may never pay out, and I17 is its successor.
+    assert uns_rep["checks_skipped"] == {"I3.no_orphans": ["unsettled"]}, (
+        f"--unsettled must suspend exactly I3.no_orphans, the check I17 replaces: "
+        f"{uns_rep['checks_skipped']}"
+    )
+    _orphans = list(uns.unsettled_payment_ids)
+    assert _orphans, "--unsettled orphaned nothing at seed 42 n=60; the mutants below would pass"
+    assert len(_orphans) < len(uns.payments), "the flag orphaned every payment"
+    _victim = _orphans[0]
+    _uns_pay = {p.payment_id: p for p in uns.payments}
+    # The mess is real on the money side too, or the flag is a relabelling the invariants happen
+    # to accept. Derived from memberships rather than from a settlement-side gross field, which
+    # does not exist: a ``Settlement`` carries ``net_paise`` and its deduction cells, and its
+    # gross is only ever implied by the wedge.
+    _claimed = {pid for s in uns.settlements for pid in s.payment_ids}
+    assert sum(_uns_pay[pid].gross_paise for pid in _claimed) < uns.total_gross_paise(), (
+        "--unsettled left every paisa of gross claimed by some settlement"
+    )
+
+    # Mutant 1 -- the orphan is cited by a credit's truth entry. Reaches I17 (measured) because
+    # it corrupts the *citation* side while leaving the orphan list and the settlement
+    # memberships untouched, so neither I3's cardinality nor I2 can see it. This is the
+    # half-converted payment: dropped from its settlement but still named by the credit that
+    # supposedly paid it, and the gross/net wedge closes either way.
+    must_fail(
+        "I17",
+        dataclasses.replace(
+            uns,
+            credits=[
+                dataclasses.replace(c, payment_ids=[*c.payment_ids, _victim])
+                if c is uns.credits[0]
+                else c
+                for c in uns.credits
+            ],
+        ),
+        uns_cfg,
+    )
+
+    # Mutant 2 -- **decision 3, and the assertion this whole flag's honesty rests on.** The
+    # orphan is marked with a distinct status. Every arithmetic check still passes: no money
+    # moved, the wedge closes, the orphan is still claimed by nothing. What changed is that
+    # ``payments.csv`` now answers the question the matcher is supposed to work out, so a
+    # one-line status filter would score perfect coverage while demonstrating nothing --
+    # Phase 4b's standard applied to a payments-side flag. ``_tier2_pool``'s docstring floats
+    # exactly this guard and names Phase 7 as where it "earns a place"; this is the refusal,
+    # and it is why raising ``MAX_POOL`` to 80 was the honest way to pay for the bigger pool.
+    must_fail(
+        "I17",
+        dataclasses.replace(
+            uns,
+            payments=[
+                dataclasses.replace(p, status="unsettled") if p.payment_id == _victim else p
+                for p in uns.payments
+            ],
+        ),
+        uns_cfg,
+    )
+
+    # Mutant 3 -- the same leak in the other column. Measured separately rather than assumed to
+    # behave like ``status``: ``currency`` is read by no other check in this file (``--fx`` is
+    # unimplemented), so this mutant proves assertion 4's second half is load-bearing *now*
+    # rather than becoming decoration the day --fx starts moving that column.
+    must_fail(
+        "I17",
+        dataclasses.replace(
+            uns,
+            payments=[
+                dataclasses.replace(p, currency="USD") if p.payment_id == _victim else p
+                for p in uns.payments
+            ],
+        ),
+        uns_cfg,
+    )
+
+    # --- the seven I3/I2 shadows, probed directly -----------------------------
+
+    # A settlement claims the orphan. I2 catches this first in a whole story (measured), which
+    # is the right outcome -- but assertion 3 is what states the *meaning* of "never paid out"
+    # on the settlement side, so it must be shown to fire on its own.
+    must_raise(
+        "I17",
+        "an orphan claimed by a settlement",
+        lambda: check_orphans(
+            dataclasses.replace(
+                uns,
+                settlements=[
+                    dataclasses.replace(s, payment_ids=[*s.payment_ids, _victim])
+                    if s is uns.settlements[0]
+                    else s
+                    for s in uns.settlements
+                ],
+            ),
+            uns_cfg,
+        ),
+    )
+
+    # The flag is on and nothing was orphaned: a run whose name is a false statement about its
+    # data. The same mislabelling ``MessFlags.IMPLEMENTED`` exists to prevent, and the same
+    # zero gate I15 and I16 carry, arriving through truth rather than through the money.
+    must_raise(
+        "I17",
+        "--unsettled with an empty orphan list",
+        lambda: check_orphans(dataclasses.replace(uns, unsettled_payment_ids=[]), uns_cfg),
+    )
+
+    # Truth names a payment ``payments.csv`` does not contain. The flag converts a payment; it
+    # never removes one, so this is the answer key and the data disagreeing about which
+    # payments exist -- and I13's unconditional count check is what makes that distinction
+    # meaningful rather than a matter of taste.
+    must_raise(
+        "I17",
+        "an orphan absent from payments.csv",
+        lambda: check_orphans(
+            dataclasses.replace(uns, unsettled_payment_ids=[*_orphans, "pay_9999"]), uns_cfg
+        ),
+    )
+
+    # The list repeats an id. Named twice is not a second orphan; it is an answer key that
+    # cannot be counted, and every downstream figure derived by length silently doubles it.
+    must_raise(
+        "I17",
+        "a repeated id in the orphan list",
+        lambda: check_orphans(
+            dataclasses.replace(uns, unsettled_payment_ids=[*_orphans, _victim]), uns_cfg
+        ),
+    )
+
+    # An orphan named on a run with the flag off. This is the branch that makes I17 a *total*
+    # check rather than one that only runs on the messy path: with ``--unsettled`` absent it
+    # asserts the same thing ``I3.no_orphans`` does, so the clean path is not left unguarded
+    # merely because the interesting case lives elsewhere.
+    must_raise(
+        "I17",
+        "an orphan named without --unsettled",
+        lambda: check_orphans(
+            dataclasses.replace(story, unsettled_payment_ids=[story.payments[0].payment_id]),
+            cfg,
+        ),
+    )
+
+    # Partiality: every payment orphaned. **This probe is why the partiality assertion moved.**
+    # Written first as a note that assertion 4's settled-population guard would catch this case
+    # instead, then measured (`.plan/probe_phase7_i17c.py`) -- and neither claim was true: it
+    # fired on *assertion 3*, because orphaning every payment leaves every payment still claimed
+    # by its real settlement. Chasing that down showed the partiality line could not be reached
+    # by any input at all: firing it needs ``len(orphans) >= len(payments)``, the checks above it
+    # force ``orphans`` to be a deduped subset of ``payments``, and the only story that satisfies
+    # both dies at assertion 3 or 4 first. It was decoration, in the one file whose whole purpose
+    # is refusing that. Hoisting it above the claim checks is what makes this probe test the
+    # assertion it names, and the probe is left here as the thing that would catch a future
+    # reordering putting it back in the shadow.
+    must_raise(
+        "I17",
+        "every payment orphaned",
+        lambda: check_orphans(
+            dataclasses.replace(
+                uns, unsettled_payment_ids=[p.payment_id for p in uns.payments]
+            ),
+            uns_cfg,
+        ),
+    )
+
+    # An orphan that also carries a refund. Fabricated *against an existing orphan* rather than
+    # by naming an already-refunded payment, which is what `.plan/probe_phase7_i17.py` tried:
+    # that mutates the orphan list and dies at I3. This version leaves the list alone -- and
+    # still cannot be a whole-story mutant, because a refund attached to a payment no
+    # settlement claims nets against nothing and trips **I15** with --netted-refunds on, or I3's
+    # "refunds without the flag" gate with it off (both measured). So the exclusion
+    # ``_draw_unsettled`` enforces is only observable here.
+    must_raise(
+        "I17",
+        "an orphan carrying a refund",
+        lambda: check_orphans(
+            dataclasses.replace(
+                uns,
+                refunds=[
+                    *uns.refunds,
+                    Refund(
+                        refund_id="rfnd_i17",
+                        payment_id=_victim,
+                        created_at=_uns_pay[_victim].captured_at,
+                        amount_paise=100,
+                    ),
+                ],
+            ),
+            uns_cfg,
+        ),
+    )
+
+    # --- I18, and the two populations that grew under it ------------------------------------
+    #
+    # ``check_noise`` raises ``"I18"`` from fourteen ``_require`` calls and ``must_raise``
+    # compares only that prefix, so a fixture can pass while an *earlier* assertion fires and
+    # the one its comment names sits unexecuted forever. That is not hypothetical: earlier in
+    # this same step a fixture labelled as reaching I4's gross/net wedge turned out to fire
+    # assertion 1, caught only by a probe that printed the message. So every mutant below was
+    # attributed to a named assertion by message in `.plan/probe_phase7_i18_mutants.py` before
+    # its comment was written, and all fourteen were measured individually reachable.
+    #
+    # ``noise_rows`` entered ``MessFlags.IMPLEMENTED`` in this same step, so these fixtures
+    # build a noisy config directly rather than patching that ClassVar. ``config.py``'s seam
+    # probe is where the declared-but-inert refusal is still tested, and it moved to ``fx`` --
+    # a flag that is genuinely inert, which is the only kind that probe can test.
+    noise_cfg = GenConfig(seed=42, n=200, flags=MessFlags(noise_rows=True))
+    noisy = build(noise_cfg)
+    noise_rep = check_story(noisy, noise_cfg)
+    # The one suspension ``--noise-rows`` earns, pinned like ``--unsettled``'s above so a
+    # future edit cannot quietly widen it. Step 4 re-derived both lists by measurement:
+    # of the five entries predicted for this flag, two passed outright
+    # (``I3.cardinality``, ``I6.all_payments_cited``) and two more were *strengthened* into
+    # named-set subtractions on the disk side rather than stood down. I18 is the successor
+    # to the one that genuinely cannot hold once a bank row may not be gateway money.
+    assert noise_rep["checks_skipped"] == {"I3.no_orphans": ["noise_rows"]}, (
+        f"--noise-rows must suspend exactly I3.no_orphans, the check I18 replaces: "
+        f"{noise_rep['checks_skipped']}"
+    )
+    _nrows, _ncredits = noisy.noise_rows, noisy.credits
+
+    def _with(rows):
+        return dataclasses.replace(noisy, noise_rows=rows)
+
+    def _mutate(i: int, **kw):
+        rows = list(_nrows)
+        rows[i] = dataclasses.replace(rows[i], **kw)
+        return _with(rows)
+
+    def _first(stratum: str) -> int:
+        return next(i for i, r in enumerate(_nrows) if r.stratum == stratum)
+
+    # Assertions 1-3: the flag-off guard, the mess, and partiality. The first is why this
+    # is a *total* check rather than one that only runs on the messy path.
+    must_raise("I18", "noise rows without the flag",
+               lambda: check_noise(noisy, GenConfig(seed=42, n=200)))
+    must_raise("I18", "the flag produced no noise",
+               lambda: check_noise(_with([]), noise_cfg))
+    must_raise("I18", "every bank row is noise",
+               lambda: check_noise(dataclasses.replace(noisy, credits=[]), noise_cfg))
+
+    # Assertion 4: one counter numbers both kinds, so a shared id means it was split.
+    must_raise("I18", "a noise row wearing a credit's id",
+               lambda: check_noise(_mutate(0, row_id=_ncredits[0].credit_id), noise_cfg))
+
+    # Assertions 5-6: the strata. The second mutant relabels every row into one stratum,
+    # which *also* breaks assertion 12 -- measured to fire 6 first, which is why this
+    # comment is about the population check and not about the gateway spelling.
+    must_raise("I18", "an undeclared stratum",
+               lambda: check_noise(_mutate(0, stratum="vendor_ish"), noise_cfg))
+    must_raise(
+        "I18",
+        "only one stratum populated",
+        lambda: check_noise(
+            _with([dataclasses.replace(r, stratum="plainly_foreign") for r in _nrows]),
+            noise_cfg,
+        ),
+    )
+
+    # Assertion 7: the key clash, which is also where correction (f) lands -- a planted
+    # ``--dup-amounts`` pair shares one key, so refusing every credit key refuses the
+    # three-way collision I12 rejects at generation time.
+    must_raise(
+        "I18",
+        "a noise key colliding with a credit",
+        lambda: check_noise(
+            _mutate(0, value_date=_ncredits[0].value_date,
+                    amount_paise=_ncredits[0].amount_paise),
+            noise_cfg,
+        ),
+    )
+    # Assertion 8: copied from another *noise* row, so assertion 7 cannot fire first.
+    must_raise(
+        "I18",
+        "two noise rows on one key",
+        lambda: check_noise(
+            _mutate(1, value_date=_nrows[0].value_date,
+                    amount_paise=_nrows[0].amount_paise),
+            noise_cfg,
+        ),
+    )
+
+    # Assertion 9: a day the gateway never credited is separable without reading anything.
+    must_raise("I18", "a noise row on an empty day",
+               lambda: check_noise(_mutate(0, value_date=date(2020, 1, 1)), noise_cfg))
+
+    # Assertion 10: the seed-dependent defect, forced deterministically. A plainly-foreign
+    # row that drew a live settlement tail stops being ignorable, and ``noise_recall`` falls
+    # below the share the run declares -- on someone else's seed, not on this one.
+    _live_tail = min(int(s.utr.removeprefix("XXXX")) for s in noisy.settlements)
+    must_raise(
+        "I18",
+        "plainly_foreign carrying a live tail",
+        lambda: check_noise(
+            _mutate(_first("plainly_foreign"),
+                    narration=f"NEFT-ACME SUPPLIES LTD-XXXX{_live_tail}"),
+            noise_cfg,
+        ),
+    )
+
+    # Assertion 11. **Two** digits, not four: assertion 10 runs first and matches 4-digit
+    # settlement tails, so a 4-digit mutant would fire that one instead and prove nothing
+    # about the masked stratum.
+    must_raise(
+        "I18",
+        "gateway_plausible carrying digits",
+        lambda: check_noise(
+            _mutate(_first("gateway_plausible"), narration="NEFT-RAZORPAYSOFT-XXXX99"),
+            noise_cfg,
+        ),
+    )
+    # Assertion 12: no digit run, so assertion 10 cannot fire first.
+    must_raise(
+        "I18",
+        "plainly_foreign naming the gateway",
+        lambda: check_noise(
+            _mutate(_first("plainly_foreign"), narration="NEFT-RAZORPAYSOFT-XXXX"),
+            noise_cfg,
+        ),
+    )
+
+    # Assertion 13: renumber the noise rows above every credit and leave their dates alone,
+    # so sorting the file by id puts scattered dates at the end.
+    _top = max(int(c.credit_id.removeprefix(ids.CREDIT_PREFIX)) for c in _ncredits)
+    must_raise(
+        "I18",
+        "noise renumbered to the end of the file",
+        lambda: check_noise(
+            _with([dataclasses.replace(r, row_id=ids.credit_id(_top + 1 + i))
+                   for i, r in enumerate(_nrows)]),
+            noise_cfg,
+        ),
+    )
+    # Assertion 14, and it exists only as a backstop -- so the mutant has to keep
+    # ``(date, amount)`` order *intact* to reach it. Placing the appended rows on the last
+    # credit date with amounts above every credit's does that: assertion 13 sees a sorted
+    # file and passes, and only the trailing-block check can catch it. A naive appended
+    # block fires 13, which would leave this assertion unreachable decoration.
+    _last_date = max(c.value_date for c in _ncredits)
+    _top_amount = max(c.amount_paise for c in _ncredits)
+    must_raise(
+        "I18",
+        "an appended block with order intact",
+        lambda: check_noise(
+            _with([
+                dataclasses.replace(
+                    r,
+                    row_id=ids.credit_id(_top + 1 + i),
+                    value_date=_last_date,
+                    amount_paise=_top_amount + (i + 1) * RUPEE * 1000,
+                )
+                for i, r in enumerate(_nrows)
+            ]),
+            noise_cfg,
+        ),
+    )
+
+    # The two checks whose *population* grew under this flag, and neither is new code --
+    # which is what makes them worth a fixture. Both audited ``story.credits`` while the
+    # bank file became credits plus noise rows, so both were passing vacuously on the rows
+    # the flag adds: the population had grown and the check had not. A suspension announces
+    # itself in ``checks_skipped``; a stale population announces nothing at all.
+    #
+    # These run through ``check_story``, because that is where the widened call sites live
+    # and the point is that the widened populations are reachable there.
+    must_raise(
+        "I1",
+        "two bank rows sharing an id",
+        lambda: check_story(_mutate(0, row_id=_ncredits[0].credit_id), noise_cfg),
+    )
+    # I7 on a noise narration. The tail is *drawn*, and a 4-digit tail collides with any
+    # amount from 1000-9999 rupees -- inside ``NOISE_AMOUNT_BAND_RUPEES``, so the redraw in
+    # ``_draw_noise_rows`` is load-bearing and nothing checked it. The victim is chosen so
+    # its own rupee figure is not a live settlement tail, or assertion 10 would fire first
+    # and this would be a fixture about the wrong check.
+    _setl_tails = {int(s.utr.removeprefix("XXXX")) for s in noisy.settlements}
+    _echo_i = next(
+        i for i, r in enumerate(_nrows)
+        if r.stratum == "plainly_foreign" and r.amount_paise // RUPEE not in _setl_tails
+    )
+    must_raise(
+        "I7",
+        "a noise narration echoing its own amount",
+        lambda: check_story(
+            _mutate(
+                _echo_i,
+                narration=f"NEFT-ACME SUPPLIES LTD-REF{_nrows[_echo_i].amount_paise // RUPEE}",
+            ),
+            noise_cfg,
         ),
     )
 

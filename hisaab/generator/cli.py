@@ -218,6 +218,70 @@ def config_from_args(args: argparse.Namespace) -> GenConfig:
     )
 
 
+#: The scalar switches the reproduce line has to carry, and the mess flag each is gated behind
+#: (``None`` for ungated). The *values* are read from ``GenConfig``'s own field defaults rather
+#: than copied here, so changing a default cannot leave this line quietly printing a stale one.
+_SCALAR_SWITCHES: tuple[tuple[str, str, str | None], ...] = (
+    ("narration_styles", "--narration-styles", None),
+    ("settlement_delay_days", "--settlement-delay-days", "settlement_delay"),
+    ("posting_lag_days", "--posting-lag-days", "settlement_delay"),
+    ("dup_pairs", "--dup-pairs", "dup_amounts"),
+)
+
+
+def _reproduce_command(cfg: GenConfig) -> str:
+    """The command that regenerates *this* run -- mess flags and all.
+
+    **This line used to print only ``--seed``, ``--n`` and ``--month``**, which meant every
+    messy run advertised a command that regenerates *clean* data: a judge copying the line off
+    a ``--fees --batching`` run got a different dataset than the one whose hashes were printed
+    three lines above it, with nothing to indicate the substitution. Reproducibility is a graded
+    property of this submission, so a reproduce line that does not reproduce is worse than none.
+
+    Two constraints shape what may be emitted, and the second is why this is not simply "print
+    every non-default":
+
+      * **``--n`` is always stated**, never omitted as a default. ``--batching`` *raises* the
+        default (see ``config_from_args``), so ``--n`` absent means 60 on one flag set and 200 on
+        another -- and the run being reproduced already resolved it to one number.
+      * **Two magnitudes are gated behind their flags.** ``argparse`` accepts
+        ``--settlement-delay-days`` only alongside ``--settlement-delay``, and ``--dup-pairs``
+        only alongside ``--dup-amounts``, so emitting one on a run whose flag is off would print
+        a command that exits 2. ``GenConfig.__post_init__`` already refuses that combination,
+        which is what makes the assertion below a statement about this function rather than a
+        guess about the config.
+    """
+    defaults = {f.name: f.default for f in fields(GenConfig)}
+    parts = [
+        "python -m hisaab.generator",
+        f"--seed {cfg.seed}",
+        f"--n {cfg.n}",
+        f"--month {cfg.month_label}",
+    ]
+    # In ``MessFlags`` declaration order, which is the build order the ``--help`` ramp uses --
+    # so the reproduce line reads as a difficulty level rather than an alphabetised pile.
+    parts.extend(
+        f"--{name.replace('_', '-')}" for name in MessFlags.names() if getattr(cfg.flags, name)
+    )
+    for field_name, switch, gate in _SCALAR_SWITCHES:
+        value = getattr(cfg, field_name)
+        if value == defaults[field_name]:
+            continue
+        assert gate is None or getattr(cfg.flags, gate), (
+            f"{switch}={value} on a run with --{(gate or '').replace('_', '-')} off. "
+            f"GenConfig.__post_init__ refuses that, so reaching here means the refusal "
+            f"regressed -- and this line would print a command argparse rejects"
+        )
+        parts.append(f"{switch} {value}")
+    # The output directories, quoted only when they need it: an unquoted path with a space
+    # silently becomes two arguments, and the second is read as the next switch's value.
+    for field_name, switch in (("out_dir", "--out"), ("truth_dir", "--truth")):
+        value = str(getattr(cfg, field_name))
+        if Path(value) != defaults[field_name]:
+            parts.append(f"{switch} {chr(34) + value + chr(34) if ' ' in value else value}")
+    return " ".join(parts)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -279,10 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n  {result.truth_dir}{Path().anchor}  (the matcher NEVER reads these)")
     for name in ("truth.json", "run_manifest.json"):
         print(f"    {name:<22} {result.rows_written[name]:>4} rows  {result.hashes[name][:12]}")
-    print(
-        f"\n  reproduce: python -m hisaab.generator --seed {cfg.seed} "
-        f"--n {cfg.n} --month {cfg.month_label}"
-    )
+    print(f"\n  reproduce: {_reproduce_command(cfg)}")
     if not args.quiet:
         assert set(DETERMINISTIC_FILES) <= set(result.hashes)
     return EXIT_OK

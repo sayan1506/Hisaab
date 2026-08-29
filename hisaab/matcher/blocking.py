@@ -52,6 +52,9 @@ from dataclasses import dataclass
 
 from ..common.bizdays import BusinessCalendar
 from .load import Credit, Settlement
+# ``MASK_PREFIX`` only -- the parser itself is not called here. ``normalize`` imports
+# nothing from this module (only ``common.ids``), so the direction cannot cycle.
+from .normalize import MASK_PREFIX
 
 #: Phase 3's date window, in business days. T+0 is measured on the committed data:
 #: ``value_date == settled_on`` on every credit, across seeds 1/2/3/42 at n=60/200/1000.
@@ -182,6 +185,21 @@ class SettlementIndex:
             settlements, key=lambda s: (s.net_paise, s.settlement_id)
         )
         self._amounts: list[int] = [s.net_paise for s in self._sorted]
+        #: Every settlement's UTR tail, as the 4-digit string a narration would carry.
+        #:
+        #: **Not on the match path** -- ``candidates_for`` does not read it, and that separation
+        #: is the same one ``_note_for_match`` documents: a tail that corroborates a join is
+        #: evidence, the same tail used *as* the join is a shortcut that hides every missing
+        #: capability. What reads this is Phase 7's ``IGNORED`` gate, which asks the opposite
+        #: question -- not "which settlement is this?" but "is this gateway money at all?".
+        #:
+        #: Built here rather than per credit because the gate runs inside a per-credit branch:
+        #: recomputing it there would make an O(n) scan into O(n^2), and this object is
+        #: constructed once per run. Eager rather than lazy since it is one pass over a list
+        #: already being sorted.
+        self.utr_tails: frozenset[str] = frozenset(
+            s.utr.removeprefix(MASK_PREFIX) for s in self._sorted
+        )
 
     def __len__(self) -> int:
         return len(self._sorted)

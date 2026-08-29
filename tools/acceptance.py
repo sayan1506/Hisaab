@@ -1260,7 +1260,7 @@ def _gate_12_cap_probe(root: Path) -> str:
     Two things are asserted, and the second matters more than the first:
 
       * the refusal fires at all, with a note that **names the bound** -- an exception saying
-        "the pool of 91 exceeds the cap of 64" is triage-able, and "could not resolve" is not;
+        "the pool of 99 exceeds the cap of 80" is triage-able, and "could not resolve" is not;
       * refusing costs only coverage. Correctness stays 1.0 and wrong matches stay 0 while
         hundreds of rows are refused, which is the property that separates a bounded refusal
         from a search that gives up and guesses.
@@ -1922,6 +1922,339 @@ def gate_13_phase6(sizes: tuple[int, ...] = (200, 1000)) -> None:
         print(f"    control  seed {seed}, n={n}: 100/100/0, 0 reserves diagnosed")
 
 
+#: Gate 13's seven plus Phase 7's two. Every flag the generator implements except ``--dup-amounts``
+#: (gate 11 owns the planted rows, and combining it with ``--batching`` is refused outright).
+PHASE7_FLAGS: tuple[str, ...] = (*PHASE6_FLAGS, "--noise-rows", "--unsettled")
+
+#: The three noise strata, in the order ``run_manifest.json`` sorts them. Named here rather than
+#: read from the manifest because a gate that learns the stratum names from the file it is
+#: auditing cannot notice a stratum disappearing.
+NOISE_STRATA: tuple[str, ...] = ("gateway_plausible", "look_alike", "plainly_foreign")
+
+
+def _noise_failure(
+    cells: dict[str, int],
+    strata: dict[str, int],
+    label: str,
+) -> str | None:
+    """Gate 14's predicate: did the non-gateway rows land on their own axis, correctly?
+
+    Three clauses, and the first is the one carrying the phase.
+
+    **The count identity.** ``noise_correctly_ignored`` must equal the manifest's realised
+    ``plainly_foreign`` count -- not a rate, and not a threshold. Step 4 measured
+    ``noise_recall`` as size-dependent (50%/41.7%/40.0% at n=60/200/1000) because the strata are
+    allocated by largest remainder over a share that is itself a share of a varying row count, so
+    any flat floor would be a seed-and-size-fitted number wearing a property's clothes. The
+    identity is the property, and it closes **both** directions at once: below it, a
+    ``plainly_foreign`` row the matcher should have set aside was not; above it, one of the two
+    gateway-spelled strata leaked into ``IGNORED``, which is the shape that becomes Phase 8's
+    ``WRONG_IGNORE`` the moment ``--utr-patchy`` strips a genuine credit's UTR.
+
+    **What this is and is not.** It is a count identity, so on its own it permits an exchange --
+    one ``plainly_foreign`` row diagnosed as pending while one ``look_alike`` row is ignored keeps
+    the total. That exchange cannot happen, and the reason lives in a different check rather than
+    this one: ``look_alike`` and ``gateway_plausible`` rows carry a gateway counterparty **by
+    construction**, and I18 asserts precisely that masking on every generated story -- including
+    the ones this gate generates, since ``check_story`` runs inside the generator subprocess. So
+    set equality follows from the identity *composed with* I18, not from the identity alone. That
+    composition is the honest claim; asserting set equality here would mean re-deriving each row's
+    stratum from its narration using the same two evidence tests the matcher's gate uses, which
+    would pass by construction and prove nothing. The per-row stratum is deliberately not on disk
+    (``emit.build_manifest``: the id list needs none), and this is why it does not need to be.
+
+    **``WRONG_IGNORE`` at zero, unconditionally.** Decision 6. Ignoring a genuine gateway credit
+    drops real money out of the books; unlike a wrong match it leaves no residual behind to
+    notice it by. There is no size, seed or flag set where a non-zero count here is acceptable.
+
+    **Every stratum populated.** A stratum that drew no rows is a stratum whose handling this run
+    did not test, and n=200 under ``--batching`` is where that would first happen -- the noise
+    share is taken against a bank-row count that batching shrinks. A gate reporting "all three
+    strata behave" over a run containing two of them is the vacuous pass this project keeps
+    finding; measured minimum at n=200 is 2 rows in the smallest stratum, so the floor is real
+    but thin.
+    """
+    ignored = cells["noise_correctly_ignored"]
+    plainly_foreign = strata.get("plainly_foreign", 0)
+    if ignored != plainly_foreign:
+        direction = (
+            f"{plainly_foreign - ignored} plainly-foreign row(s) were NOT set aside"
+            if ignored < plainly_foreign
+            else f"{ignored - plainly_foreign} gateway-spelled noise row(s) leaked into IGNORED"
+        )
+        return (
+            f"{label}: {ignored} noise row(s) correctly ignored against "
+            f"{plainly_foreign} plainly_foreign in the manifest -- {direction}. Only "
+            f"plainly_foreign is ignorable: the other two strata carry a gateway counterparty by "
+            f"construction and must fall through to a diagnosis. A leak in this direction is "
+            f"Phase 8's WRONG_IGNORE arriving early, since --utr-patchy makes a genuine credit "
+            f"look exactly like gateway_plausible.\n  strata: {dict(sorted(strata.items()))}"
+        )
+
+    if cells["wrong_ignore"]:
+        return (
+            f"{label}: {cells['wrong_ignore']} genuine gateway credit(s) were discarded as "
+            f"non-gateway income. This is the one cell with no acceptable non-zero value "
+            f"(decision 6) -- a wrong match leaves a residual a human can find, while a wrongly "
+            f"ignored credit leaves nothing behind at all"
+        )
+
+    if empty := [s for s in NOISE_STRATA if not strata.get(s)]:
+        return (
+            f"{label}: stratum/strata {empty} drew no rows, so this run does not exercise "
+            f"the handling this gate claims to check. The noise share is taken against a bank-row "
+            f"count that --batching shrinks, so the small size is where a stratum empties first"
+            f"\n  strata: {dict(sorted(strata.items()))}"
+        )
+    return None
+
+
+def _gate_14_self_check() -> None:
+    """Prove ``_noise_failure`` is satisfiable, and rejects each shape it claims to.
+
+    Gate 13's discipline, for gate 13's reason: this gate's value is entirely in what it refuses,
+    so the predicate meets a known-good input and every known-bad one before a real run is read.
+    Both directions of the identity are exercised separately -- a predicate that caught only the
+    shortfall would miss the leak, and the leak is the one that becomes a wrong answer next phase.
+    """
+    def cells(ignored: int, wrong_ignore: int = 0) -> dict[str, int]:
+        return {"noise_correctly_ignored": ignored, "noise_mishandled": 0,
+                "wrong_ignore": wrong_ignore}
+
+    healthy_strata = {"gateway_plausible": 11, "look_alike": 11, "plainly_foreign": 15}
+    if (got := _noise_failure(cells(15), healthy_strata, "probe")) is not None:
+        raise GateFailure(
+            f"gate 14's predicate rejects a healthy noisy run, so every failure it reports below "
+            f"would be unconditional and would prove nothing: {got}"
+        )
+
+    for bad_cells, bad_strata, want in (
+        # A plainly-foreign row the matcher failed to set aside.
+        (cells(14), healthy_strata, "were NOT set aside"),
+        # The direction that matters more: a gateway-spelled row wrongly ignored.
+        (cells(16), healthy_strata, "leaked into IGNORED"),
+        # Decision 6.
+        (cells(15, wrong_ignore=1), healthy_strata, "no acceptable non-zero value"),
+        # A stratum that drew nothing -- checked with the identity satisfied, so the
+        # complaint must be attributable to the stratum rather than to the count.
+        (cells(15), {**healthy_strata, "look_alike": 0}, "drew no rows"),
+    ):
+        got = _noise_failure(bad_cells, bad_strata, "probe")
+        if got is None or want not in got:
+            raise GateFailure(
+                f"gate 14's predicate failed to reject a bad shape: expected a complaint "
+                f"containing {want!r}, got {got!r}"
+            )
+
+
+def gate_14_phase7(sizes: tuple[int, ...] = (200, 1000)) -> None:
+    """Phase 7: bank rows that are not gateway credits, and payments that never pay out.
+
+    Every gate before this one scores a file where **every bank row is gateway money** and every
+    payment eventually settles. Both assumptions are false in a real bank statement, and this gate
+    turns on all nine implemented flags at once to assert what the matcher must do without them.
+
+    **It runs at n=1000 even under ``--skip-slow``, and for gate 13's reason rather than by
+    imitation.** Two of the properties below are invisible at n=200: ``AMBIGUOUS_MULTI_SUBSET``
+    does not appear at all until the candidate pool is large enough for a coincidental subset to
+    exist (measured: 0 at n=200 on all three seeds, 21-34 at n=1000), and Tier 2's pool cap is
+    what Phase 7 step 0 raised to 80 -- a size that never presents a pool above 64 cannot notice
+    a cap regression. A fast run that dropped n=1000 would report this phase green while blind to
+    both.
+
+    What it asserts, per seed and size:
+
+      * **The noise axis lands correctly** -- ``_noise_failure``, above, whose three clauses carry
+        their own reasoning and whose central claim is a count identity against the manifest's
+        realised strata rather than a rate.
+      * **Correctness 1.0 with zero wrong matches.** Gate 13 asserts this on seven flags; nothing
+        before this gate asserts it with non-gateway rows and unsettled payments on the file, and
+        both are new ways for a match to go wrong: a noise row sits in the same date-and-amount
+        space as a settlement's net, and an orphaned payment is claimed by no settlement, so
+        Tier 2's partition filter cannot remove it from the pool.
+      * **Every unresolved *gateway* row abstains honestly**, with the noise rows excluded from
+        that check rather than swept into it. Their outcome is scored on its own axis, and folding
+        ``IGNORED`` into an abstention audit would let the easiest rows in the file vouch for the
+        hardest. Gate 13's single ``NO_CANDIDATE`` exemption is inherited by identity -- it did
+        not fire on any measured seed or size here, so it is a permission this gate carries
+        rather than a clause it depends on.
+      * **A negative control**: the same seed and size with no flags resolves everything, ignores
+        nothing and reports ``noise_recall`` as ``n/a``. A rate is only attributable to a cause
+        when the run without the cause reads zero -- and an ``IGNORED`` in clean mode would mean
+        the gate from step 5 fires on rows that are plain gateway credits.
+
+    What a pass does **not** prove. ``noise_recall`` sits near 40% by construction, not by
+    difficulty: only ``plainly_foreign`` is ignorable, so the ceiling on this metric is the
+    stratum split itself. The other two strata are *designed* to be indistinguishable from a
+    genuine credit that has lost its UTR, because Phase 8 makes exactly that row real -- and a
+    rule that ignored them would convert this phase's recall into next phase's wrong answers. The
+    17-of-36 misdiagnosed as pending reserves at n=1000 are a measured limit of the band (step 6),
+    not a defect this gate is failing to catch.
+    """
+    print(f"\ngate 14 -- Phase 7: all nine flags, seeds {list(DEV_SEEDS)}")
+    _gate_14_self_check()
+
+    with tempfile.TemporaryDirectory(prefix="hisaab-phase7-") as tmp:
+        root = Path(tmp)
+        for seed in DEV_SEEDS:
+            for n in sizes:
+                base = root / f"s{seed}n{n}"
+                data, truth = base / "data", base / "truth"
+                _run(
+                    [
+                        sys.executable, "-m", "hisaab.generator",
+                        "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                        "--out", str(data), "--truth", str(truth), "--quiet", *PHASE7_FLAGS,
+                    ],
+                    f"generator with all Phase 7 flags at seed {seed}, n={n}",
+                )
+                out = base / "matches.json"
+                doc = _matcher_and_score(
+                    data, truth, out, seed, extra=["--window", str(MESS_WINDOW_DAYS)],
+                )
+                verdicts = json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+                truth_doc = json.loads((truth / "truth.json").read_text(encoding="utf-8"))
+                credits = truth_doc["credits"]
+                manifest = json.loads(
+                    (truth / "run_manifest.json").read_text(encoding="utf-8")
+                )
+                strata: dict[str, int] = manifest["noise_strata"]
+                cells, rates = doc["cells"], doc["rates"]  # type: ignore[index]
+
+                # --- the flags produced their mess at all --------------------------------
+                noise_ids = set(truth_doc["orphans"]["non_gateway_credit_ids"])
+                if not noise_ids:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: --noise-rows put nothing on the file, so every "
+                        f"noise property below would be satisfied by an empty set"
+                    )
+                if sum(strata.values()) != len(noise_ids):
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: the manifest's strata sum to "
+                        f"{sum(strata.values())} but truth lists {len(noise_ids)} non-gateway "
+                        f"row(s) -- the two truth-side files disagree about the same rows, and "
+                        f"the identity below is read off the manifest"
+                    )
+                if not truth_doc["orphans"]["unsettled_payment_ids"]:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: --unsettled orphaned no payment, so the run is "
+                        f"labelled with a mess it does not have"
+                    )
+
+                # --- the noise axis ------------------------------------------------------
+                if problem := _noise_failure(cells, strata, f"seed {seed}, n={n}"):
+                    raise GateFailure(problem)
+
+                # --- the line that never bends ------------------------------------------
+                wrong = (
+                    cells["wrong_match"] + cells["wrong_match_invented"]
+                    + cells["lucky_guess"]
+                )
+                if wrong or rates["correctness"] != 1.0:
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: correctness {rates['correctness']}, {wrong} wrong "
+                        f"match(es). Two new ways for this to break: a noise row occupies the "
+                        f"same date-and-amount space as a settlement's net, and an orphaned "
+                        f"payment cannot be filtered out of Tier 2's pool by partition.\n"
+                        f"  cells: {cells}"
+                    )
+
+                # --- honest abstentions, gateway rows only -------------------------------
+                exempt = _orphan_bearing_undeclared(data, credits)
+                dishonest = [
+                    str(v.get("credit_id")) for v in verdicts
+                    if v.get("outcome") != "RESOLVED"
+                    and str(v.get("credit_id")) not in noise_ids
+                    and str(v.get("reason")) not in ABSTENTION_REASONS
+                    and not (
+                        str(v.get("reason")) == "NO_CANDIDATE"
+                        and str(v.get("credit_id")) in exempt
+                    )
+                ]
+                if dishonest:
+                    unresolved = [
+                        v for v in verdicts
+                        if v.get("outcome") != "RESOLVED"
+                        and str(v.get("credit_id")) not in noise_ids
+                    ]
+                    raise GateFailure(
+                        f"seed {seed}, n={n}: {len(dishonest)} unresolved gateway row(s) carry a "
+                        f"reason outside ABSTENTION_REASONS (e.g. {dishonest[:3]}). The noise "
+                        f"rows are excluded from this check on purpose -- they are scored on "
+                        f"their own axis, and letting IGNORED count as an abstention would have "
+                        f"the easiest rows in the file vouch for the hardest.\n"
+                        f"  reasons seen: "
+                        f"{dict(sorted(collections.Counter(str(v.get('reason')) for v in unresolved).items()))}"
+                    )
+
+                ignored_total = sum(
+                    1 for v in verdicts if v.get("outcome") == "IGNORED"
+                )
+                print(
+                    f"    seed {seed}, n={n:<5} rows={len(verdicts):<5} "
+                    f"noise={len(noise_ids):<4} ignored={ignored_total:<4} "
+                    f"recall={rates['noise_recall']:.3f} "
+                    f"mishandled={cells['noise_mishandled']:<4} "
+                    f"correct={cells['correct']:<5} wrong={wrong} "
+                    f"cov={rates['coverage']:.4f}  strata={dict(sorted(strata.items()))}"
+                )
+
+        # --- the negative control ----------------------------------------------------
+        # Same seed and size, no flags. Two things must read zero, and the second is the
+        # one step 5 could plausibly have broken: if the IGNORED gate fired on plain
+        # gateway credits, it would show up here and nowhere else.
+        seed, n = DEV_SEEDS[0], sizes[0]
+        base = root / f"control-s{seed}n{n}"
+        data, truth = base / "data", base / "truth"
+        _run(
+            [
+                sys.executable, "-m", "hisaab.generator",
+                "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                "--out", str(data), "--truth", str(truth), "--quiet",
+            ],
+            f"clean-mode control at seed {seed}, n={n}",
+        )
+        out = base / "matches.json"
+        doc = _matcher_and_score(data, truth, out, seed)
+        cells, rates = doc["cells"], doc["rates"]  # type: ignore[index]
+        # The control's **own** truth, read fresh. Reusing the loop's ``truth_doc`` here would
+        # compare the clean run's cells against the last noisy run's credit count -- two
+        # different files, and the mismatch would read as a control failure.
+        control_credits = json.loads(
+            (truth / "truth.json").read_text(encoding="utf-8")
+        )["credits"]
+        control_ignored = [
+            str(v.get("credit_id"))
+            for v in json.loads(out.read_text(encoding="utf-8"))["verdicts"]
+            if v.get("outcome") == "IGNORED"
+        ]
+        if control_ignored:
+            raise GateFailure(
+                f"the clean-mode control at seed {seed}, n={n} set aside "
+                f"{len(control_ignored)} row(s) as non-gateway (e.g. {control_ignored[:3]}) on a "
+                f"file where every row is a gateway credit. Step 5's gate requires **both** "
+                f"evidence tests to fail, and a clean credit names the counterparty, so this "
+                f"means the gate is reading something other than what it claims to"
+            )
+        if rates["noise_recall"] is not None or cells["noise_correctly_ignored"]:
+            raise GateFailure(
+                f"the clean-mode control reports noise_recall={rates['noise_recall']} over "
+                f"{cells['noise_correctly_ignored']} ignored row(s); with no non-gateway rows on "
+                f"the file the rate has to be n/a rather than a number -- a 0.0 or a 1.0 here "
+                f"would make the noisy runs' rate unattributable"
+            )
+        if rates["correctness"] != 1.0 or cells["correct"] != len(control_credits):
+            raise GateFailure(
+                f"the clean-mode control resolves {cells['correct']} of "
+                f"{len(control_credits)} at correctness {rates['correctness']} -- the control is "
+                f"what makes the noisy numbers attributable, so it has to be perfect"
+            )
+        print(
+            f"    control  seed {seed}, n={n:<5} no flags: resolved={cells['correct']}"
+            f"/{len(control_credits)} ignored=0 recall=n/a"
+        )
+
+
 def gate_7_assumptions() -> None:
     """ASSUMPTIONS.md must exist and cover every topic the write-up has to state."""
     print("\ngate 7 -- ASSUMPTIONS.md")
@@ -1947,10 +2280,11 @@ def gate_7_assumptions() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-6).")
+    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-7).")
     p.add_argument("--skip-slow", action="store_true",
-                   help="skip the n=200 sweeps in gates 3, 6, 9, 10, 11 and 12. Gate 13 "
-                        "ignores this flag: its wrong-match assertion is invisible at n=200")
+                   help="skip the n=200 sweeps in gates 3, 6, 9, 10, 11 and 12. Gates 13 "
+                        "and 14 ignore this flag: gate 13's wrong-match assertion and gate "
+                        "14's ambiguity and pool-cap assertions are all invisible at n=200")
     args = p.parse_args(argv)
 
     print("Acceptance -- generator (clean mode) + scoring harness + matcher\n" + "=" * 62)
@@ -1976,6 +2310,12 @@ def main(argv: list[str] | None = None) -> int:
         # Measured cost of keeping it: 2.2s -> 23.5s, and the slow half is the matcher rather
         # than the generator (n=1000 generates in ~0.5s).
         lambda: gate_13_phase6((200, 1000)),
+        # n=1000 under --skip-slow for the same reason as gate 13, measured separately:
+        # AMBIGUOUS_MULTI_SUBSET does not occur at all at n=200 on any dev seed (0, against
+        # 21-34 at n=1000), so the small size cannot show that a noisy file still abstains
+        # honestly where the subset search is genuinely ambiguous -- and n=200 never presents
+        # a Tier 2 pool above 64, so it cannot notice a regression in the cap Phase 7 raised.
+        lambda: gate_14_phase7((200, 1000)),
     ]
     try:
         for gate in gates:
@@ -1985,7 +2325,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all thirteen gates pass -- Phases 1 through 6 are complete")
+    print("all fourteen gates pass -- Phases 1 through 7 are complete")
     print("\nClean mode still resolves at 100/100/0 (gate 9), and the first two rows of the")
     print("mess dial are on: --fees wedges gross against net, --settlement-delay moves the")
     print("dates, and the matcher holds 100% correctness with 0 wrong matches while proving")

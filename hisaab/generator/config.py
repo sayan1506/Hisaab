@@ -150,6 +150,119 @@ RESERVE_SHARE = 0.08
 #: ``amount_paise > 0``, and at 20% of net the remaining 80% is comfortably positive.
 RESERVE_BPS_BAND: tuple[int, int] = (500, 2_000)
 
+#: Share of payments that are captured but **never paid out** (``--unsettled``, Phase 7).
+#:
+#: Partial for the reason every other share in this file is partial, and here the argument is
+#: sharper than usual: if most payments never settled, "the unsettled ones" and "every payment"
+#: would be the same set, and nothing downstream could tell a matcher that handles orphans from
+#: one that has no concept of them.
+#:
+#: **2% rather than anything larger, because this share is paid for in Tier 2 enumeration.** An
+#: orphan is claimed by no settlement, so ``tier1._tier2_pool``'s partition filter never removes
+#: it and it sits in every pool whose window covers its capture date. Seed 1 at n=1000 had one
+#: payment of headroom under the old cap of 64 (pool max 63); at this share its measured pool is
+#: **65**, and eleven of its withheld settlements present a pool above 64 -- which is what forced
+#: ``MAX_POOL`` to 80 (see ``matcher/tier2.py`` and ASSUMPTIONS.md row 23b).
+#:
+#: **The share and that bound are coupled tightly, and the curve is not smooth.** Measured with
+#: this constant patched (`.plan/probe_phase7_growth_real.py`): a 5% share already reaches 79 on
+#: seed 3, and a 15% share breaches the cap at 84. Growth is also non-monotonic -- seed 3 runs
+#: 60 -> 79 -> 71 -> 63 across 2/5/10/15% -- because orphaning a settlement's only member deletes
+#: that settlement and moves which date holds the maximum. So raising this share means
+#: **re-measuring** the pool rather than interpolating, and an over-cap refusal carries
+#: ``MEMBERSHIP_UNDECLARED``, which fails the acceptance gates rather than costing coverage.
+UNSETTLED_SHARE = 0.02
+
+#: Bank rows that are **not gateway money at all** (``--noise-rows``, Phase 7), as a share of
+#: the gateway credits a run produces. A real statement carries the business's whole banking
+#: life; the reconciler's first job is deciding which rows are even in scope.
+#:
+#: 6% of credits, so the count tracks the bank file rather than ``n`` -- under ``--batching``
+#: those differ by ~1.6x, and a share of ``n`` would make noise a *third* of a batched
+#: statement instead of a fringe. Partial for the reason every share here is partial.
+NOISE_SHARE = 0.06
+
+#: Noise amounts, in whole rupees, drawn uniformly. Overlaps the gateway amount bands on
+#: purpose: a noise row separable by *size* would be separable without reading the narration
+#: at all, and the whole point of the flag is that scope is a narration question.
+NOISE_AMOUNT_BAND_RUPEES: tuple[int, int] = (500, 50_000)
+
+#: The three strata, and the split is **allocated by count rather than drawn**, which is the
+#: load-bearing choice (`.plan/phase7.md` decision 2).
+#:
+#: ``noise_recall``'s floor is the plainly-foreign share and nothing more, and gate 14 asserts
+#: it. A *randomly* drawn split makes that floor wobble seed to seed, so the gate would have to
+#: assert a number loose enough to survive the wobble -- which is a weaker gate for no benefit.
+#: Allocated by count, the share is exact, truth publishes the realised counts, and the floor is
+#: fixed before any matcher runs.
+#:
+#: Why these three and not one:
+#:
+#:   * **plainly_foreign** -- vendor, salary or interest text, **no gateway counterparty and no
+#:     settlement-hitting tail**. The only stratum the ``IGNORED`` rule can catch, so the only
+#:     one the floor may count.
+#:   * **gateway_plausible** -- a gateway counterparty spelling with **no resolvable tail** (the
+#:     masked ``XXXX`` form, no digit run at all).
+#:   * **look_alike** -- a gateway counterparty **and** a 4-digit tail that hits no settlement's
+#:     UTR.
+#:
+#: The last two are why the flag means anything, and they are **deliberately not separable**.
+#: Decision 4 ignores a row only when it carries neither a settlement-hitting tail nor a gateway
+#: counterparty, and both of these carry the counterparty -- so both fall through to the reserve
+#: diagnostic and score as ``NOISE_MISHANDLED``. That is not a gap to be closed by relaxing the
+#: rule: under Phase 8's ``--utr-patchy`` a *genuine* gateway credit loses its tail and looks
+#: exactly like ``gateway_plausible``, so a rule where "no tail" alone sufficed would convert
+#: this phase's ``noise_recall`` into next phase's ``WRONG_IGNORE`` -- money dropped from the
+#: books instead of merely left unexplained. The honest consequence is a recall near the
+#: plainly-foreign share, reported rather than engineered upward.
+#:
+#: A recall of 100% is therefore a **finding that the strata are too easy**, never a win.
+NOISE_STRATA_SPLIT: dict[str, float] = {
+    "plainly_foreign": 0.40,
+    "gateway_plausible": 0.30,
+    "look_alike": 0.30,
+}
+
+#: Counterparty text for ``plainly_foreign`` rows. Authored rather than generated, so I7's leak
+#: audit is a real exposure here: no ``pay_``/``setl_``/``C``-prefixed identifier shape, and no
+#: digit run that could equal a row's own amount (the tail is the only digits these carry, and
+#: ``story._draw_noise_rows`` re-draws it if it echoes).
+#:
+#: None of these contain ``RAZORPAY`` or ``RZRPAY`` in any spelling -- that is what makes the
+#: stratum plainly foreign, and ``invariants.check_noise`` asserts it rather than trusting it.
+NOISE_FOREIGN_COUNTERPARTIES: tuple[str, ...] = (
+    "ACME SUPPLIES LTD",
+    "KIRANA WHOLESALE",
+    "MONTHLY SALARY",
+    "OFFICE RENT",
+    "GST REFUND",
+    "TERM DEPOSIT INT",
+    "ELECTRICITY BOARD",
+    "COURIER SERVICES",
+)
+
+#: Templates for the three strata. ``{tail}`` is a 4-digit reference; ``gateway_plausible``
+#: takes none, which is what makes its parsed ``ref_tail`` ``None``.
+NOISE_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "plainly_foreign": (
+        "{channel}-{counterparty}-XXXX{tail}",
+        "{channel} CR/{counterparty}/{tail}",
+        "{channel}/{counterparty}/REF{tail}",
+    ),
+    # No digit run anywhere: ``normalize.parse`` reads the last run as the tail, so a masked
+    # reference is how a row carries the gateway's name while offering nothing to join on.
+    "gateway_plausible": (
+        "{channel}-{counterparty}-XXXX",
+        "{channel} CR/{counterparty}/REF",
+        "{channel}/{counterparty}/SETTLEMENT",
+    ),
+    "look_alike": (
+        "{channel}-{counterparty}-XXXX{tail}",
+        "{channel} CR/{counterparty}/{tail}",
+        "{channel}/{counterparty}/XXXX{tail}/SETTLEMENT",
+    ),
+}
+
 DEFAULT_N = 60
 DEFAULT_N_BATCHED = 200
 
@@ -258,9 +371,26 @@ class MessFlags:
     #: derivable from any rate**: it is declared in ``refunds.csv`` and has to be *looked up*
     #: through the payment it cites. ``settlements.csv`` gains no column for it, because I9
     #: freezes that header.
+    #: Phase 7 step 1 added ``unsettled``: ``story._draw_unsettled`` picks the payments that no
+    #: settlement will claim and ``build`` removes them from ``groups`` before any settlement is
+    #: derived, so a group that loses its only member never becomes a settlement at all. Added
+    #: *after* that code existed, per the paragraph above. The two Phase 7 flags are declared in
+    #: separate steps so a regression in one cannot be attributed to the other.
+    #: Phase 7 step 4 added ``noise_rows``: ``story._draw_noise_rows`` draws bank rows that are
+    #: not gateway money across three declared strata, and ``build`` merges them into the
+    #: credits' sort so both kinds are numbered from one counter. Added *after* that code
+    #: existed, per the paragraph above.
+    #:
+    #: **Declared in step 4 rather than step 8, which is where `.plan/phase7.md` put it.** The
+    #: plan's ordering was unsafe for a reason the plan could not see: this refusal is what makes
+    #: ``--noise-rows`` unusable from the *command line* while the flag is undeclared, so every
+    #: in-process probe has to patch this ClassVar to build a noisy story. Step 7's gate 14
+    #: invokes the generator as a **subprocess** and can patch nothing, so the declaration has to
+    #: precede it regardless -- and the rule step 1 already recorded is the same one: a flag
+    #: enters this set in the step that lands its generator code. Step 4 landed it.
     IMPLEMENTED: ClassVar[frozenset[str]] = frozenset(
         {"settlement_delay", "fees", "dup_amounts", "batching", "settlement_report_late",
-         "tds", "netted_refunds", "reserve"}
+         "tds", "netted_refunds", "reserve", "unsettled", "noise_rows"}
     )
 
     @classmethod
@@ -696,12 +826,14 @@ if __name__ == "__main__":
     # off ``unimplemented()`` rather than a hand-written list is what makes it inverting
     # automatically instead of going stale.
     assert MessFlags().declared_but_inert() == []
-    # Phase 6 step 6 landed ``netted_refunds``, so the inert probe moved to a Phase 7 flag.
-    # Moved rather than deleted, for the reason the seam probe below carries: the moment this
-    # names a flag that *is* implemented, it asserts nothing.
-    assert MessFlags(noise_rows=True).declared_but_inert() == ["noise_rows"]
+    # Phase 6 step 6 landed ``netted_refunds``, so the inert probe moved to a Phase 7 flag; Phase
+    # 7 step 4 landed *that* one (``noise_rows``), so it moves again -- now to ``fx``, which
+    # Phase 8 will land. Moved rather than deleted, for the reason the seam probe below carries:
+    # the moment this names a flag that *is* implemented, it asserts nothing at all.
+    assert MessFlags(fx=True).declared_but_inert() == ["fx"]
     for _landed in ("settlement_delay", "fees", "dup_amounts", "batching",
-                    "settlement_report_late", "tds", "netted_refunds", "reserve"):
+                    "settlement_report_late", "tds", "netted_refunds", "reserve",
+                    "unsettled", "noise_rows"):
         assert _landed not in MessFlags.unimplemented()
         assert MessFlags(**{_landed: True}).declared_but_inert() == [], (
             f"{_landed} is implemented, so it must not be reported inert"
@@ -794,20 +926,21 @@ if __name__ == "__main__":
 
     # The IMPLEMENTED seam still works for a flag no phase has landed yet. This probe was
     # written against ``batching``; Phase 5 landed it, so the probe moved to
-    # ``netted_refunds`` (Phase 6) rather than being deleted -- the seam has to keep working
-    # for as long as *any* flag is still declared and inert, and the moment it tests a landed
-    # flag it tests nothing. Move it again, do not delete it, when Phase 6 lands.
+    # ``netted_refunds`` (Phase 6), then to ``noise_rows``, and Phase 7 step 4 landed that one
+    # -- so it now names ``fx``. Never deleted: the seam has to keep working for as long as
+    # *any* flag is still declared and inert, and the moment it tests a landed flag it tests
+    # nothing. Move it again when Phase 8 lands ``fx``; ``rounding_edge`` and ``utr_patchy``
+    # are the two left after that.
     _original = MessFlags.IMPLEMENTED
     try:
-        MessFlags.IMPLEMENTED = _original | {"noise_rows"}
-        assert MessFlags(noise_rows=True).declared_but_inert() == []
-        assert GenConfig(flags=MessFlags(noise_rows=True)).resolved()["flags_enabled"] == [
-            "noise_rows"
-        ]
+        MessFlags.IMPLEMENTED = _original | {"fx"}
+        assert MessFlags(fx=True).declared_but_inert() == []
+        assert GenConfig(flags=MessFlags(fx=True)).resolved()["flags_enabled"] == ["fx"]
     finally:
         MessFlags.IMPLEMENTED = _original
     assert MessFlags.IMPLEMENTED == _original, "the probe must not leak"
-    assert "noise_rows" in MessFlags.unimplemented(), "noise_rows lands in Phase 7"
+    assert "fx" in MessFlags.unimplemented(), "fx lands in Phase 8"
+    assert "noise_rows" in MessFlags.IMPLEMENTED, "Phase 7 step 4 implements noise_rows"
     assert "netted_refunds" in MessFlags.IMPLEMENTED, "Phase 6 step 6 implements netted_refunds"
     assert "batching" in MessFlags.IMPLEMENTED, "Phase 5 step 1 implements batching"
     assert MessFlags.unimplemented(), (

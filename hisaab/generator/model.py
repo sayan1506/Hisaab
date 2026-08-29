@@ -279,6 +279,57 @@ class Credit:
 
 
 @dataclass(frozen=True, slots=True)
+class NoiseRow:
+    """A bank row that is **not gateway money at all** (``--noise-rows``, Phase 7).
+
+    Deliberately **not** a ``Credit`` with empty provenance, and the reason is that two
+    existing checks would have to be weakened to allow that:
+
+      * ``Credit.__post_init__`` asserts ``settlement_ids`` is non-empty -- "a gateway credit
+        needs settlements". A noise row has none, by definition. Relaxing that assertion would
+        retire the check that catches a genuine credit losing its provenance.
+      * I8b reads ``c.payment_ids[0]`` on every credit in ``story.credits`` to test that
+        within-day row position carries no information. A member with no payments would either
+        crash it or have to be filtered out of it -- and a check with a filter for the rows
+        that cannot satisfy it is a check that has quietly stopped covering them.
+
+    So a noise row is its own type, ``story.credits`` stays gateway-only, and every invariant
+    written against it keeps its exact meaning. What the two share is the **CSV shape**: four
+    fields, indistinguishable on disk from a real credit, which is the entire point.
+
+    ``stratum`` is answer-key data (it names *why* this row is hard) and reaches
+    ``run_manifest.json`` only -- never a CSV column, and not ``truth.json``'s scored section
+    either. ``truth.json`` publishes the row **ids** under ``orphans.non_gateway_credit_ids``,
+    which is what the scorer keys on.
+    """
+
+    row_id: str
+    value_date: date
+    amount_paise: int
+    narration: str
+    #: Which of ``config.NOISE_STRATA_SPLIT``'s three shapes this row was drawn as.
+    stratum: str
+
+    def __post_init__(self) -> None:
+        paise(self.amount_paise)
+        assert self.amount_paise > 0, f"{self.row_id}: a bank credit must be positive"
+        assert self.narration, f"{self.row_id}: narration must not be empty"
+
+    @staticmethod
+    def csv_header() -> tuple[str, ...]:
+        return BANK_HEADER
+
+    def csv_row(self) -> tuple[str, ...]:
+        """Four fields, the same shape a ``Credit`` emits. Do not extend this method."""
+        return (
+            self.row_id,
+            self.value_date.isoformat(),
+            str(self.amount_paise),
+            self.narration,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Story:
     """One complete generated month, before it is split into impoverished views.
 
@@ -292,7 +343,12 @@ class Story:
     refunds: list[Refund] = field(default_factory=list)
     unsettled_payment_ids: list[str] = field(default_factory=list)
     settlements_without_credit: list[str] = field(default_factory=list)
-    non_gateway_credit_ids: list[str] = field(default_factory=list)
+
+    #: Bank rows that are not gateway money (``--noise-rows``). Held as **rows**, not as a list
+    #: of ids: ``non_gateway_credit_ids`` below is derived from them, so the answer key's id
+    #: list cannot drift from the rows it names. ``credits`` stays gateway-only -- see
+    #: ``NoiseRow`` for the two invariants that depend on that separation.
+    noise_rows: list[NoiseRow] = field(default_factory=list)
 
     #: Settlements whose rows ``emit`` omits from ``settlement_items.csv``
     #: (``--settlement-report-late``). **The membership itself is not removed** -- every
@@ -301,6 +357,18 @@ class Story:
     #: to search for a payment set instead of reading it off the settlement report. Keeping
     #: the two apart is why every in-memory invariant still runs unchanged under the flag.
     membership_withheld: list[str] = field(default_factory=list)
+
+    @property
+    def non_gateway_credit_ids(self) -> list[str]:
+        """The ids of the noise rows, in bank-file order.
+
+        **Derived, not stored.** It was a field until Phase 7 step 4 and became a property the
+        moment real rows existed: a stored copy is a second place for the same fact, and the
+        failure it invites is the answer key naming a row the statement does not carry (or
+        missing one it does). The scorer keys ``noise_recall`` on exactly this list, so a drift
+        here would mis-grade silently rather than crash.
+        """
+        return [r.row_id for r in self.noise_rows]
 
     def counts(self) -> dict[str, int]:
         return {

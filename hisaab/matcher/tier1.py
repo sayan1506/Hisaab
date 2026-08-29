@@ -115,6 +115,37 @@ RESERVE_PROBE_BPS = 2_600
 #: is the fee's own rounding divergence, a couple of paise on a batch, which is orders of
 #: magnitude below 100 bps of a net. A diagnostic that fired on a few paise would relabel every
 #: rounding bug as a business explanation, which is worse than declining to explain it.
+#:
+#: **Phase 7 step 6 re-measured this against a population it was not set against.** The band was
+#: chosen when every bank row was a gateway credit; ``--noise-rows`` puts rows on the file that
+#: are not gateway money at all, and a threshold left unexamined after its population changed is
+#: the stale-population defect this phase found twice elsewhere. Measured both directions at
+#: n=1000 seed 42 (``.plan/probe_phase7_band.py``, gitignored -- the numbers are here because
+#: the probe is not): **the band has no setting that trades favourably, so it does not move.**
+#:
+#: The ceiling is inert, and provably so rather than incidentally. The probe admits a settlement
+#: only within ``RESERVE_PROBE_BPS`` of the *credit*, so ``net <= 1.26 x credit`` and the
+#: shortfall share ``(net - credit) / net`` cannot exceed ``0.26 / 1.26`` = 2,063 bps. Every
+#: ceiling from 2,063 to 5,000 measured identically (80/80 reserves, 17 noise). The ceiling
+#: therefore filters nothing today; it states the intent, and the self-check below asserts the
+#: relationship so that raising the probe cannot silently make it binding.
+#:
+#: The floor is where a trade exists and it is a losing one. At 1,000 bps the band gives up
+#: **10 of 80** credits truth records as reserved to remove **5 of 17** misdiagnosed noise rows,
+#: and the lost ten fall to ``NO_CANDIDATE`` -- trading gate 13's characterised abstention back
+#: into the undifferentiated pile Phase 7 exists to break up. 500 bps is the only free move
+#: measured and it is worth one row of 17, which is not a reason to replace a principled
+#: boundary with a seed-fitted one: the lowest genuine reserve sits between 500 and 1,000 bps,
+#: so a floor tuned to today's draw silently costs true positives the moment the reserve range
+#: or the seed changes. That is the same fitting-to-the-gap the reserve design refuses outright.
+#:
+#: What remains is a real limit, not a tuning failure: **8/18 ``gateway_plausible`` and 9/18
+#: ``look_alike`` rows are diagnosed as pending reserves.** Both strata carry a gateway
+#: counterparty by construction, so step 5's gate cannot set them aside, and a noise row drawn
+#: in the gateway amount band genuinely does fall a plausible-reserve share short of some
+#: settlement's net. The geometry is identical to a real reserve and no width of this band
+#: separates them; they score ``NOISE_MISHANDLED`` and are reported as such. All 24
+#: ``plainly_foreign`` rows are ignored before reaching here.
 RESERVE_PLAUSIBLE_BPS: tuple[int, int] = (100, 3_000)
 
 # The calendar the window is measured on. Weekends and holidays are not settlement days, so
@@ -210,8 +241,10 @@ def _tier2_pool(settled_on: date, dataset: Dataset) -> list[Payment]:
 
     What it *does* affect is pool size, and therefore how often the cap binds -- so coverage
     depends on the withholding share, which is a dependency worth stating rather than hiding.
-    Measured at n=1000: pool max 57-62 at a 30% share against a cap of 64, rising to 157-168
-    at 100%, where the cap refuses ~95% of rows. The Phase 5 default share is 30%.
+    Measured at n=1000: pool max 57-62 at a 30% share, rising to 157-168 at 100%, where the
+    cap refuses ~95% of rows (that share was measured against the cap of 64 that stood before
+    Phase 7 raised it to 80; the pool maxima are properties of the data and did not move). The
+    Phase 5 default share is 30%.
 
     Deliberately **not** excluding payments that an earlier Tier 2 search in this same run
     already claimed. It would raise coverage, and it would make the answer depend on the order
@@ -460,6 +493,73 @@ def resolve_credit(
     # inputs without knowing the lag, so the pool falls through to the abstention below.
 
     if not candidates:
+        # **Phase 7 step 5, and it runs before the reserve probe on purpose.** The exact join
+        # found nothing, and there are two very different reasons that happens: the credit is
+        # gateway money whose settlement this matcher cannot pin down, or it is **not gateway
+        # money at all** -- a vendor payment, a salary run, an interest credit, sitting in the
+        # same bank statement because a real statement is not filtered for us. Deciding which
+        # comes first, because every diagnosis below assumes the row is ours.
+        #
+        # Ordering is the entire fix (`.plan/phase7.md` decision 4). Left after the reserve
+        # probe, a non-gateway row that happens to sit a plausible percentage below some
+        # settlement's net gets diagnosed as a partially-paid gateway settlement -- a confident
+        # wrong answer about a row that was never ours. Measured on real generated noise before
+        # this gate existed (`.plan/probe_phase7_gate_baseline.py`, seed 42, n=1000): **16 of 24
+        # plainly-foreign rows collected ``PARTIAL_SETTLEMENT_PENDING``**, and 17 of 24 under
+        # ``--fees --settlement-delay``. The mechanism, not the exact count, is the finding --
+        # the plan's own 72.5% came from synthetic rows drawn by a probe's RNG, and a number that
+        # moves with the probe's seed is a property of the probe.
+        #
+        # **Positive evidence, and both tests must fail before a row is ignored:**
+        #
+        #   * the narration's 4-digit tail hits some settlement's UTR, **or**
+        #   * the narration carries a gateway counterparty spelling.
+        #
+        # Requiring *both* to fail is what keeps ``WRONG_IGNORE`` at zero, and it is written
+        # this way now for Phase 8's benefit rather than this phase's. ``--utr-patchy`` strips
+        # UTRs from **gateway** credits, so a rule where "no resolvable tail" alone sufficed
+        # would convert this phase's ``noise_recall`` into next phase's ``WRONG_IGNORE`` --
+        # real money dropped out of the books instead of merely left unexplained. The two are
+        # not comparable failures: an abstention costs a human a look, and this is the one
+        # verdict in the file that can lose a credit silently.
+        #
+        # The honest consequence, stated because it looks like a shortfall from outside: the
+        # generator's ``gateway_plausible`` and ``look_alike`` strata both carry a gateway
+        # counterparty *by construction*, so **neither can ever be ignored here** and both fall
+        # through to the diagnosis below as ``NOISE_MISHANDLED``. That is the rule working, not
+        # failing. ``noise_recall`` is therefore expected near the plainly-foreign share, and a
+        # recall of 100% would be evidence the strata are too easy rather than a win.
+        #
+        # Nothing here reads truth, and nothing here reads an amount. The gate asks only what
+        # the narration says and whether any settlement claims that tail -- which is the same
+        # information a human doing this by hand would use, and the reason a bank statement's
+        # narration column is worth parsing at all.
+        tail_hits_a_settlement = (
+            narration.ref_tail is not None and narration.ref_tail in index.utr_tails
+        )
+        if not tail_hits_a_settlement and not narration.is_gateway_counterparty:
+            return Verdict(
+                credit.credit_id,
+                Outcome.IGNORED,
+                reason=Reason.NON_GATEWAY_CREDIT,
+                credit_amount_paise=credit.amount_paise,
+                note=(
+                    f"no settlement pays {credit.amount_paise}p within {window_days}bd of "
+                    f"{credit.value_date.isoformat()}, and this row offers no evidence of "
+                    f"being gateway money: its narration names no gateway counterparty"
+                    + (
+                        f" and its reference {narration.ref_tail} matches no settlement's UTR"
+                        if narration.ref_tail is not None
+                        else " and carries no reference this matcher can read"
+                    )
+                    + f". Read as income from another source -- {narration.raw!r} -- so it is "
+                    f"out of scope for this reconciliation rather than an unexplained "
+                    f"gateway credit. Both evidence tests have to fail before a row is set "
+                    f"aside: a gateway credit whose UTR is merely unreadable still names the "
+                    f"counterparty, and dropping one would lose real money from the books"
+                ),
+            )
+
         # Phase 6 step 7: **the exact join found nothing, so before reporting "nothing
         # matches" this asks the one further question the data can answer** -- is there a
         # settlement this credit is *short of* by a plausible reserve?
@@ -1350,6 +1450,134 @@ if __name__ == "__main__":
     assert RESERVE_PROBE_BPS >= 2_500, (
         "the probe band no longer covers a 20% reserve, so the reserved rows this matcher is "
         "built to recognise would come back as NO_CANDIDATE"
+    )
+
+    # --- Phase 7 step 5: the IGNORED gate, and the four ways it must not misfire ------
+    # First use of ``Outcome.IGNORED`` in the project. Every fixture below pairs the case with
+    # the control that could make it pass for the wrong reason -- a gate that never fires and a
+    # gate that always fires both satisfy a one-sided test.
+    foreign = "NEFT-ACME SUPPLIES LTD-XXXX9999"
+
+    # (1) Both evidence tests fail, and no settlement is even close: IGNORED, and the verdict
+    # claims nothing at all.
+    noise_ds = dataset(
+        [payment("pay_0001", 85358)],
+        [settlement("setl_0005", mon, 85358, "8104")],
+        [credit("C0001", mon, 12_345, foreign)],
+        {"setl_0005": ("pay_0001",)},
+    )
+    v = verdict_of(noise_ds, "C0001")
+    assert v.outcome is Outcome.IGNORED, v.outcome
+    assert v.reason is Reason.NON_GATEWAY_CREDIT, v.reason
+    assert not v.outcome.is_committal, "IGNORED must not be scored as an asserted answer"
+    assert v.payment_ids == () and v.settlement_ids == (), (
+        "a row set aside as out of scope names nothing -- it is not a match"
+    )
+    assert v.tier is None and v.residual_paise is None and v.decomposition is None
+    assert v.credit_amount_paise == 12_345, (
+        "the amount is a bank column, not a claim, and an out-of-scope row is more useful "
+        "quoting the figure it declined to explain"
+    )
+    assert "ACME SUPPLIES LTD" in (v.note or ""), (
+        f"the note must quote the narration it read, so the decision is reviewable: {v.note}"
+    )
+
+    # (2) **The assertion this step exists for.** The same foreign row, positioned so the
+    # reserve probe *would* have diagnosed it: 10% below a real settlement's net, which is
+    # squarely inside RESERVE_PLAUSIBLE_BPS. Before the gate this returned
+    # PARTIAL_SETTLEMENT_PENDING -- a confident wrong answer about a row that was never ours,
+    # measured at 16 of 24 plainly-foreign rows on real data.
+    tempting = dataset(
+        [payment("pay_0001", 100_000)],
+        [settlement("setl_0005", mon, 100_000, "8104")],
+        [credit("C0001", mon, 90_000, foreign)],
+        {"setl_0005": ("pay_0001",)},
+    )
+    v = verdict_of(tempting, "C0001")
+    assert v.outcome is Outcome.IGNORED and v.reason is Reason.NON_GATEWAY_CREDIT, (
+        f"a non-gateway row sitting a plausible reserve below a settlement must be set aside, "
+        f"not diagnosed as a partially-paid gateway settlement: {v.reason}"
+    )
+    # ...and the control, without which the fixture above proves nothing: the *identical*
+    # geometry with a gateway narration must still reach the probe. If this were also IGNORED,
+    # the gate would be swallowing reserved rows and gate 13 would fail at n=1000.
+    assert verdict_of(
+        dataset(
+            [payment("pay_0001", 100_000)],
+            [settlement("setl_0005", mon, 100_000, "8104")],
+            [credit("C0001", mon, 90_000, "NEFT-RAZORPAYSOFT-XXXX9999")],
+            {"setl_0005": ("pay_0001",)},
+        ),
+        "C0001",
+    ).reason is Reason.PARTIAL_SETTLEMENT_PENDING, (
+        "the gate is eating reserved gateway rows -- the probe never fires, so the fixture "
+        "above passes for the wrong reason"
+    )
+
+    # (3) **Either test passing is enough to keep a row in scope.** Both halves are asserted,
+    # because "both must fail" and "either must fail" differ on exactly these two rows -- and
+    # the second is the one Phase 8 turns into a live case.
+    #
+    # (3a) No gateway counterparty, but the reference hits a real settlement's UTR.
+    assert verdict_of(
+        dataset(
+            [payment("pay_0001", 100_000)],
+            [settlement("setl_0005", mon, 100_000, "8104")],
+            [credit("C0001", mon, 90_000, "NEFT-ACME SUPPLIES LTD-XXXX8104")],
+            {"setl_0005": ("pay_0001",)},
+        ),
+        "C0001",
+    ).reason is Reason.PARTIAL_SETTLEMENT_PENDING, (
+        "a row whose reference matches a settlement's UTR is evidence of gateway money even "
+        "with an unrecognised counterparty, and must not be set aside"
+    )
+    # (3b) A gateway counterparty with **no readable reference at all** -- the masked form.
+    # This is ``--utr-patchy``'s shape (Phase 8) arriving early: a genuine gateway credit whose
+    # UTR is gone still names the counterparty, and ignoring it would drop real money from the
+    # books. A rule where "no resolvable tail" alone sufficed would fail right here.
+    for spelling in ("RAZORPAYSOFT", "RAZORPAY SOFTWARE", "RZRPAY"):
+        masked = dataset(
+            [payment("pay_0001", 100_000)],
+            [settlement("setl_0005", mon, 100_000, "8104")],
+            [credit("C0001", mon, 90_000, f"NEFT-{spelling}-XXXX")],
+            {"setl_0005": ("pay_0001",)},
+        )
+        mv = verdict_of(masked, "C0001")
+        assert mv.outcome is not Outcome.IGNORED, (
+            f"{spelling!r} names the gateway, so a missing UTR alone must never be sufficient "
+            f"to ignore the row -- that is how Phase 7's noise_recall becomes Phase 8's "
+            f"WRONG_IGNORE: {mv.reason}"
+        )
+        assert mv.reason is Reason.PARTIAL_SETTLEMENT_PENDING, mv.reason
+
+    # (4) **The gate sits inside the no-candidate branch, so it never pre-empts a match.** A
+    # row failing both evidence tests that nonetheless has an exact settlement still RESOLVES.
+    #
+    # That ordering is deliberate and it cuts both ways, which is worth stating rather than
+    # discovering: a genuinely non-gateway row landing exactly on some settlement's net inside
+    # the window would be wrong-matched here, and no narration test would save it. The
+    # alternative -- gating before the join -- would ignore a *gateway* credit whose narration
+    # is unreadable even though its settlement matches exactly, and that loses money instead of
+    # merely misattributing a row the generator refuses to create. Measured at 0 occurrences
+    # across seven flag sets at n=1000 (`.plan/probe_phase7_gate_baseline.py`), because noise
+    # amounts are drawn clear of every credit key; it is a coincidence, not a mechanism.
+    exact_ds = dataset(
+        [payment("pay_0001", 85358)],
+        [settlement("setl_0005", mon, 85358, "8104")],
+        [credit("C0001", mon, 85358, foreign)],
+        {"setl_0005": ("pay_0001",)},
+    )
+    ev = verdict_of(exact_ds, "C0001")
+    assert ev.outcome is Outcome.RESOLVED, (
+        f"the gate must not run ahead of the exact join -- a readable settlement match is "
+        f"stronger evidence than any narration test: {ev.outcome}/{ev.reason}"
+    )
+
+    # (5) The gate reads the index's tail set, so that set has to be populated. A guard against
+    # the failure mode where ``utr_tails`` is empty and *every* unmatched row looks foreign.
+    assert SettlementIndex(exact_ds.settlements).utr_tails == {"8104"}, (
+        "the settlement tail set is empty or mis-stripped, which would make the first "
+        "evidence test unfalsifiable and ignore every unmatched gateway credit"
     )
 
     # --- two candidates: ambiguous, and it must not pick one ---------------

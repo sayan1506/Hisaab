@@ -137,12 +137,38 @@ def parse_captured_at(value: str, where: str) -> datetime:
 #: rather than silently never suspending.
 DISK_SUSPENDED_BY: dict[str, tuple[str, ...]] = {
     # Genuinely broken by batching: n payments become ~n/1.6 settlements and that many credits.
-    "I3.one_to_one_to_one":     ("batching", "noise_rows", "unsettled"),
+    # ``noise_rows`` was removed in Phase 7 step 4: like ``unsettled`` before it, it **subtracts**
+    # a set truth names rather than invalidating the equality -- orphans come off the payment
+    # side, noise rows off the bank side. See the check itself.
+    "I3.one_to_one_to_one":     ("batching",),
     "I3.no_refunds":            ("netted_refunds",),
-    # A payment in no settlement is --unsettled's business and nothing else's.
-    "I2.every_payment_settled": ("unsettled",),
-    # A noise row is a bank row with no truth entry, so the two counts diverge.
-    "I6.truth_covers_bank":     ("noise_rows",),
+    # **``unsettled`` was removed from two entries in Phase 7 step 1, and the removals are the
+    # correction rather than an omission.** ``.plan/phase7.md`` correction (d) requires *both*
+    # suspension lists to be re-derived rather than trusted, and this list is the one a reader
+    # misses -- it has a different name from ``invariants.SUSPENDED_BY`` and different keys, and
+    # it is the pass that sees only what a judge sees.
+    #
+    # ``I2.every_payment_settled`` had its own entry here and no longer needs one: truth.json
+    # **names** the payments that never settled, so the check became an equality against that
+    # list instead of standing down (see the I2 block below). ``I3.one_to_one_to_one`` subtracts
+    # the orphan count for the same reason. Both are strictly stronger than a suspension, and
+    # they matter most on exactly the runs the suspension covered: a payment that goes missing
+    # for some *other* reason while ``--unsettled`` is on is still caught.
+    #
+    # What ``--unsettled`` genuinely needs from this file is a new **term**, not a new
+    # suspension: I4's wedge gains the never-settled gross, sourced from the payments truth
+    # names because no settlement or credit cell mentions an orphan at all.
+    # **Emptied in Phase 7 step 4, and the key is kept deliberately** -- ``_disk_suspended``
+    # indexes this dict, so deleting the entry would raise ``KeyError`` at the call site rather
+    # than un-suspend the check. An empty tuple is the honest statement: nothing suspends this.
+    #
+    # The old comment here read "a noise row is a bank row with no truth entry, so the two counts
+    # diverge", and the first clause is simply **false** -- a noise row *is* in truth, named under
+    # ``orphans.non_gateway_credit_ids``. What it lacks is a full ``credits`` entry, which is a
+    # different thing, and the difference is exactly what lets this check be strengthened into an
+    # equality on identities instead of stood down. A prediction that was wrong about the data,
+    # kept visible rather than quietly deleted.
+    "I6.truth_covers_bank":     (),
     # The legitimate signal must resolve the dataset. This list was **corrected by
     # measurement** rather than reasoned, and it was wrong in both directions first time:
     #
@@ -257,6 +283,8 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     refunds_on = flags.get("netted_refunds", False)
     reserve_on = flags.get("reserve", False)
     late_on = flags.get("settlement_report_late", False)
+    unsettled_on = flags.get("unsettled", False)
+    noise_on = flags.get("noise_rows", False)
     #: settlement -> payments, as the *answer key* declares it. Used only to stand in for the
     #: rows ``--settlement-report-late`` withholds from settlement_items.csv, so that the
     #: partition and per-settlement arithmetic checks keep running at full coverage instead of
@@ -293,6 +321,48 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     # net and the credit rather than between the gross and the net. That is design B, and
     # adding it there would assert the settlement declared a smaller payout than it did.
     reserve_cells = [c.decomposition.reserve_paise for c in truth.credits]
+    # Phase 7 step 1, and the sourcing is one step further out again. A refund has
+    # ``refunds.csv`` and a reserve has truth's decomposition; a never-settled payment has
+    # **no cell anywhere** -- no settlement claims it and no credit mentions it, which is what
+    # being an orphan means. So the term is the gross of the payments truth *names* as
+    # unsettled, read against ``payments.csv``'s own amounts.
+    #
+    # A name truth carries that ``payments.csv`` does not is a defect rather than a term, and
+    # it is refused here instead of raising ``KeyError`` from the comprehension: I13 pins the
+    # payment count unconditionally, so an orphan missing from the file means the answer key
+    # and the data disagree about which payments exist.
+    unknown_orphans = sorted(set(truth.unsettled_payment_ids) - set(gross_by_payment))
+    if unknown_orphans:
+        raise InvariantError(
+            f"I4: truth names {len(unknown_orphans)} unsettled payment(s) that are not in "
+            f"payments.csv: {unknown_orphans[:5]} -- the answer key and the data disagree "
+            f"about which payments exist, so no gross total means what it claims"
+        )
+    unsettled_cells = [gross_by_payment[pid] for pid in truth.unsettled_payment_ids]
+
+    # Phase 7 step 4, and the sourcing is the mirror image of the orphan term above. An orphan
+    # is a payment **no** bank row mentions; a noise row is a bank row **no** settlement
+    # mentions. So this term is read from ``bank_statement.csv``'s own amounts, keyed on the ids
+    # truth names as non-gateway -- the same "read the file, keyed by the answer key" shape.
+    #
+    # **This term is why ``--noise-rows`` needed no suspension on this side**, and it was found
+    # by measurement rather than predicted: forcing the two ``noise_rows`` entries in
+    # ``DISK_SUSPENDED_BY`` to run (`.plan/probe_phase7_noise_suspensions.py`) failed on **I4**
+    # rather than on either of those checks -- I4 runs first and aborts the pass, so the noise
+    # total showed up as "settled and credited disagree" by exactly the noise sum. A suspension
+    # of the two cardinality checks would not have fixed that and would have hidden it.
+    #
+    # A truth-named noise id absent from the bank file is a defect rather than a term, refused
+    # here for the same reason ``unknown_orphans`` is: it would otherwise raise ``KeyError`` from
+    # the comprehension, from a line that names neither the answer key nor the file.
+    unknown_noise = sorted(set(truth.non_gateway_credit_ids) - set(amount_by_credit))
+    if unknown_noise:
+        raise InvariantError(
+            f"I4: truth names {len(unknown_noise)} non-gateway row(s) that are not in "
+            f"bank_statement.csv: {unknown_noise[:5]} -- the answer key names a bank row the "
+            f"statement does not carry, so no credited total means what it claims"
+        )
+    noise_cells = [amount_by_credit[cid] for cid in truth.non_gateway_credit_ids]
     check_totals(
         sum(gross_by_payment.values()),
         sum(net_by_settlement.values()),
@@ -301,19 +371,36 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
         tds_cells,
         refund_cells,
         reserve_cells,
+        unsettled_cells,
+        noise_cells=noise_cells,
         fees_on=fees_on,
         tds_on=tds_on,
         refunds_on=refunds_on,
         reserve_on=reserve_on,
+        unsettled_on=unsettled_on,
+        noise_on=noise_on,
     )
 
     # --- I3: cardinality, per flag rather than per clean_mode ----------------
     if on := _disk_suspended(flags, "I3.one_to_one_to_one"):
         skipped["I3.one_to_one_to_one"] = on
-    elif not (len(payments) == len(settlements) == len(bank)):
+    # ``--unsettled`` subtracts rather than suspending, matching the in-memory ``I3.cardinality``
+    # (Phase 7 step 1): every payment is still in the file and each orphan removes exactly the
+    # one-member settlement it was in, so the settlement and bank counts fall by the orphan count
+    # and nothing else. At zero orphans this is the old three-way equality unchanged.
+    # ``--noise-rows`` subtracts on the **bank** side, the way ``--unsettled`` subtracts on the
+    # payments side, and for the same reason: truth names the rows, so the check can account for
+    # them instead of standing down. Phase 7 step 4 removed its suspension here.
+    elif not (
+        len(payments) - len(truth.unsettled_payment_ids)
+        == len(settlements)
+        == len(bank) - len(truth.non_gateway_credit_ids)
+    ):
         raise InvariantError(
-            f"I3: 1:1:1 must hold while every flag that changes cardinality is off, got "
-            f"{len(payments)}/{len(settlements)}/{len(bank)}"
+            f"I3: 1:1:1 must hold while every flag that changes cardinality is off -- "
+            f"allowing for {len(truth.unsettled_payment_ids)} payment(s) truth names as never "
+            f"settled and {len(truth.non_gateway_credit_ids)} bank row(s) truth names as "
+            f"non-gateway -- got {len(payments)}/{len(settlements)}/{len(bank)}"
         )
     if on := _disk_suspended(flags, "I3.no_refunds"):
         skipped["I3.no_refunds"] = on
@@ -340,25 +427,78 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
     # so a batching loop that dropped a payment from a member list passed this pass entirely.
     # Only ``--unsettled`` legitimately breaks it: batching regroups payments, it never loses
     # one, and the partition claim is what makes every per-settlement gross sum meaningful.
-    if on := _disk_suspended(flags, "I2.every_payment_settled"):
-        skipped["I2.every_payment_settled"] = on
-    else:
-        # ``--settlement-report-late`` withholds some settlements' rows, so the *disk* file is
-        # deliberately not a partition. The partition claim does not weaken -- it moves to
-        # truth.json, which still declares every member. Sourcing it from there keeps this
-        # check at full coverage instead of standing it down, which is the difference between
-        # a relaxation with a successor and a hole.
-        cited = set(counts) | (truth_members_all if late_on else set())
-        missing = sorted(set(gross_by_payment) - cited)
-        if missing:
-            where = (
-                "settlement_items.csv (plus truth.json for the withheld settlements)"
-                if late_on else "settlement_items.csv"
-            )
+    # **Runs unconditionally as of Phase 7 step 1, having lost its ``unsettled`` suspension.**
+    # Correction (d) of `.plan/phase7.md` requires both suspension lists to be re-derived, and
+    # this is the entry that changes here: truth.json *names* the payments that never settled,
+    # so the check becomes "the payments in no settlement are exactly the ones truth names"
+    # rather than standing down. That is strictly stronger than the old form plus a suspension,
+    # and it matters most on precisely the runs the suspension covered -- a batching loop or an
+    # orphan draw that loses a payment truth did **not** name is still caught here.
+    #
+    # ``--settlement-report-late`` withholds some settlements' rows, so the *disk* file is
+    # deliberately not a partition. The partition claim does not weaken -- it moves to
+    # truth.json, which still declares every member. Sourcing it from there keeps this
+    # check at full coverage instead of standing it down, which is the difference between
+    # a relaxation with a successor and a hole.
+    cited = set(counts) | (truth_members_all if late_on else set())
+    missing = sorted(set(gross_by_payment) - cited)
+    orphans = sorted(truth.unsettled_payment_ids)
+    if missing != orphans:
+        where = (
+            "settlement_items.csv (plus truth.json for the withheld settlements)"
+            if late_on else "settlement_items.csv"
+        )
+        unexpected = sorted(set(missing) - set(orphans))
+        claimed_but_settled = sorted(set(orphans) - set(missing))
+        raise InvariantError(
+            f"I2: the payments in no settlement are not the ones truth names as unsettled. "
+            f"{len(missing)} in no settlement ({missing[:5]}) against {len(orphans)} named "
+            f"in truth ({orphans[:5]}); unsettled but unclaimed by truth: "
+            f"{unexpected[:5]}; named by truth but settled anyway: "
+            f"{claimed_but_settled[:5]} -- {where} plus truth's orphan list must partition "
+            f"payments.csv, or no gross sum over a settlement means what it claims"
+        )
+
+    # --- I17: an orphan is indistinguishable *on disk*, not just in memory ---
+    # `.plan/phase7.md` decision 3, re-checked after the round trip. ``check_orphans`` asserts
+    # this on the in-memory story, where the CSV writer cannot yet have touched it; this pass
+    # reads the file a matcher reads, which is the copy that would actually leak. **The columns
+    # were already parsed here and never consulted** -- ``read_csv`` builds every row against the
+    # frozen header -- so the gap was one dict lookup wide, in the assertion the whole flag's
+    # honesty rests on. Same reasoning as I5 re-validating int money after the write: this file
+    # exists because in-memory agreement is not evidence about the artefact.
+    #
+    # Compared against the settled population rather than a hard-coded ``"captured"``/``"INR"``,
+    # matching the in-memory version: the claim is indistinguishability, so it must keep holding
+    # when ``--fx`` legitimately starts moving ``currency``.
+    #
+    # Measured in `.plan/probe_phase7_i17d.py`, which mutates a written dataset one cell at a
+    # time. Both leaks fire here; the third case is the one that had to be run: a **settled**
+    # payment given a distinct status *passes*. The subset direction is deliberate -- what
+    # identifies an orphan is a value only orphans carry, so widening the settled set is not a
+    # leak, and a check that fired on it would be a column-uniformity assertion wearing I17's
+    # name and would fail the day ``--fx`` mixes currencies legitimately.
+    #
+    # One interaction a later phase should expect: if ``--fx`` ever gives a non-INR currency to
+    # *only* orphans, this fires -- and correctly, because in that dataset the currency column
+    # really does identify the payments that never settled. It is a constraint on how the two
+    # flags may be drawn together, not a defect in this check.
+    #
+    # Vacuous when nothing is orphaned, which is correct rather than lazy: with an empty orphan
+    # list there is no leak to find, and a run naming orphans while ``--unsettled`` is off is
+    # already refused by I4's cell-zero gate on ``unsettled_cells``.
+    orphan_set = set(orphans)
+    for column in ("status", "currency"):
+        orphan_values = {r[column] for r in payments if r["payment_id"] in orphan_set}
+        settled_values = {r[column] for r in payments if r["payment_id"] not in orphan_set}
+        leaked = sorted(orphan_values - settled_values)
+        if leaked:
             raise InvariantError(
-                f"I2: {len(missing)} payment(s) are in no settlement: {missing[:5]} -- "
-                f"{where} is not a partition of payments.csv, so no gross sum "
-                f"over a settlement means what it claims"
+                f"I17: on disk, {column} distinguishes a never-settled payment: {leaked} "
+                f"against {sorted(settled_values)} on the settled rows -- decision 3: a value "
+                f"carried by exactly the payments that never settled publishes the answer key "
+                f"in a column, and a matcher filtering on it would score perfect coverage "
+                f"while demonstrating nothing"
             )
 
     # --- I4: the money adds up, per settlement ------------------------------
@@ -434,13 +574,33 @@ def verify(data_dir: Path, truth_dir: Path, verbose: bool = True) -> dict[str, o
                 f"I4: truth expects {c.decomposition.expected_credit_paise} for "
                 f"{c.credit_id} but the bank file says {amount_by_credit[c.credit_id]}"
             )
+    # **Strengthened from a count into an equality on identities, Phase 7 step 4** -- the same
+    # treatment ``--reserve`` got for Strategy D in Phase 6, and preferred to the suspension this
+    # entry used to carry. Every bank row must be accounted for by the answer key as *either*
+    # gateway income or a named non-gateway row, and every credit truth declares must be in the
+    # file. A count equality would let a missing credit and an unnamed noise row cancel out;
+    # identities cannot cancel.
+    #
+    # This is why ``--noise-rows`` needed no suspension on this side: the flag adds rows the
+    # answer key **names**, so the check gains a term rather than losing coverage. Left as a
+    # suspension it would have stood down on every noisy run -- at exactly the moment a bank row
+    # can go missing from truth -- which is the footgun ``DISK_SUSPENDED_BY``'s docstring warns
+    # about and which the orphan terms above already declined.
     if on := _disk_suspended(flags, "I6.truth_covers_bank"):
         skipped["I6.truth_covers_bank"] = on
-    elif len(truth.credits) != len(bank):
-        raise InvariantError(
-            f"I6: truth has {len(truth.credits)} credits, bank file has {len(bank)} rows -- "
-            f"every bank row needs an answer-key entry unless --noise-rows is on"
-        )
+    else:
+        bank_ids = {r["row_id"] for r in bank}
+        accounted = {c.credit_id for c in truth.credits} | set(truth.non_gateway_credit_ids)
+        unexplained = sorted(bank_ids - accounted)
+        missing = sorted(accounted - bank_ids)
+        if unexplained or missing:
+            raise InvariantError(
+                f"I6: the answer key and the bank file disagree about which rows exist -- "
+                f"{len(unexplained)} bank row(s) have no truth entry and are not named "
+                f"non-gateway ({unexplained[:5]}), and {len(missing)} row(s) truth accounts "
+                f"for are absent from the file ({missing[:5]}). Every bank row needs an "
+                f"answer-key entry: a credit, or a named non-gateway row."
+            )
 
     # --- Section 2: the leak audit (the honest gate 4) ---------------------
     audit = leak_audit(payments, settlements, bank, items, truth)
@@ -513,6 +673,28 @@ def leak_audit(
     if not n:
         return {}
 
+    #: Phase 7 step 4. Rows that are not gateway money at all (``--noise-rows``), named by truth.
+    #:
+    #: **Every threshold below is against ``gateway_n``, not ``n``, and that is a correction
+    #: rather than a refinement.** A noise row has no ``credits`` entry, so ``truth_pid`` and
+    #: ``truth_sid`` both return ``None`` for it and *no* strategy can ever score it. Left
+    #: comparing against ``n``, the three structural refusals -- "position must not resolve the
+    #: dataset", "numbering must not resolve the dataset" -- become **unreachable** the moment a
+    #: single noise row exists: ``zip_hits == n`` cannot hold when some rows are unscoreable, so
+    #: the assertions stand down invisibly on every noisy run. That is the footgun this file's
+    #: own docstring warns about, and it was not in either suspension list because it is not a
+    #: suspension -- it is a denominator quietly becoming the wrong number.
+    #:
+    #: Found by measurement (`.plan/probe_phase7_noise_suspensions.py`), not by prediction: the
+    #: probe forced the two predicted checks to run and a *third* check failed first.
+    noise_ids = set(truth.non_gateway_credit_ids)  # type: ignore[attr-defined]
+    gateway_n = n - len(noise_ids)
+    if not gateway_n:
+        raise InvariantError(
+            f"I6: all {n} bank rows are named non-gateway -- a run with no gateway income at "
+            f"all has nothing to reconcile, so no resolution strategy means anything"
+        )
+
     # Strategy A -- by row position: payments[i] <-> bank[i].
     pay_order = [r["payment_id"] for r in payments]
     zip_hits = sum(
@@ -543,6 +725,13 @@ def leak_audit(
     #: rows, and asserting *which* ones is what turns a suspension into a strengthening.
     arithmetic_missed: list[str] = []
     for r in bank:
+        # A noise row is not gateway income, so no strategy can resolve it and its failure to
+        # resolve says nothing about the signal. Skipped rather than counted as a miss, because
+        # ``arithmetic_missed`` carries **identities** into the reserved-row equality below --
+        # counted, every noisy run would report the noise rows as unexplained misses and that
+        # equality could never hold again.
+        if r["row_id"] in noise_ids:
+            continue
         candidates = key_of_settlement.get((r["value_date"], r["amount_paise"]), [])
         if len(candidates) == 1 and truth_sid.get(r["row_id"]) == candidates[0]:
             arithmetic_hits += 1
@@ -555,15 +744,25 @@ def leak_audit(
             f"I7: {narration_hits} bank narrations name their own source -- the "
             f"answer was generated into the input"
         )
-    if zip_hits == n:
+    # ``gateway_n`` rather than ``n`` in all three refusals below -- see its definition. An
+    # unscoreable row in the denominator makes an ``== n`` test unsatisfiable, which turns an
+    # anti-cheat assertion into a no-op instead of a failure.
+    if zip_hits == gateway_n:
         raise InvariantError(
             "I8b: row position alone resolves every credit -- a matcher that zips "
             "the files together would score 100% without doing any work"
         )
-    if number_hits == n or setl_number_hits == n:
+    # ``setl_number_hits`` is counted over ``items`` rather than over bank rows, so its
+    # denominator is ``len(items)`` and never ``n``. That was pre-existing looseness this step
+    # had to resolve rather than inherit: comparing it to a bank-row count is right only while
+    # the two happen to be equal (they are not under ``--batching``), and switching it to
+    # ``gateway_n`` would have made a *false* refusal reachable. Fixed to the population the
+    # strategy actually enumerates.
+    if number_hits == gateway_n or (items and setl_number_hits == len(items)):
         raise InvariantError(
             f"I8a: ID numbering alone resolves the dataset "
-            f"(pay->credit {number_hits}/{n}, pay->settlement {setl_number_hits}/{n}) "
+            f"(pay->credit {number_hits}/{gateway_n}, "
+            f"pay->settlement {setl_number_hits}/{len(items)}) "
             f"-- the numbering is the answer key"
         )
     # ... and the legitimate one must resolve it completely, or row 1 of the mess dial is not
@@ -605,19 +804,24 @@ def leak_audit(
                 f"matcher exactly one candidate, the WRONG one, with arithmetic that closes "
                 f"perfectly; see story._separate_reserved_amounts and I16"
             )
-    elif arithmetic_hits != n:
+    elif arithmetic_hits != gateway_n:
         raise InvariantError(
-            f"I3: date+amount resolves only {arithmetic_hits}/{n} credits while every flag "
-            f"that legitimately breaks that join is off -- the mess dial requires 100% here, "
-            f"so the Phase 3 matcher cannot hit its target on this data"
+            f"I3: date+amount resolves only {arithmetic_hits}/{gateway_n} gateway credits "
+            f"while every flag that legitimately breaks that join is off -- the mess dial "
+            f"requires 100% here, so the Phase 3 matcher cannot hit its target on this data"
         )
     return {
         "leak_audit": {
-            "by_row_position": f"{zip_hits}/{n}",
-            "by_id_numbering": f"{number_hits}/{n}",
-            "by_settlement_numbering": f"{setl_number_hits}/{n}",
+            # Denominators match the populations the assertions above test, so a reader
+            # comparing a reported figure against a threshold is comparing like with like.
+            # Identical to the old ``/{n}`` on every run without ``--noise-rows``, since
+            # ``gateway_n == n`` there -- the figures recorded in ``DISK_SUSPENDED_BY``'s
+            # comment block (clean 200/200, batching 120/120) are unchanged.
+            "by_row_position": f"{zip_hits}/{gateway_n}",
+            "by_id_numbering": f"{number_hits}/{gateway_n}",
+            "by_settlement_numbering": f"{setl_number_hits}/{len(items)}",
             "by_narration": f"{narration_hits}/{n}",
-            "by_date_and_amount": f"{arithmetic_hits}/{n}",
+            "by_date_and_amount": f"{arithmetic_hits}/{gateway_n}",
             # Present so a reader can tell "resolves everything" from "was not required to".
             "date_amount_not_required_by": suspended_by,
         }

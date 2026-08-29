@@ -63,9 +63,53 @@ cannot produce a wrong answer: an over-cap pool is refused before the search sta
 an abstention. Measured across caps 32 to 128 at n up to 2000, wrong matches were 0 at every
 one. What the cap buys is that the answer to "what happens at 10,000 records?" is *bounded
 work and a stated refusal* rather than a throughput claim that holds on the seeds someone
-happened to run. At the declared cap the worst case is C(64, 4) = 635,376 subsets; measured
-pool maxima are 20 at n=200 and 63 at n=1000, so the cap costs nothing there, while at n=2000
-it refuses the over-cap rows and keeps the pass at ~0.35s instead of ~20s.
+happened to run. At the declared cap the worst case is C(80, 4) = 1,581,580 subsets; measured
+pool maxima are 20 at n=200 and 63 at n=1000 on the Phase 6 flag set, so the cap costs nothing
+there, while at n=2000 it refuses the over-cap rows and keeps the pass affordable.
+
+**Phase 7 raised the cap 64 -> 80, and the raise was forced -- measured, not projected.**
+``--unsettled`` converts a settled payment into an orphan, and an orphan is a payment that no
+settlement declares -- so ``tier1._tier2_pool``'s partition filter never removes it and it
+sits in every pool whose window covers its capture date. Seed 1 at n=1000 had **one** payment
+of headroom (pool max 63 against a cap of 64), and at the locked 2% share **11 of its withheld
+settlements present a pool above 64**. Under the old bound those eleven rows would have been
+refused with ``MEMBERSHIP_UNDECLARED``, which fails the acceptance suite (see below) -- so the
+raise was a blocker rather than a tuning choice.
+
+Measured envelopes at the locked share, n=1000, seeds 1/2/3/42 (`.plan/probe_phase7_pool_real.py`
+and `.plan/probe_phase7_growth_real.py`): **65 / 59 / 60 / 58**, against 63 / 56 / 58 / 59 with
+the flag off. Growth is +2/+3/+2/**-1** -- seed 42 *shrinks*, because orphaning a settlement's
+only member deletes that settlement outright and can remove the date that held the maximum.
+
+**80 is headroom over the measured 65, and is deliberately not derived from the growth curve.**
+An earlier planning table simulated higher shares by dropping members from
+``settlement_items.csv`` and put the worst case at 78, which is where "the smallest round number
+above 78" came from. Re-measured with the real flag, that simulation is **not a bound in either
+direction**: it over-states some cells (seed 1 at a 15% share is 70 real against 86 simulated)
+and under-states others (seed 3 at 5% is **79** real against 67). Real growth is also
+non-monotonic in the share -- seed 3 runs 60 -> 79 -> 71 -> 63 across 2/5/10/15% -- for the same
+settlement-deletion reason. So no share's figure bounds another's, and the honest statement is
+that 80 clears the worst pool this project actually generates by 15 payments.
+
+**The cap and ``UNSETTLED_SHARE`` are therefore coupled, and the coupling is tight.** A 5% share
+already reaches 79 on seed 3 and a 15% share breaches 80 outright at 84. The share is locked at
+2% by `.plan/phase7.md` decision 3, and raising it means re-measuring this bound rather than
+assuming the curve is smooth.
+
+The price is stated rather than absorbed: the worst-case enumeration goes from C(64, 4) =
+635,376 to C(80, 4) = 1,581,580 subsets, a **2.49x** rise. That is the honest cost of not
+filtering the pool on ``status``, which would be the alternative -- and which would mean
+reading the answer key, since the payments that never settle are exactly the ones the
+generator knows about (`.plan/phase7.md` decision 3).
+
+**Why a breach is a build blocker and not a coverage cost.** Over-cap rows abstain, and an
+abstention normally trades away only coverage. Not this one: ``tier1.py`` returns
+``Reason.MEMBERSHIP_UNDECLARED`` for a refused pool, and that code sits deliberately *outside*
+``acceptance.ABSTENTION_REASONS`` -- "the matcher did not look and could not" is a capability
+gap, not an honest refusal. Gates 10, 12 and 13 permit a coverage shortfall only when every
+unresolved row carries a code from that set, so exceeding this cap **fails the acceptance
+suite**. The bound therefore has to be raised before the flag lands, not after a red gate
+explains it.
 
 **Nothing here reads ``settlement_items.csv``.** That is the file whose absence created the
 problem, and where it *is* present Tier 1 has already used it; a search that peeked would be
@@ -80,8 +124,20 @@ from typing import Sequence
 
 # The largest pool this search will enumerate. Above it, an abstention -- see the module
 # docstring on why a refusal is the honest answer rather than a longer search. The bound it
-# promises is C(MAX_POOL, MAX_SUBSET_SIZE) = 635,376 subsets.
-MAX_POOL = 64
+# promises is C(MAX_POOL, MAX_SUBSET_SIZE) = 1,581,580 subsets.
+#
+# **64 -> 80 in Phase 7, forced by ``--unsettled``** (see the docstring section above). An
+# unsettled payment is claimed by no settlement, so it never leaves the pool; seed 1 at n=1000
+# had one payment of headroom, and at the locked 2% share eleven of its withheld settlements
+# present a pool above 64 -- measured, not projected. A breach is not graceful here: the refusal
+# carries ``MEMBERSHIP_UNDECLARED``, which is outside ``ABSTENTION_REASONS``, so it fails the
+# suite rather than costing coverage.
+#
+# 80 is headroom over a measured worst pool of **65**, not a point on a growth curve: real
+# growth is non-monotonic in the unsettled share, so no share's figure bounds another's. The
+# bound is coupled to ``UNSETTLED_SHARE`` (2%) -- a 5% share reaches 79 and 15% breaches 80 --
+# so moving that share means re-measuring this one. ``ASSUMPTIONS.md`` row 23b carries both.
+MAX_POOL = 80
 
 # The largest subset this search will consider. **Never lower this without re-reading the
 # docstring:** a limit below the true maximum batch size converts abstentions into wrong
@@ -243,8 +299,8 @@ if __name__ == "__main__":
     assert (over.pool_size, over.cap) == (11, 10), over
     # ... and the same pool one under the cap does resolve, so the cap is what refused it.
     assert isinstance(resolve(pool_of(*range(1, 11)), 3, cap=10), TwoOrMore)
-    assert MAX_POOL == 64 and MAX_SUBSET_SIZE == 4
-    assert math.comb(MAX_POOL, MAX_SUBSET_SIZE) == 635_376, "the declared bound moved"
+    assert MAX_POOL == 80 and MAX_SUBSET_SIZE == 4
+    assert math.comb(MAX_POOL, MAX_SUBSET_SIZE) == 1_581_580, "the declared bound moved"
 
     # -- the depth limit, and the wrong match a lower one manufactures --------------------
     # This reproduces setl_0072 (seed 1, n=1000) in miniature: a true four-member batch, and
