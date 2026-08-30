@@ -53,3 +53,13 @@ env/
 # Log files, at any depth -- no log in this project is a source artifact. The
 # measurement harnesses' own output is already covered by .scratch/ above.
 *.log
+
+# Secrets. Nothing in hisaab/ or tools/ reads a key -- Phase 9's smoke probe takes
+# ANTHROPIC_API_KEY from the environment and no file -- but Phase 9 is the phase
+# that first made a key part of the workflow, so the ignore lands with it rather
+# than in the phase that first writes one down. Listed before any .env exists, for
+# the same reason as the caches above: the commit that adds a key path should not
+# also be the commit that has to notice it.
+.env
+.env.*
+*.pem

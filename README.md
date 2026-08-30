@@ -65,7 +65,7 @@ The scorer prints the metric block:
 ```
 Records processed          60 bank rows (60 gateway, 0 non-gateway)
 Run                        seed 42, 2026-08, clean mode, flags: none
-Matcher                    tier1@0.3.0
+Matcher                    tier1+2@0.5.0
 Wall clock                 0.00s, unattended
 
 Coverage                   60/60    (100.0%)   how often it committed
@@ -78,7 +78,10 @@ Missed                     0   resolvable, but it abstained
 
 Exceptions                 0
 Value in exceptions        ₹0.00
-Est. human time to clear   0 min   (vs ~2 h 00 min for the batch by hand)
+Est. human time to clear   0 min   (0 min exceptions + 0 min dismissals)
+Same batch by hand         2 h 00 min   (60 on sight x 2 min + 0 chased x 15 min)
+Time saved                 100.0%   (2 h 00 min less than by hand)
+Break-even chased rate     n/a   (nothing chased, so no rate to cross)
 
 Exception queue                 empty -- every row was resolved or ignored
 ```
@@ -111,6 +114,60 @@ What that number does **not** prove is worth stating in the same breath:
 Line 1 of stdout is the same block as JSON, for a caller that parses rather than reads.
 `--quiet` prints that line alone.
 
+### Then work the exceptions
+
+A match rate tells you how well the matcher did. It does not tell anyone what to do on Monday
+morning. That is the exception queue:
+
+```bash
+python -m hisaab.triage --matches out/matches.json --data data/
+```
+
+It groups what could not be reconciled **by cause**, ranks the groups **by money at risk**,
+prices each one, and gives each a next action and the missing input that would stop it
+recurring:
+
+```
+Exception queue: 14 row(s) in 6 group(s), ₹1,83,178.68 at risk, ~152 min to clear
+
+1. PARTIAL_SETTLEMENT_PENDING  --  ₹1,03,274.66 across 5 row(s), ~25 min (5 min each)
+     C0047        ₹77,334.29
+     C0030        ₹12,610.00
+     C0010        ₹12,519.83
+     C0019           ₹641.26
+     C0005           ₹169.28
+
+   Do: This looks like a settlement with part of it held back, not a mismatch: the
+   shortfall is within the reserve band. Confirm the rolling-reserve release schedule,
+   then match the credit against the settlement net of the held amount.
+   Would stop it recurring: the reserve held and its release date, which no input file
+   states today
+
+2. DISMISSED (not gateway money)  --  ₹33,979.00 across 1 row(s), ~3 min (3 min each)
+     C0023        ₹33,979.00
+   ...
+```
+
+Three things about that output are deliberate:
+
+- **Ranked by money, not by effort.** A queue ordered by minutes puts forty three-minute
+  dismissals above one ₹4-lakh unresolved credit. Value leads; effort breaks ties. Gate 16
+  requires at least one cell in its sweep where the two keys *disagree*, because "ranked by
+  value" is untestable on data where every ordering happens to agree.
+- **Groups come from the codes that occurred**, never from the vocabulary. Thirteen codes are
+  declared; a heading for each would show a person seven empty sections that read as results.
+- **The hints are fixed text, written against the branch that raises each code.** Nothing here
+  is generated. Advice a person acts on should be reviewable in a diff before it is read — and
+  writing them this way caught four hints that misdescribed their own cause, including one
+  that asked for a fuller bank reference when the matcher deliberately does not read it.
+
+**It cannot see the answer key.** `hisaab/triage` reads `matches.json` and `data/` only; it is
+on the same `MATCHER_PACKAGES` allowlist as the matcher, so the static check that keeps the
+matcher off `truth.json` keeps the queue off it too. That is what makes this runnable on a real
+month rather than a demo. It also refuses to build a queue from two different runs' files —
+including the case where both runs have the same row count, so every credit id lines up and
+only the matcher's own stated amounts reveal the mismatch.
+
 ### Compare against a known answer
 
 The matcher is measured against four fixtures whose scores are known before they run — a
@@ -132,7 +189,7 @@ python -m hisaab.generator --seed 42 --n 60   # if you have not already
 python tools/acceptance.py
 ```
 
-Thirteen gates, one command, exit code is the verdict. Byte-identical output at a fixed
+Sixteen gates, one command, exit code is the verdict. Byte-identical output at a fixed
 seed across two processes; invariants on three seeds in memory and again re-read from
 disk; the leak audit; truth isolation; throughput; the assumptions file; the four
 known-answer fixtures; the matcher at 100/100/0 across three seeds × two sizes, including
@@ -140,8 +197,11 @@ the check that blanking every bank narration changes no decision; gate 10, which
 on the first two rows of the difficulty dial and proves the arithmetic per row; gate
 11, which plants pairs that genuinely cannot be resolved and reads the abstention count;
 gate 12, which requires both matcher tiers to carry rows so a Tier 1 regression cannot
-hide behind a Tier 2 success; and gate 13, which turns on all seven implemented flags at
-once.
+hide behind a Tier 2 success; gate 13, which adds three deduction terms and pins the one
+that must never be resolved; gate 14, which adds bank rows that are not gateway credits
+and payments that never pay out; gate 15, the eleven-flag run, with foreign currency and a
+bank statement missing its UTRs; and gate 16, which requires the exception queue to be
+complete, correctly valued, genuinely ranked, and honest about its own ROI claim.
 
 Gate 10 is the one worth reading the source of, because of what it declines to assert. The
 plan called for a flat 100/100/0 under `--fees --settlement-delay`; measurement said the
@@ -289,7 +349,7 @@ genuine ambiguity:
 ```
 Records processed          200 bank rows (200 gateway, 0 non-gateway)
 Run                        seed 3, 2026-08, mess[fees,settlement_delay], flags: fees,settlement_delay
-Matcher                    tier1@0.3.0
+Matcher                    tier1+2@0.5.0
 
 Coverage                   199/200  (99.5%)   how often it committed
 Correctness                199/199  (100.0%)   how often it was right
@@ -299,7 +359,10 @@ Missed                     1   resolvable, but it abstained
 
 Exceptions                 1
 Value in exceptions        ₹4,178.99
-Est. human time to clear   8 min   (vs ~6 h 40 min for the batch by hand)
+Est. human time to clear   8 min   (8 min exceptions + 0 min dismissals)
+Same batch by hand         6 h 53 min   (199 on sight x 2 min + 1 chased x 15 min)
+Time saved                 98.1%   (6 h 45 min less than by hand)
+Break-even chased rate     none -- saving is unconditional
 
 Exception queue (1, by value)
 
@@ -384,9 +447,26 @@ because the 2% platform fee still applies on the standard payment-gateway rail. 
 now 🟢 with the source and date recorded; TDS stays 🔴, since it is tax withholding rather
 than gateway pricing and the pricing page does not cover it.
 
-The human-time estimates remain 🔴 and say so, including the break-even ratio at which the
-comparison stops flattering: at ~10 min per exception against a 2 min-per-row baseline, the
-tool only saves time while exceptions stay under **20%** of bank rows.
+The human-time estimates remain 🔴 and say so. **They also collected the largest correction
+in this project so far, and it was the tool's own claim about itself.** Through Phase 8 the
+metric block printed the tool's minutes beside a by-hand total and never subtracted them —
+and on all six measured cells the by-hand figure was the *smaller* one, so the report claimed
+a saving while the tool cost an operator 2–3× more time than ignoring it. Fifteen gates missed
+it because no assertion put the two numbers on opposite sides of a comparison; each side was
+individually right. The block now prints both totals, states the subtraction, and prints the
+chased rate at which they cross — **13.34 min on the binding cell against an assumed 15**, so
+a 1.66-minute margin, measured at 7.09–13.34 across three seeds × two sizes.
+
+Two further versions of that line were wrong before one was checkable, and both were found by
+regenerating this README's own output rather than by a test: a *negative* break-even printed
+as a rate ("below −390 min, by hand is cheaper" — true of the arithmetic, meaningless as a
+claim), and — the one worth reading — **a wrong match is invisible to a comparison built on
+queue minutes.** It raises no exception, so it costs the tool side nothing: the `zip` fixture,
+which matches by row position at 35% correctness with 39 wrong matches, printed `Time saved
+100.0%`. The best possible figure, earned by getting rows silently wrong. The claim is now
+withheld entirely on any run with a wrong match, rather than qualified — a percentage beside a
+caveat is still the number a reader takes away — and no remediation rate was invented to
+charge those rows with, because nobody was timed for finding a mis-booked entry months later.
 
 ---
 

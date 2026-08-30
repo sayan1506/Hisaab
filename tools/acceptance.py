@@ -22,7 +22,7 @@ done" is a claim with a check behind it rather than a feeling.
      every planted row and required to come back ambiguous  [Phase 4b]
  12. both tiers carry rows, so a Tier 1 regression cannot hide behind a Tier 2
      success -- and the subset search's bound refuses rather than guessing  [Phase 5]
- 13. all seven implemented flags at once: the three new deduction terms are non-zero
+ 13. all seven of Phase 6's flags at once: the three new deduction terms are non-zero
      and re-derived, and the reserve is diagnosed but never resolved  [Phase 6]
 
 **This file grows a gate per phase; it never turns over.** Gates 0-7 are Phase 1's and
@@ -82,6 +82,11 @@ from hisaab.matcher.tier2 import MAX_POOL as TIER2_MAX_POOL  # noqa: E402
 SELF_CHECK_MODULES: tuple[str, ...] = (
     "hisaab.common.ids",
     "hisaab.common.reasons",
+    # Phase 9 moved the effort table here from ``scoring/metrics.py`` so ``hisaab/triage``
+    # could read it without importing the scoring package. Listed straight after
+    # ``reasons`` -- the only thing it depends on -- and well ahead of ``metrics``, which
+    # now imports it: a broken price table should be reported as a broken price table.
+    "hisaab.common.effort",
     "hisaab.common.money",
     "hisaab.common.bizdays",
     "hisaab.generator.rng",
@@ -119,6 +124,16 @@ SELF_CHECK_MODULES: tuple[str, ...] = (
     # resolution path by design (``check_isolation.py`` check 7), so a failure here means
     # the declared-vs-derived *report* is wrong, never that a verdict is.
     "hisaab.matcher.adjustments",
+    # --- Phase 9, triage. Last because it reads what everything above produces, and it
+    # reads it with the least access of any package here: ``hisaab/triage`` is in
+    # ``MATCHER_PACKAGES``, so it may not import the scoring package, the generator, or
+    # the adjustment report. Its reader is a deliberate narrow duplicate of
+    # ``verdict_io``'s parse half -- see that module's docstring for why the alternative
+    # was rejected -- so this self-check is what keeps the two from drifting silently.
+    "hisaab.triage.read",
+    "hisaab.triage.group",
+    "hisaab.triage.value",
+    "hisaab.triage.hint",
 )
 
 #: Gate 3's seed matrix. Seed 99 is absent on purpose: it is the holdout, and it is
@@ -878,7 +893,8 @@ def gate_11_planted(sizes: tuple[int, ...] = (60, 200)) -> None:
     every planted row and requires it to come back *ambiguous*. A flag that survives only
     because nobody tried the cheap attack is not testing the capability its name claims.
 
-    What it asserts, per dev seed and size, with all three implemented flags on:
+    What it asserts, per dev seed and size, with ``--fees``, ``--settlement-delay`` and
+    ``--dup-amounts`` on:
 
       * ``planted_pairs`` in the manifest, and ``2 x`` that many unresolvable rows in truth,
         each carrying ``AMBIGUOUS_DUPLICATE_AMOUNT``. The count is the *denominator*, so a
@@ -1781,7 +1797,7 @@ def gate_13_phase6(sizes: tuple[int, ...] = (200, 1000)) -> None:
     """Phase 6: three new deduction terms, and the one that must never be resolved.
 
     Every gate before this one scores runs where the whole gross/net wedge is fee and GST. This
-    gate turns on all seven implemented flags at once and asserts the properties Phase 6's three
+    gate turns on all seven flags implemented as of Phase 6 at once and asserts the properties its three
     terms are supposed to have -- two of which are *arithmetic* and one of which is a refusal.
 
     **It runs at n=1000, and that size is not incidental.** Phase 6 step 5 swept the amount band
@@ -2063,7 +2079,7 @@ def gate_13_phase6(sizes: tuple[int, ...] = (200, 1000)) -> None:
         print(f"    control  seed {seed}, n={n}: 100/100/0, 0 reserves diagnosed")
 
 
-#: Gate 13's seven plus Phase 7's two. Every flag the generator implements except ``--dup-amounts``
+#: Gate 13's seven plus Phase 7's two -- every flag implemented as of Phase 7 except ``--dup-amounts``
 #: (gate 11 owns the planted rows, and combining it with ``--batching`` is refused outright).
 PHASE7_FLAGS: tuple[str, ...] = (*PHASE6_FLAGS, "--noise-rows", "--unsettled")
 
@@ -2193,7 +2209,8 @@ def gate_14_phase7(sizes: tuple[int, ...] = (200, 1000)) -> None:
 
     Every gate before this one scores a file where **every bank row is gateway money** and every
     payment eventually settles. Both assumptions are false in a real bank statement, and this gate
-    turns on all nine implemented flags at once to assert what the matcher must do without them.
+    turns on all nine flags implemented as of Phase 7 at once to assert what the matcher must
+    do without them.
 
     **It runs at n=1000 even under ``--skip-slow``, and for gate 13's reason rather than by
     imitation.** Two of the properties below are invisible at n=200: ``AMBIGUOUS_MULTI_SUBSET``
@@ -2944,15 +2961,402 @@ def gate_7_assumptions() -> None:
     print(f"    {len(text.splitlines())} lines at {path.relative_to(ROOT)}")
 
 
+def _duration_minutes(text: str) -> int:
+    """Read ``report.duration``'s output back to an integer.
+
+    The gate compares the two ROI totals itself rather than trusting the percentage beside
+    them, which is the whole reason this parser exists: the inverted claim survived eight
+    phases because no assertion ever subtracted the two printed numbers.
+    """
+    import re
+
+    t = text.strip()
+    if t.endswith(" min") and " h " not in t:
+        return int(t[: -len(" min")])
+    m = re.fullmatch(r"(\d+) h (\d+) min", t)
+    if not m:
+        raise GateFailure(f"cannot read a duration from {text!r}")
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
+def _metric_line(block: str, label: str) -> str:
+    """The value on one line of the metric block, without its parenthesised note."""
+    for line in block.splitlines():
+        if line.startswith(label):
+            return line[len(label):].strip().split("(")[0].strip()
+    raise GateFailure(f"no {label!r} line in the metric block:\n{block}")
+
+
+def _bank_amounts(data: Path) -> dict[str, int]:
+    """``row_id -> amount_paise``, read straight from the CSV.
+
+    Deliberately **not** through ``matcher.load``, which is what triage itself uses. A gate
+    that validated the join with the same reader the join is built on could not notice the
+    reader being wrong -- it would only notice the two of them disagreeing, which they never
+    would. Six lines of ``csv`` is the independent second opinion.
+    """
+    import csv as _csv
+
+    with (data / "bank_statement.csv").open("r", encoding="utf-8", newline="") as f:
+        reader = _csv.DictReader(f)
+        return {row["row_id"]: int(row["amount_paise"]) for row in reader}
+
+
+def _triage(matches: Path, data: Path) -> tuple[dict[str, object], str]:
+    """Run the triage CLI. Returns (line 1 as JSON, the text block below it)."""
+    stdout = _run(
+        [
+            sys.executable, "-m", "hisaab.triage",
+            "--matches", str(matches), "--data", str(data),
+        ],
+        f"triage on {matches.name}",
+    )
+    lines = stdout.splitlines()
+    if not lines:
+        raise GateFailure("triage printed nothing")
+    try:
+        doc = json.loads(lines[0])
+    except json.JSONDecodeError as e:
+        raise GateFailure(f"line 1 of triage's stdout is not JSON: {lines[0]!r} ({e})")
+    return doc, "\n".join(lines[1:])
+
+
+def gate_16_triage(sizes: tuple[int, ...] = (60, 200)) -> None:
+    """Phase 9: the exception queue is complete, correctly valued, ranked, and honest about ROI.
+
+    Six properties, and the order matters -- the control comes first, because every check
+    below it would also pass on a queue that silently dropped rows:
+
+      * **The empty queue, first.** Clean mode resolves every row, so triage must print an
+        empty queue and exit 0. Without this, "no row appears twice" and "every value matches
+        its bank row" are both satisfied by a tool that emits nothing at all.
+      * **Every queued row exactly once, and no resolved row.** The partition is against
+        ``matches.json`` itself: exceptions plus dismissals, no more and no less.
+      * **Every total is the sum of its parts.** Group value against its own credits, group
+        minutes against ``rows x minutes_per_row``, and the totals block against the groups.
+        Three sums that could each be computed independently, so a disagreement localises.
+      * **Every value is its own bank row's**, checked against the CSV read directly rather
+        than through the loader triage uses.
+      * **Genuinely ranked by money, and the ranking is not vacuous.** Descending value is
+        asserted on every cell; separately, at least one cell across the sweep must order two
+        groups differently than effort would. Otherwise "ranked by value" is untestable --
+        every ordering agrees when the two keys never disagree.
+      * **The ROI claim points the right way.** The gate reads both totals out of the metric
+        block, subtracts them itself, and requires the printed claim to agree. This is the
+        assertion whose absence let the report state a saving on all six measured cells while
+        the tool's own total was 2-3x larger than doing the batch by hand.
+
+    And two refusals, because a queue that cannot say "these inputs are not from the same
+    run" would present numbers computed across two months as a month's work.
+    """
+    print(f"\ngate 16 -- the exception queue on seeds {list(DEV_SEEDS)} x sizes {list(sizes)}")
+    inversion_seen: str | None = None
+
+    with tempfile.TemporaryDirectory(prefix="hisaab-triage-") as tmp:
+        root = Path(tmp)
+
+        # --- the control: clean mode leaves nothing for a human --------------------------
+        clean = root / "clean"
+        data, truth = clean / "data", clean / "truth"
+        _run(
+            [
+                sys.executable, "-m", "hisaab.generator",
+                "--seed", "1", "--n", "60", "--month", "2026-08",
+                "--out", str(data), "--truth", str(truth), "--quiet",
+            ],
+            "generator, clean mode",
+        )
+        matches = clean / "matches.json"
+        _run(
+            [
+                sys.executable, "-m", "hisaab.matcher",
+                "--data", str(data), "--out", str(matches),
+                "--seed", "1", "--month", "2026-08", "--quiet",
+            ],
+            "matcher, clean mode",
+        )
+        doc, text = _triage(matches, data)
+        totals = doc["totals"]  # type: ignore[index]
+        if doc["groups"] != [] or totals["rows"] != 0:  # type: ignore[index]
+            raise GateFailure(
+                f"clean mode resolves every row, so the queue must be empty -- got "
+                f"{totals['rows']} row(s) in {len(doc['groups'])} group(s).\n"  # type: ignore[index,arg-type]
+                f"Either the matcher regressed or the queue is inventing work."
+            )
+        if "empty" not in text:
+            raise GateFailure(f"an empty queue must say so in the text block, got:\n{text}")
+        print("    clean mode        empty queue, exit 0 -- nothing needs a human")
+
+        # --- the real thing: an eleven-flag run at every seed and size -------------------
+        for seed in DEV_SEEDS:
+            for n in sizes:
+                base = root / f"s{seed}n{n}"
+                data, truth = base / "data", base / "truth"
+                _run(
+                    [
+                        sys.executable, "-m", "hisaab.generator",
+                        "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                        "--all-mess", "--out", str(data), "--truth", str(truth), "--quiet",
+                    ],
+                    f"generator --all-mess at seed {seed}, n={n}",
+                )
+                matches = base / "matches.json"
+                # ``--window 1`` for the reason gate 10 measured: ``--all-mess`` includes the
+                # posting lag, and at the default window 0 nothing resolves at all. A queue
+                # holding every row would pass most checks here while testing nothing.
+                metrics = _matcher_and_score(
+                    data, truth, matches, seed, extra=["--window", str(MESS_WINDOW_DAYS)],
+                )
+                doc, text = _triage(matches, data)
+                groups = doc["groups"]  # type: ignore[assignment]
+                totals = doc["totals"]  # type: ignore[index]
+                where = f"seed {seed}, n={n}"
+
+                # --- the partition, against matches.json ----------------------------------
+                verdicts = json.loads(matches.read_text(encoding="utf-8"))["verdicts"]
+                queued = {v["credit_id"] for v in verdicts if v["outcome"] != "RESOLVED"}
+                resolved = {v["credit_id"] for v in verdicts if v["outcome"] == "RESOLVED"}
+                listed = [c["credit_id"] for g in groups for c in g["credits"]]  # type: ignore[index,union-attr]
+                if len(listed) != len(set(listed)):
+                    dupes = sorted({c for c in listed if listed.count(c) > 1})
+                    raise GateFailure(
+                        f"{where}: {dupes} appear in more than one group. A duplicated row is "
+                        f"counted twice in its group's money and its minutes."
+                    )
+                if set(listed) != queued:
+                    raise GateFailure(
+                        f"{where}: the queue does not match the verdicts.\n"
+                        f"  missing from the queue: {sorted(queued - set(listed))[:8]}\n"
+                        f"  in the queue but resolved: {sorted(set(listed) & resolved)[:8]}\n"
+                        f"A row missing from every group is a row that quietly stops being "
+                        f"somebody's job."
+                    )
+
+                # --- three sums, each computed independently ------------------------------
+                bank = _bank_amounts(data)
+                for g in groups:  # type: ignore[union-attr]
+                    own = sum(c["value_paise"] for c in g["credits"])
+                    if g["value_paise"] != own:
+                        raise GateFailure(
+                            f"{where}, group {g['cause']}: claims {g['value_paise']}p but its "
+                            f"rows sum to {own}p"
+                        )
+                    if g["estimated_minutes"] != g["rows"] * g["minutes_per_row"]:
+                        raise GateFailure(
+                            f"{where}, group {g['cause']}: {g['estimated_minutes']} min for "
+                            f"{g['rows']} rows at {g['minutes_per_row']} min each"
+                        )
+                    if g["rows"] != len(g["credits"]):
+                        raise GateFailure(
+                            f"{where}, group {g['cause']}: says {g['rows']} rows, lists "
+                            f"{len(g['credits'])}"
+                        )
+                    if not g["action"]:
+                        raise GateFailure(
+                            f"{where}, group {g['cause']}: no next action. A heading with no "
+                            f"action reads as 'nothing can be done about these'."
+                        )
+                    # --- every value is its own bank row's --------------------------------
+                    for c in g["credits"]:
+                        if c["credit_id"] not in bank:
+                            raise GateFailure(
+                                f"{where}: {c['credit_id']} is queued but is not a bank row"
+                            )
+                        if c["value_paise"] != bank[c["credit_id"]]:
+                            raise GateFailure(
+                                f"{where}: {c['credit_id']} is ranked at {c['value_paise']}p "
+                                f"but the bank statement says {bank[c['credit_id']]}p -- the "
+                                f"join is attaching the wrong money to a row"
+                            )
+                for key, got in (
+                    ("groups", len(groups)),  # type: ignore[arg-type]
+                    ("rows", len(listed)),
+                    ("value_paise", sum(g["value_paise"] for g in groups)),  # type: ignore[union-attr]
+                    ("estimated_minutes", sum(g["estimated_minutes"] for g in groups)),  # type: ignore[union-attr]
+                ):
+                    if totals[key] != got:  # type: ignore[index]
+                        raise GateFailure(
+                            f"{where}: totals.{key} is {totals[key]} but the groups sum to "  # type: ignore[index]
+                            f"{got}"
+                        )
+
+                # --- genuinely ranked by money ------------------------------------------
+                values = [g["value_paise"] for g in groups]  # type: ignore[union-attr]
+                if values != sorted(values, reverse=True):
+                    raise GateFailure(
+                        f"{where}: groups are not ordered by money at risk: {values}"
+                    )
+                for a, b in zip(groups, groups[1:]):  # type: ignore[index,arg-type]
+                    # Value already leads; this is the pair that proves it *led* rather than
+                    # merely agreed with effort. ``a`` is worth more than ``b`` by the check
+                    # above, so ``a`` costing fewer minutes is a pair the two keys order
+                    # differently.
+                    if a["estimated_minutes"] < b["estimated_minutes"]:
+                        inversion_seen = (
+                            f"{where}: {a['cause']} ({a['estimated_minutes']} min) outranks "
+                            f"{b['cause']} ({b['estimated_minutes']} min) on money"
+                        )
+
+                # --- the ROI claim, subtracted here rather than trusted -------------------
+                block = _run(
+                    [
+                        sys.executable, "-m", "hisaab.scoring",
+                        "--matches", str(matches), "--truth", str(truth),
+                    ],
+                    f"scorer text block at seed {seed}, n={n}",
+                )
+                tool = _duration_minutes(_metric_line(block, "Est. human time to clear"))
+                by_hand = _duration_minutes(_metric_line(block, "Same batch by hand"))
+                claim = _metric_line(block, "Time saved")
+                # **Three states, not two.** Reading this line as "COSTS MORE or a percentage"
+                # was wrong the moment the wrong-match branch existed: a run that books a wrong
+                # match withholds the claim entirely, and on such a run the minute totals may
+                # still favour the tool -- so a two-valued reading would fail this gate on a
+                # block that is behaving correctly. The states are asserted separately because
+                # each one is a different promise about the same two numbers.
+                wrong = (
+                    metrics["cells"]["wrong_match"]  # type: ignore[index]
+                    + metrics["cells"]["wrong_match_invented"]  # type: ignore[index]
+                    + metrics["cells"]["lucky_guess"]  # type: ignore[index]
+                )
+                withheld = "not claimable" in claim
+                costs_more = "COSTS MORE" in claim
+                if withheld != bool(wrong):
+                    raise GateFailure(
+                        f"{where}: the block says {claim!r} with {wrong} wrong match(es). The "
+                        f"claim must be withheld exactly when a wrong match exists -- a wrong "
+                        f"match raises no exception, so it costs the queue nothing and is "
+                        f"invisible to this comparison. The `zip` fixture printed 'Time saved "
+                        f"100.0%' at 35% correctness before that branch existed."
+                    )
+                if not withheld and costs_more != (tool >= by_hand):
+                    raise GateFailure(
+                        f"{where}: the ROI claim contradicts its own numbers -- the block says "
+                        f"{claim!r} while the tool costs {tool} min against {by_hand} min by "
+                        f"hand. This is the defect the four-line block was written to make "
+                        f"impossible: a claim nothing subtracted."
+                    )
+                if withheld and "%" in claim:
+                    raise GateFailure(
+                        f"{where}: the claim is withheld but still prints a percentage "
+                        f"({claim!r}). A number beside a caveat is the number a reader takes "
+                        f"away."
+                    )
+                # The tool's own total must also be the queue's, since they price the same
+                # work from the same table by two routes.
+                if tool != totals["estimated_minutes"]:  # type: ignore[index]
+                    raise GateFailure(
+                        f"{where}: the scorer charges {tool} min but the queue charges "
+                        f"{totals['estimated_minutes']} min for the same rows -- one of them "  # type: ignore[index]
+                        f"is pricing work the other cannot see"
+                    )
+                # Three states here too. The sweep's cells all hold 100% correctness today, so
+                # the withheld case never prints -- but a gate whose own summary line could
+                # report "saves 88 min" for a run that refused to claim a saving would be
+                # narrating the opposite of what it just asserted.
+                if withheld:
+                    verdict = f"not claimable ({wrong} wrong)"
+                elif costs_more:
+                    verdict = "COSTS MORE"
+                else:
+                    verdict = f"saves {by_hand - tool} min"
+                print(
+                    f"    seed {seed}, n={n:<4} {totals['rows']:>3} row(s) in "  # type: ignore[index]
+                    f"{len(groups):>2} group(s)   "  # type: ignore[arg-type]
+                    f"{totals['estimated_minutes']:>4} min vs {by_hand:>4} by hand   "  # type: ignore[index]
+                    f"{verdict}   exceptions {metrics['exceptions']['count']}"  # type: ignore[index]
+                )
+
+        if inversion_seen is None:
+            raise GateFailure(
+                "no cell in this sweep ordered two groups differently than effort would, so "
+                "'ranked by money at risk' is untested here -- every ordering agrees when the "
+                "two keys never disagree. Widen the sweep rather than deleting this check."
+            )
+        print(f"    ranking is load-bearing: {inversion_seen}")
+
+        # --- and it refuses two runs pretending to be one -------------------------------
+        # Both directions. Seed 1's verdicts against seed 2's data: some credit ids exist in
+        # both files with different amounts, which is precisely the mismatch that would
+        # produce a plausible, wrong queue rather than an error.
+        a, b = root / f"s{DEV_SEEDS[0]}n{sizes[0]}", root / f"s{DEV_SEEDS[1]}n{sizes[0]}"
+        for matches_dir, data_dir, label in (
+            (a, b, "seed 1 verdicts against seed 2 data"),
+            (b, a, "seed 2 verdicts against seed 1 data"),
+        ):
+            proc = subprocess.run(
+                [
+                    sys.executable, "-m", "hisaab.triage",
+                    "--matches", str(matches_dir / "matches.json"), "--data", str(data_dir / "data"),
+                ],
+                cwd=ROOT, capture_output=True, text=True,
+                env={**_env(), "PYTHONUTF8": "1"},
+            )
+            if proc.returncode != 1:
+                raise GateFailure(
+                    f"{label}: exit {proc.returncode}, expected 1. Two runs' files must not "
+                    f"produce a queue -- every number in it would be about the wrong month.\n"
+                    f"{proc.stdout[:400]}"
+                )
+            if "REFUSING TO BUILD A QUEUE" not in proc.stderr:
+                raise GateFailure(f"{label}: refused without saying so:\n{proc.stderr[:400]}")
+        print("    mismatched runs refused in both directions (exit 1)")
+
+        # --- and the mismatch no id check can see ---------------------------------------
+        # Both refusals above fire on the id sets: seeds 1 and 2 produce 48 and 50 bank rows at
+        # n=60, so one file simply has rows the other lacks. **The dangerous case is two runs of
+        # the same size**, where the ids coincide exactly, both id checks pass, and the queue
+        # comes out plausible and wrong. Rather than hunting for two seeds that happen to agree
+        # on row count, this changes one amount by one paisa in a copy of the data -- the
+        # smallest possible same-size divergence, and the one a byte-level diff would find but
+        # an id comparison never will.
+        import shutil
+
+        skewed = root / "skewed"
+        shutil.copytree(a / "data", skewed)
+        bank_csv = skewed / "bank_statement.csv"
+        rows = bank_csv.read_text(encoding="utf-8").splitlines()
+        if len(rows) < 2:
+            raise GateFailure("the copied bank statement has no rows to skew")
+        fields = rows[1].split(",")
+        amount_at = rows[0].split(",").index("amount_paise")
+        before = int(fields[amount_at])
+        fields[amount_at] = str(before + 1)
+        rows[1] = ",".join(fields)
+        bank_csv.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "hisaab.triage",
+                "--matches", str(a / "matches.json"), "--data", str(skewed),
+            ],
+            cwd=ROOT, capture_output=True, text=True,
+            env={**_env(), "PYTHONUTF8": "1"},
+        )
+        if proc.returncode != 1:
+            raise GateFailure(
+                f"a bank amount changed by 1 paisa produced exit {proc.returncode}, expected 1. "
+                f"Every credit id still matches, so this is the mismatch the id checks cannot "
+                f"see -- and the queue it built ranks {before + 1}p as though the matcher had "
+                f"judged it.\n{proc.stdout[:400]}"
+            )
+        if "wrong month" not in proc.stderr:
+            raise GateFailure(
+                f"refused, but not by comparing the stated amount -- so the same-size case is "
+                f"still uncovered:\n{proc.stderr[:400]}"
+            )
+        print(f"    one amount off by 1p refused (ids all match, {before}p vs {before + 1}p)")
+
+
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-7).")
+    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-9).")
     p.add_argument("--skip-slow", action="store_true",
-                   help="skip the n=200 sweeps in gates 3, 6, 9, 10, 11 and 12. Gates 13 "
+                   help="skip the n=200 sweeps in gates 3, 6, 9, 10, 11, 12 and 16. Gates 13 "
                         "and 14 ignore this flag: gate 13's wrong-match assertion and gate "
                         "14's ambiguity and pool-cap assertions are all invisible at n=200")
     args = p.parse_args(argv)
 
-    print("Acceptance -- generator (clean mode) + scoring harness + matcher\n" + "=" * 62)
+    print("Acceptance -- generator + scoring harness + matcher + exception queue\n" + "=" * 62)
     gates = [
         gate_0_self_checks,
         lambda: gate_3_invariants_across_seeds((12, 60) if args.skip_slow else (12, 60, 200)),
@@ -2993,6 +3397,11 @@ def main(argv: list[str] | None = None) -> int:
         # ~127s total. A size that expensive should not be paid twice for properties n=200
         # already covers.
         lambda: gate_15_phase8((200,) if args.skip_slow else (200, 1000)),
+        # Honours --skip-slow, like gate 15 and unlike gates 13 and 14. Every property this
+        # gate reads is non-vacuous at n=60: an --all-mess run there already produces several
+        # groups, a dismissal group, and the value/effort inversion the ranking check needs.
+        # Nothing here is a rate that only separates at scale.
+        lambda: gate_16_triage((60,) if args.skip_slow else (60, 200)),
     ]
     try:
         for gate in gates:
@@ -3002,7 +3411,25 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all fifteen gates pass -- Phases 1 through 8 are complete")
+    print("all sixteen gates pass -- Phases 1 through 9 are complete")
+    print("\nPhase 9 turned the scored run into a work queue -- grouped by cause, ranked by")
+    print("money at risk, priced per group, with a next action and a named missing input each.")
+    print("It reads matches.json and data/ only: hisaab/triage is on MATCHER_PACKAGES, so the")
+    print("same static check that keeps the matcher away from the answer key keeps the queue")
+    print("away from it too. An operator can run this on their own month.")
+    print("\n  And it found that the ROI claim had been printing backwards since Phase 2. The")
+    print("  metric block showed the tool's minutes beside a by-hand total and never subtracted")
+    print("  them -- on all six measured cells the by-hand figure was SMALLER, so the report was")
+    print("  quietly claiming a saving while the tool cost an operator 2-3x more time than")
+    print("  ignoring it. Eight phases and fifteen gates missed it because no assertion anywhere")
+    print("  put the two numbers on opposite sides of a comparison. Gate 16 now does, and reads")
+    print("  the claim back out of the block to check it agrees with its own arithmetic.")
+    print("\n  The fix was not a bigger number. The baseline was one flat 2 min/row, which prices")
+    print("  a chased exception the same as a tick-off; it now splits into 2 min on sight and 15")
+    print("  min chased, and dismissals are charged 3 min each where they had been priced since")
+    print("  Phase 2 and never billed. Break-even sits at 13.34 min against the assumed 15 -- a")
+    print("  1.66-minute margin, printed beside the claim so a reader can see how much room it")
+    print("  has rather than taking the percentage on trust.")
     print("\nClean mode still resolves at 100/100/0 (gate 9), and the mess dial is now fully")
     print("built: 12 of 13 flags implemented, eleven of them composing in one run (gate 15).")
     print("Across every flag set in this suite the matcher holds 100% correctness with 0 wrong")
@@ -3051,7 +3478,7 @@ def main(argv: list[str] | None = None) -> int:
     print("  number is attributable to the flag and not to the fixture.")
     print("\nPhase 6 turned on the three remaining deduction terms -- TDS, netted refunds and")
     print("a withheld reserve -- and gate 13 is the first thing in this suite to run all seven")
-    print("implemented flags at once. It found three defects that had been sitting in the code,")
+    print("of Phase 6's flags at once. It found three defects that had been sitting in the code,")
     print("and the reason all three hid is the same: no gate before it ran --netted-refunds")
     print("alongside --batching and --settlement-report-late.")
     print("\n  The serious one was a wrong match, which is the single number this project says")

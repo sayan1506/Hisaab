@@ -66,8 +66,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-#: Packages on the matching path. ``hisaab.matcher`` arrives in Phase 3; listing it
-#: now means the guard is armed before there is anything to guard.
+#: Packages that must work from the inputs alone. ``hisaab.matcher`` arrives in Phase 3;
+#: listing it now means the guard is armed before there is anything to guard.
+#:
+#: **Named for the matcher, but it gates four checks** -- 1, 2, 6 and 7 -- so adding an entry
+#: bans four things at once: importing ``hisaab.scoring``, naming the truth path in code,
+#: importing the generator, and importing the declared-fee report. Worth knowing before adding
+#: one, because the four have different justifications and a new package inherits all of them.
+#:
+#: ``hisaab/triage`` (Phase 9) is here for check 6 above all. Checks 1 and 3 already covered
+#: it -- check 3 walks every ``.py`` in the tree and is default-deny, so a new package is
+#: guarded from the moment its first file exists -- but check 6 was scoped to *this tuple*, so
+#: until triage joined it, the queue could import the generator's fee rates, T+n cycle and
+#: narration templates with nothing to stop it. That is the worse leak of the two: triage's job
+#: is explaining **why** a row failed, which is precisely the job that tempts an author toward
+#: the generator's rate table, and unlike a truth import it yields a queue that *looks* right.
+#: The summary line below reported "matching path: 11 files" while triage sat outside it, so
+#: the number a reader trusts did not count the package with the most reason to cheat.
 MATCHER_PACKAGES: tuple[str, ...] = (
     "hisaab/matcher",
     "hisaab/normalize",
@@ -75,6 +90,7 @@ MATCHER_PACKAGES: tuple[str, ...] = (
     "hisaab/prove",
     "hisaab/classify",
     "hisaab/explain",
+    "hisaab/triage",
 )
 
 #: The one module allowed to read truth.json.

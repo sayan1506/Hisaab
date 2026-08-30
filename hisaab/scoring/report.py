@@ -29,15 +29,40 @@ byte-for-byte.
 
 from __future__ import annotations
 
-from ..common.money import fmt
-from .metrics import MINUTES_PER_EXCEPTION, Cell, Metrics
+from typing import NamedTuple
 
-#: Minutes a person needs per bank row doing this reconciliation by hand: open the
-#: statement, find the settlement, tick it off. **An assumption, not a measurement** --
-#: stated in ASSUMPTIONS.md so a judge can challenge the figure instead of discovering
-#: it was invented at demo time. 60 rows x 2 min ~ 2 hours, which is the "vs ~2 h by
-#: hand" comparison in the block.
-BY_HAND_MINUTES_PER_ROW = 2
+from ..common.money import fmt
+from ..common.verdict import Outcome
+from .metrics import Cell, Metrics, minutes_for
+
+#: Minutes a person needs for a bank row that reconciles on sight: open the statement, find
+#: the settlement, tick it off. **An assumption, not a measurement** -- stated in
+#: ASSUMPTIONS.md so a judge can challenge the figure instead of discovering it was invented
+#: at demo time.
+#:
+#: This was ``BY_HAND_MINUTES_PER_ROW``, a single flat rate applied to every row in the file,
+#: and Phase 9 split it because one rate made the whole ROI claim read backwards. A flat 2
+#: minutes says a row nothing matches costs the same as a row that ticks off, so the by-hand
+#: total came out *below* the tool's own estimate on all six measured cells -- the report
+#: printed both figures and never subtracted them, so nothing caught it for eight phases.
+BY_HAND_MINUTES_EASY = 2
+
+#: Minutes for a row a person cannot reconcile on sight -- the ones the matcher raises as
+#: exceptions. Chase the settlement report, call the bank, reconstruct a payment set.
+#:
+#: **15, and the number it has to beat is measured rather than argued.**
+#: `.plan/probe_phase9_roi_breakeven.py` computes the break-even rate per cell -- the rate at
+#: which doing the batch by hand stops costing more than working the tool's queue. Across
+#: three seeds at two sizes the binding cell needs **13.17 min** (seed 1, n=200; the others
+#: run 8.67-12.93), and charging dismissals moves that to **13.34**. So 15 clears every
+#: measured cell with 1.66 minutes to spare, and the measured saving runs 9.1-29.8% with the
+#: floor on that same binding cell.
+#:
+#: The margin is thin on purpose rather than by luck: 12 minutes -- a defensible reading of
+#: "a person just calls the bank" -- inverts every cell. That is why the block prints this
+#: run's break-even beside the saving instead of a bare percentage: a reader can see how much
+#: room the claim has rather than trusting the point estimate.
+BY_HAND_MINUTES_HARD = 15
 
 #: Exceptions listed individually before the queue is summarised by reason. Enough to
 #: read the shape of the failure, few enough that a 200-row run stays quotable.
@@ -77,6 +102,87 @@ def duration(minutes: int) -> str:
     return f"{hours} h {mins:02d} min"
 
 
+class Roi(NamedTuple):
+    """The two totals, side by side, and the rate at which they cross.
+
+    **The whole point is that something subtracts them.** Before Phase 9 the block printed
+    ``exception_minutes`` and ``rows x 2`` on one line and never compared them; on all six
+    measured cells the second was *smaller*, so the shipped report was quietly claiming a tool
+    that cost an operator 2-3x more time than ignoring it. Eight phases and fifteen gates
+    missed it because no assertion anywhere put the two numbers on opposite sides of a ``>``.
+    """
+
+    #: Rows a person clears on sight, at ``BY_HAND_MINUTES_EASY``. Resolved rows, dismissed
+    #: rows, and exceptions raised on money that is not gateway money -- an operator glances
+    #: at those and moves on, whatever the matcher said about them.
+    easy_rows: int
+    #: Rows a person has to chase, at ``BY_HAND_MINUTES_HARD``: exceptions on real gateway
+    #: credits. This is the population the break-even was measured against.
+    hard_rows: int
+    by_hand_minutes: int
+    #: What the tool leaves a person to do: exception minutes plus charged dismissals.
+    tool_minutes: int
+
+    @property
+    def saved_minutes(self) -> int:
+        return self.by_hand_minutes - self.tool_minutes
+
+    @property
+    def saved_fraction(self) -> float | None:
+        """``None`` when there is no by-hand baseline to be a fraction of."""
+        if not self.by_hand_minutes:
+            return None
+        return self.saved_minutes / self.by_hand_minutes
+
+    @property
+    def break_even_hard_minutes(self) -> float | None:
+        """The by-hand hard rate at which the two totals cross.
+
+        Below it, doing the batch by hand is cheaper and the claim inverts. ``None`` when
+        there are no hard rows -- with nothing to chase there is no rate to be sensitive to,
+        and a number here would be an artefact of dividing by zero rows.
+        """
+        if not self.hard_rows:
+            return None
+        return (self.tool_minutes - self.easy_rows * BY_HAND_MINUTES_EASY) / self.hard_rows
+
+    @property
+    def tool_wins(self) -> bool:
+        return self.by_hand_minutes > self.tool_minutes
+
+
+def roi(m: Metrics) -> Roi:
+    """Split the file into rows a person clears on sight and rows they chase.
+
+    Counted **row by row from the landings**, not derived by subtracting counters. The
+    arithmetic shortcut is available -- ``.plan/probe_phase9_hard_denominator.py`` measured
+    ``hard == exceptions - cells[NOISE_MISHANDLED]`` and it is exact on all six cells and in
+    clean mode -- and it is not used, because it is exact only while no noise row is ever
+    RESOLVED. That is a ``WRONG_*``-flavoured event: rare rather than impossible, so it would
+    pass every cell anyone tested and then quietly compare a by-hand total against a
+    population the break-even was never measured on. Counting the buckets needs no invariant
+    to hold.
+    """
+    easy = hard = 0
+    for land in m.landings:
+        if land.outcome is Outcome.EXCEPTION and land.cell is not Cell.NOISE_MISHANDLED:
+            hard += 1
+        else:
+            easy += 1
+
+    # The partition, asserted rather than assumed: every bank row is on exactly one side of
+    # this comparison, or the two totals are over different populations.
+    assert easy + hard == m.total_bank_rows, (
+        f"the ROI split lost rows: {easy} easy + {hard} hard != {m.total_bank_rows} bank rows"
+    )
+    return Roi(
+        easy_rows=easy,
+        hard_rows=hard,
+        by_hand_minutes=easy * BY_HAND_MINUTES_EASY + hard * BY_HAND_MINUTES_HARD,
+        tool_minutes=m.exception_minutes + m.dismissal_minutes,
+    )
+
+
 def _line(label: str, value: str, note: str = "") -> str:
     body = f"{label:<{LABEL}} {value}"
     return f"{body}   {note}".rstrip() if note else body
@@ -101,7 +207,7 @@ def metric_block(m: Metrics) -> str:
     """
     rows = m.total_bank_rows
     invented = m.cells[Cell.WRONG_MATCH_INVENTED] + m.cells[Cell.LUCKY_GUESS]
-    by_hand = rows * BY_HAND_MINUTES_PER_ROW
+    r = roi(m)
 
     lines = [
         _line(
@@ -174,9 +280,86 @@ def metric_block(m: Metrics) -> str:
         "",
         _line("Exceptions", str(m.exceptions)),
         _line("Value in exceptions", fmt(m.exception_value_paise)),
-        _line("Est. human time to clear", duration(m.exception_minutes),
-              f"(vs ~{duration(by_hand)} for the batch by hand)"),
+        # Four lines where there was one, and the fourth is the only one that is a *claim*.
+        # The old single line printed the tool's minutes with the by-hand total as a note and
+        # never compared them; these print both totals, then subtract them out loud.
+        _line("Est. human time to clear", duration(r.tool_minutes),
+              f"({duration(m.exception_minutes)} exceptions "
+              f"+ {duration(m.dismissal_minutes)} dismissals)"),
+        _line("Same batch by hand", duration(r.by_hand_minutes),
+              f"({r.easy_rows} on sight x {BY_HAND_MINUTES_EASY} min "
+              f"+ {r.hard_rows} chased x {BY_HAND_MINUTES_HARD} min)"),
     ]
+
+    # The branch. A time-saved figure is a claim that can be false, so the false case gets
+    # its own wording rather than a negative percentage in the same sentence -- that is
+    # exactly how the inverted claim survived eight phases: a reader skimming for a number
+    # found one, and it never said which way round the comparison had come out.
+    if m.wrong_matches:
+        # **A wrong match is invisible to this comparison, so the comparison must not be made.**
+        # Found by regenerating README's fixture output: ``zip``, which matches by row position,
+        # scores 35% correctness with 39 wrong matches and printed "Time saved 100.0%" -- the
+        # best possible figure, earned by committing wrongly on every row. ``saboteur`` did the
+        # same with 6. The arithmetic was right and the claim was absurd: a wrong match raises
+        # no exception, so it costs the tool side nothing, and the queue a person clears says
+        # nothing about the rows they were never told to look at.
+        #
+        # This is the third rendering of this figure that read as informative and could not be
+        # checked, after the un-subtracted totals and the negative break-even. It also inverts
+        # this project's own thesis -- that zero wrong matches beats higher coverage -- so the
+        # figure is withheld rather than qualified: a percentage printed beside a caveat is
+        # still the number a reader takes away.
+        #
+        # No remediation rate is invented to charge them with. Nobody was timed for a routine
+        # row, let alone for finding a mis-booked one months later, and a made-up figure here
+        # would be the same defect wearing a correction's clothes.
+        note = (
+            f"(a wrong match leaves no queue row, so the {duration(r.tool_minutes)} above is "
+            f"not what this run left a person to do)"
+        )
+        if not r.tool_wins:
+            note = note[:-1] + f", and it already costs {duration(-r.saved_minutes)} more)"
+        lines.append(_line(
+            "Time saved", f"not claimable -- {m.wrong_matches} wrong match(es)", note,
+        ))
+    elif r.tool_wins:
+        lines.append(_line("Time saved", pct(r.saved_fraction),
+                           f"({duration(r.saved_minutes)} less than by hand)"))
+    else:
+        lines.append(_line(
+            "Time saved", "none -- COSTS MORE",
+            f"(clearing this queue takes {duration(-r.saved_minutes)} longer than by hand)",
+        ))
+
+    # Printed beside the claim on purpose: the saving is sensitive to one assumed rate, and a
+    # reader who can see where it crosses can judge how much room it has. On the measured
+    # binding cell that is 13.34 against an assumed 15 -- a 1.66-minute margin, which is a
+    # fact about the claim that no percentage on its own conveys.
+    be = r.break_even_hard_minutes
+    if be is None:
+        lines.append(_line("Break-even chased rate", "n/a",
+                           "(nothing chased, so no rate to cross)"))
+    elif be <= 0:
+        # **A negative crossing point is not a rate, so it must not be printed as one.** The
+        # arithmetic is right -- it is where the two lines meet -- but a by-hand rate below
+        # zero cannot happen, so "below this, by hand is cheaper" would be an unfalsifiable
+        # claim about an impossible number. That is the same defect as the inverted line this
+        # block replaced: a figure that reads as informative and cannot be checked.
+        #
+        # What it actually means is stronger than any rate: the easy rows alone already cost
+        # more by hand than the whole queue costs with the tool, so no assumed chased rate --
+        # not even zero -- inverts the comparison. Found by regenerating README's second
+        # report block, which printed "-390.00 min" on a run with 199 easy rows and 1 chased.
+        lines.append(_line(
+            "Break-even chased rate", "none -- saving is unconditional",
+            f"(the {r.easy_rows} rows cleared on sight cost more by hand than this whole "
+            f"queue, so no chased rate inverts it)",
+        ))
+    else:
+        lines.append(_line(
+            "Break-even chased rate", f"{be:.2f} min",
+            f"(below this, doing all {rows} rows by hand is cheaper)",
+        ))
     return "\n".join(lines)
 
 
@@ -198,7 +381,9 @@ def exception_queue(m: Metrics) -> str:
     lines = [f"Exception queue ({len(queued)}, by value)", ""]
     for land in queued[:MAX_EXCEPTIONS_LISTED]:
         reason = str(land.reason) if land.reason else "?"
-        minutes = MINUTES_PER_EXCEPTION.get(land.reason, 0) if land.reason else 0
+        # ``minutes_for``, not a second ``.get`` with a second default. This line used to
+        # default an unpriced code to 0 while the total above defaulted it to 10.
+        minutes = minutes_for(land.reason)
         lines.append(
             f"  {land.credit_id:<8} {fmt(land.value_paise):>14}  {reason:<28} ~{minutes} min"
         )
@@ -289,7 +474,15 @@ if __name__ == "__main__":
     assert "seed 42, 2026-08, clean mode, flags: none" in block
     assert "Wall clock" in block and "0.02s" in block
     assert "Value in exceptions        ₹0.00" in block, block
-    assert "vs ~6 min for the batch by hand" in block  # 3 rows x 2 min
+    # Phase 9: the comparison, with both sides shown. Nothing to chase here, so the by-hand
+    # total is 3 rows on sight and the break-even is n/a rather than a division by no rows.
+    assert "Est. human time to clear   0 min" in block, block
+    assert "(0 min exceptions + 0 min dismissals)" in block, block
+    assert "Same batch by hand         6 min" in block, block  # 3 x 2 + 0 x 15
+    assert "(3 on sight x 2 min + 0 chased x 15 min)" in block, block
+    assert "Time saved                 100.0%" in block, block
+    assert "Break-even chased rate     n/a" in block, block
+    assert "nothing chased, so no rate to cross" in block, block
     assert "empty" in exception_queue(oracle)
     # Non-gateway lines stay out entirely when there is no noise and nothing ignored.
     assert "Non-gateway" not in block
@@ -311,6 +504,120 @@ if __name__ == "__main__":
     assert "Exception queue (3, by value)" in queue
     assert "NO_CANDIDATE" in queue and "~10 min" in queue
     assert "by reason:" in queue
+
+    # --- the branch this phase exists for: the tool LOSING ------------------
+    # Every other fixture in this file has the tool winning, which is how the inverted claim
+    # survived: the losing wording had no test because nothing produced a losing run. Both
+    # cases below are constructed to lose, because a branch that cannot be reached in a test
+    # is a branch nobody has read.
+    #
+    # (a) One expensive exception. FX_RATE_GAP is priced at 20 min against a chased row's 15,
+    #     so a file of nothing but FX gaps costs more to triage than to reconcile by hand.
+    losing = score(
+        _run((Verdict("C0001", Outcome.EXCEPTION, reason=Reason.FX_RATE_GAP),)),
+        _truth((_credit("C0001", ("pay_0001",)),)),
+    )
+    block = metric_block(losing)
+    assert "Est. human time to clear   20 min" in block, block
+    assert "Same batch by hand         15 min" in block, block  # 0 x 2 + 1 x 15
+    assert "Time saved                 none -- COSTS MORE" in block, block
+    assert "takes 5 min longer than by hand" in block, block
+    assert "100.0%" not in block, (
+        "a losing run must not print a percentage anywhere near the claim -- a reader "
+        "skimming for a number is exactly who the old single line misled"
+    )
+    # The break-even reads as the rate at which this run would break even: at 20 min a chased
+    # row it is a wash, and the assumed 15 is below it, which is why this run loses.
+    assert "Break-even chased rate     20.00 min" in block, block
+
+    # (b) The dismissal case, and the one the Phase 9 decision made reachable: a file that is
+    #     almost all noise. Four rows a person clears on sight cost 8 minutes by hand, while
+    #     the tool charges 3 min for each of three dismissals. Nothing is chased, so the
+    #     saving is negative with no hard rows at all -- which the old code could not express,
+    #     since dismissals cost zero and the comparison never happened.
+    noisy = tuple(_credit(f"C{i:04d}", (f"pay_{i:04d}",)) for i in (1,))
+    all_noise = score(
+        _run((
+            _resolved("C0001", ("pay_0001",)),
+            Verdict("C0007", Outcome.IGNORED, reason=Reason.NON_GATEWAY_CREDIT),
+            Verdict("C0008", Outcome.IGNORED, reason=Reason.NON_GATEWAY_CREDIT),
+            Verdict("C0009", Outcome.IGNORED, reason=Reason.NON_GATEWAY_CREDIT),
+        )),
+        _truth(noisy, noise=("C0007", "C0008", "C0009")),
+    )
+    block = metric_block(all_noise)
+    assert "Est. human time to clear   9 min" in block, block  # 0 exceptions + 3 x 3
+    assert "(0 min exceptions + 9 min dismissals)" in block, block
+    assert "Same batch by hand         8 min" in block, block  # 4 x 2 + 0 x 15
+    assert "Time saved                 none -- COSTS MORE" in block, block
+    assert "Break-even chased rate     n/a" in block, block
+    # And the pair that makes the point: dismissals are charged now, so this run has a cost
+    # even though it raised no exceptions at all. Before Phase 9 it read as free.
+    assert all_noise.dismissal_minutes == 9 and all_noise.exception_minutes == 0
+
+    # (c) The **negative crossing point**, which is a winning run rather than a losing one.
+    #     Ten rows resolved and one cheap exception: the tool charges 5 min while the ten easy
+    #     rows alone cost 20 by hand, so the two lines cross at a chased rate of -15 min/row.
+    #     That is arithmetically correct and meaningless as a rate, and it used to print as
+    #     "-390.00 min   (below this, doing all 200 rows by hand is cheaper)" -- a claim about
+    #     an impossible number, found by regenerating README's second report block rather than
+    #     by any assertion here. The saving on such a run is unconditional, which is a stronger
+    #     statement than any threshold, so the block now says that instead.
+    easy_ids = tuple(f"C{i:04d}" for i in range(1, 11))
+    unconditional = score(
+        _run(
+            tuple(_resolved(cid, (f"pay_{cid[1:]}",)) for cid in easy_ids)
+            + (Verdict("C0011", Outcome.EXCEPTION, reason=Reason.PARTIAL_SETTLEMENT_PENDING),)
+        ),
+        _truth(
+            tuple(_credit(cid, (f"pay_{cid[1:]}",)) for cid in easy_ids)
+            + (_credit("C0011", ("pay_0011",)),)
+        ),
+    )
+    block = metric_block(unconditional)
+    r_uncond = roi(unconditional)
+    assert (r_uncond.easy_rows, r_uncond.hard_rows) == (10, 1), r_uncond
+    assert r_uncond.tool_minutes == 5 and r_uncond.by_hand_minutes == 35, r_uncond
+    # The property that makes the branch necessary: a real, negative crossing point.
+    assert r_uncond.break_even_hard_minutes == -15.0, r_uncond.break_even_hard_minutes
+    assert "Break-even chased rate     none -- saving is unconditional" in block, block
+    assert "10 rows cleared on sight cost more by hand" in block, block
+    # No negative minute figure anywhere near the claim -- that is the whole point.
+    assert "-15" not in block and "-390" not in block, block
+    # And this is a *winning* run, so the saving still prints as a percentage: the branch is
+    # about the threshold being meaningless, not about the comparison having gone the wrong way.
+    assert "Time saved                 85.7%" in block, block
+    assert "COSTS MORE" not in block, block
+
+    # (d) **A wrong match withholds the claim entirely.** Two rows: one resolved to the wrong
+    #     payment, one resolved correctly. The queue is empty, so the tool side costs 0 min and
+    #     every earlier branch here would print "Time saved 100.0%" -- which is what ``zip``
+    #     (35% correctness, 39 wrong matches) and ``saboteur`` (6) actually printed until this
+    #     branch existed. A wrong match raises no exception, so it is invisible to a comparison
+    #     built on queue minutes, and the best possible figure was being earned by committing
+    #     wrongly on every row.
+    wrong = score(
+        _run((_resolved("C0001", ("pay_0002",)), _resolved("C0002", ("pay_0002",)))),
+        _truth((_credit("C0001", ("pay_0001",)), _credit("C0002", ("pay_0002",)))),
+    )
+    assert wrong.wrong_matches == 1, wrong.cells
+    block = metric_block(wrong)
+    r_wrong = roi(wrong)
+    # The trap: by the minutes alone this run looks perfect.
+    assert r_wrong.tool_minutes == 0 and r_wrong.hard_rows == 0, r_wrong
+    assert r_wrong.tool_wins and r_wrong.saved_fraction == 1.0, r_wrong
+    # ...and no percentage is printed anywhere near the claim, for the reason (a) gives: a
+    # reader skimming for a number must not find one here.
+    assert "Time saved                 not claimable -- 1 wrong match(es)" in block, block
+    assert "100.0%   (" not in block.split("Time saved")[1], block
+    assert "not what this run left a person to do" in block, block
+    # The withholding is keyed on wrong matches, not on the queue being empty: the empty-queue
+    # runs above still print their percentage.
+    assert "Time saved                 100.0%" in metric_block(unconditional_zero_check := score(
+        _run((_resolved("C0001", ("pay_0001",)),)),
+        _truth((_credit("C0001", ("pay_0001",)),)),
+    )), "a clean run with an empty queue must still be able to claim its saving"
+    assert unconditional_zero_check.wrong_matches == 0
 
     # --- the answer key must not reach the page ----------------------------
     wrong = score(

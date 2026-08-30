@@ -42,50 +42,70 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from ..common.effort import DISMISSAL_MINUTES, MINUTES_PER_EXCEPTION
 from ..common.reasons import Reason
 from ..common.verdict import Decomposition, Outcome, Verdict, VerdictFile
 from .truth_io import Truth, TruthCredit, TruthDecomposition
 
-#: Minutes a human needs to clear one exception, by reason code. **Assumptions, not
-#: measurements** -- stated in ASSUMPTIONS.md so a judge can challenge the number
-#: rather than discover it was invented at demo time. Phase 9 refines these into
-#: per-group estimates once exceptions are ranked; Phase 2 only needs the field to
-#: exist and the numbers to be declared.
-MINUTES_PER_EXCEPTION: dict[Reason, int] = {
-    Reason.NO_CANDIDATE: 10,
-    Reason.AMBIGUOUS_MULTI_SUBSET: 15,
-    # Strictly more work than the code above, which is why it is priced higher: there, the
-    # search ran and the human picks between candidates it already found; here nothing
-    # declares the members, so the human has to *construct* the candidate set by hand before
-    # they can choose. Once Tier 2 exists this code should be rare -- a run full of them is
-    # reporting that the search was unavailable, not that the data was hard.
-    Reason.MEMBERSHIP_UNDECLARED: 20,
-    Reason.AMBIGUOUS_DUPLICATE_AMOUNT: 8,
-    # Cheaper than either ambiguity above, because less is unknown: the settlement and the
-    # payment set are both already matched, and the only open question is *which declared
-    # rate schedule applied*. That is looked up in a contract rather than reconstructed from
-    # the data -- unlike AMBIGUOUS_MULTI_SUBSET (15), where the human still has to choose
-    # between candidate payment sets, or MEMBERSHIP_UNDECLARED (20), where they build one.
-    Reason.AMBIGUOUS_ADJUSTMENT: 10,
-    Reason.UNEXPLAINED_RESIDUAL: 12,
-    Reason.PARTIAL_SETTLEMENT_PENDING: 5,
-    Reason.REFUND_UNLINKED: 10,
-    Reason.FX_RATE_GAP: 20,
-    Reason.NON_GATEWAY_CREDIT: 3,
-    Reason.CREDIT_MISSING: 15,
-    Reason.SETTLEMENT_MISSING: 15,
-    Reason.ROUNDING_DRIFT: 5,
-}
+# Re-exported, not re-declared. The effort table moved to ``hisaab/common/effort.py`` in
+# Phase 9 so that ``hisaab/triage`` -- which check 1 forbids from importing this package --
+# reads the same numbers rather than a second copy of them. The names stay importable from
+# here because gate 7 reads ``MINUTES_PER_EXCEPTION`` off this module to compare against
+# ASSUMPTIONS.md row 34, and that check should not have to know where the table lives.
+__all__ = [
+    "DISMISSAL_MINUTES",
+    "MINUTES_PER_EXCEPTION",
+    "Cell",
+    "Landing",
+    "Metrics",
+    "MetricsError",
+    "expected_credit_ids",
+    "minutes_for",
+    "score",
+]
 
-#: Fallback for a reason code with no estimate. Should be unreachable -- the assertion
-#: below keeps the table exhaustive -- but a scorer must not crash on an unpriced
-#: exception when the alternative is reporting a slightly wrong number of minutes.
-DEFAULT_MINUTES_PER_EXCEPTION = 10
+# ``MINUTES_PER_EXCEPTION`` and ``DISMISSAL_MINUTES`` are imported above, not declared
+# here. Phase 9 moved the table to ``hisaab/common/effort.py`` because ``hisaab/triage``
+# cannot import this package (check_isolation check 1) and needed the same numbers; the
+# exhaustiveness assertion moved with it.
 
-assert set(MINUTES_PER_EXCEPTION) == set(Reason), (
-    "every reason code needs an effort estimate, or the human-time figure silently "
-    "under-reports: missing " + str(sorted(str(r) for r in set(Reason) - set(MINUTES_PER_EXCEPTION)))
-)
+
+def minutes_for(reason: Reason | None) -> int:
+    """Minutes for one exception, by reason code. **The only way to price a row.**
+
+    Phase 9 step 1, and it replaces two ``.get`` calls that disagreed. Until now this table
+    was read at two sites with two different fallbacks: ``metrics.score`` defaulted an
+    unpriced code to ``DEFAULT_MINUTES_PER_EXCEPTION = 10`` while ``report.exception_queue``
+    defaulted the same code to ``0``. So an unpriced code cost 10 minutes in the reported
+    total and displayed 0 against its own row, and the queue's visible minutes did not have
+    to sum to the figure printed above them.
+
+    Unreachable while ``effort.py``'s exhaustiveness assertion holds -- which is exactly why
+    it was safe to leave wrong for seven phases, and why it stops being safe in step 6, where
+    per-group estimates make "a code with no price" a live state for the first time. The
+    fallbacks are deleted rather than reconciled: two defaults for one table is a silent
+    disagreement wearing an assertion's protection, and picking either number would have kept
+    the shape while making the value agree by luck.
+
+    Raises rather than defaulting, for the reason ``reasons.py`` deleted
+    ``CORRECT_ABSTENTION_CODES`` instead of wiring it up: a plausible fallback invites the
+    caller to stop declaring prices, and a queue that quietly prices a new code at somebody's
+    guess is worse than one that refuses to print until the price is written down.
+    """
+    if reason is None:
+        raise MetricsError(
+            "cannot price an exception with no reason code -- Verdict.__post_init__ "
+            "refuses an EXCEPTION without one, so this is a scorer bug, not bad input"
+        )
+    try:
+        return MINUTES_PER_EXCEPTION[reason]
+    except KeyError:
+        raise MetricsError(
+            f"{reason} has no effort estimate in MINUTES_PER_EXCEPTION. Add one (and the "
+            f"matching entry in ASSUMPTIONS.md row 34, which gate 7 compares against this "
+            f"table) rather than letting it price at a default -- an unpriced code used to "
+            f"cost 10 minutes in the total and show 0 in the queue."
+        ) from None
 
 
 class Cell(str, Enum):
@@ -240,6 +260,14 @@ class Metrics:
     exception_minutes: int = 0
     ignores_total: int = 0
 
+    #: Minutes charged for dismissals -- ``ignores_total x DISMISSAL_MINUTES``. **A separate
+    #: counter rather than more minutes in ``exception_minutes``**, because an ``IGNORED`` row
+    #: is not an exception: that field serialises as ``exceptions.estimated_minutes``, and
+    #: folding a different population into it would make the JSON's own name wrong. The two
+    #: are summed only where the sum is what is meant -- the by-hand comparison, where the
+    #: question is what the whole queue costs an operator.
+    dismissal_minutes: int = 0
+
     #: Rows whose decomposition was compared against truth's, and of those, how many
     #: disagreed on at least one term. Both are carried because the second is
     #: uninterpretable without the first -- ``0 mismatches`` reads as a clean bill of health
@@ -375,6 +403,13 @@ class Metrics:
                 "value_paise": self.exception_value_paise,
                 "estimated_minutes": self.exception_minutes,
             },
+            # Dismissals are their own block and not more minutes under ``exceptions``: an
+            # IGNORED row is not an exception, and the key above is named for the population
+            # it counts. Phase 9 charges these for the first time.
+            "dismissals": {
+                "count": self.ignores_total,
+                "estimated_minutes": self.dismissal_minutes,
+            },
             "decomposition": {
                 "checked": self.decomposition_checked,
                 "mismatches": self.decomposition_mismatches,
@@ -384,6 +419,17 @@ class Metrics:
 
 #: Bumped on a breaking change to ``Metrics.as_json``. Phase 9 re-ranks this document
 #: and Phase 11 renders it; a format that shifts silently costs both.
+#:
+#: v4 (Phase 9 step 1): a new ``dismissals`` block. Breaking by the same rule as v2 and v3
+#: below -- a renderer reading ``dismissals.estimated_minutes`` would otherwise have to branch
+#: on whether the key exists, and a v3 document is a run where dismissals were *priced and
+#: never charged*, which is a different fact from a run where they cost nothing.
+#:
+#: What did **not** change is worth stating, because it is the trap this bump avoids:
+#: ``exceptions.estimated_minutes`` still counts exceptions only. The new minutes went into a
+#: new block rather than swelling a key named for a different population, so a v3 reader that
+#: keeps reading the old key gets the number it always got instead of a larger one under the
+#: same name.
 #:
 #: v3 (Phase 5 step 3): ``totals.payments``. Breaking by the same rule as v2 below, and the
 #: reason is the phase itself: until ``--batching`` a bank row *was* a payment, so a v2
@@ -398,7 +444,7 @@ class Metrics:
 #: v1 document is a run where the arithmetic was never checked -- which is a different fact
 #: from a run where it was checked and agreed. Refusing the old document says so; reading
 #: it and defaulting the missing key would not.
-METRICS_SCHEMA_VERSION = 3
+METRICS_SCHEMA_VERSION = 4
 
 
 class MetricsError(Exception):
@@ -560,9 +606,7 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
 
         if verdict.outcome is Outcome.EXCEPTION:
             exception_value += value
-            exception_minutes += MINUTES_PER_EXCEPTION.get(
-                verdict.reason, DEFAULT_MINUTES_PER_EXCEPTION
-            )
+            exception_minutes += minutes_for(verdict.reason)
 
     gateway = [c for c in truth.credits if c.credit_id not in noise_ids]
 
@@ -602,6 +646,8 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
         exception_value_paise=exception_value,
         exception_minutes=exception_minutes,
         ignores_total=counts["IGNORED"],
+        # Charged per row, by the act rather than the code -- see ``DISMISSAL_MINUTES``.
+        dismissal_minutes=counts["IGNORED"] * DISMISSAL_MINUTES,
         decomposition_checked=checked,
         decomposition_mismatches=mismatched,
     )
@@ -894,5 +940,53 @@ if __name__ == "__main__":
         _run(tuple(_except(c.credit_id) for c in three)),
         replace(three_t, unsettled_payment_ids=("pay_9001", "pay_9002")),
     ).total_payments == 5
+
+    # --- Phase 9 step 1: one accessor, and both of its refusals fired ---------
+    # ``minutes_for`` replaced two ``.get`` calls whose defaults disagreed by 10 minutes
+    # (score defaulted to 10, the queue line to 0), so an unpriced code cost 10 in the total
+    # and showed 0 in the queue. The fallbacks are gone; these are the branches that replaced
+    # them, and an unexercised refusal is decoration.
+    #
+    # Positive control first, over the whole vocabulary: if ``minutes_for`` raised on
+    # everything, the two refusals below would still "pass" and this accessor would be broken
+    # in the direction no fixture would notice.
+    assert all(minutes_for(r) == MINUTES_PER_EXCEPTION[r] for r in Reason)
+    assert minutes_for(Reason.NO_CANDIDATE) == 10
+
+    try:
+        minutes_for(None)
+    except MetricsError as e:
+        assert "no reason code" in str(e), e
+    else:
+        raise AssertionError(
+            "priced an exception carrying no reason code -- that is the state "
+            "Verdict.__post_init__ refuses, so reaching a number here would be a scorer "
+            "bug reported as an estimate"
+        )
+
+    # The unpriced-code branch, reached the only way the exhaustiveness assertion allows: by
+    # removing a price. Restored in ``finally``, because a self-check that leaves the module's
+    # own table mutated would corrupt every assertion after it.
+    _victim = Reason.NO_CANDIDATE
+    _price = MINUTES_PER_EXCEPTION.pop(_victim)
+    try:
+        assert _victim not in MINUTES_PER_EXCEPTION, (
+            "the mutation did not take, so the branch below is not the one being tested"
+        )
+        try:
+            minutes_for(_victim)
+        except MetricsError as e:
+            assert "no effort estimate" in str(e) and str(_victim) in str(e), e
+            # It names the row a maintainer has to edit as well as the table, because gate 7
+            # compares the two and a fix to one alone fails there instead of here.
+            assert "ASSUMPTIONS.md" in str(e), e
+        else:
+            raise AssertionError(
+                f"{_victim} priced without an entry in MINUTES_PER_EXCEPTION -- the default "
+                f"this accessor exists to delete is still reachable"
+            )
+    finally:
+        MINUTES_PER_EXCEPTION[_victim] = _price
+    assert set(MINUTES_PER_EXCEPTION) == set(Reason), "the table was left mutated"
 
     print("metrics.py self-check ok")
