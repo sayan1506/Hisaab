@@ -128,6 +128,14 @@ TRUTH_READERS: tuple[str, ...] = (
     "hisaab/scoring/report.py",    # transitive: imports Metrics for the type, never Truth
     "hisaab/scoring/__main__.py",  # transitive: imports .cli
     "tools/fixtures.py",           # gate 8: the oracle and saboteur read truth by design
+    # --- Phase 11's report ----------------------------------------------------
+    "hisaab/report/metric_block.py",  # transitive: imports Metrics/Cell for the type and
+                                       # metric_block() itself, never Truth or truth_io. Same
+                                       # trade as hisaab/scoring/report.py above, made for the
+                                       # same reason: this module rebuilds a Metrics object
+                                       # from the persisted JSON document (landings is never
+                                       # serialized) so it can call the real, unmodified
+                                       # metric_block() rather than re-deriving its text.
     # Deliberately ABSENT: hisaab/scoring/verdict_io.py. It validates the matcher's
     # output -- the one scoring job with no business seeing the answers -- so it takes
     # the credit IDs, seed and month as plain arguments and imports no sibling that

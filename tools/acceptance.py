@@ -164,6 +164,24 @@ SELF_CHECK_MODULES: tuple[str, ...] = (
     # was the omission gate 17's own module-count check exists to catch -- see that check's
     # comment on ``cluster.py`` slipping past a hardcoded tuple the same way.
     "hisaab.explain.qa",
+    # --- Phase 11, the report. ``assemble`` first: it defines ``ReportInput`` and reads
+    # nothing else in this package. The five section renderers after it (``header``,
+    # ``metric_block``, ``exceptions``, ``matched``, ``qa``) are leaves with respect to each
+    # other -- none imports another -- so they are listed in the order Step 3-7 built them
+    # in, not by any dependency among themselves. ``html`` last: it is the only module here
+    # that imports the other six, so a broken section should be reported as that section
+    # breaking, not as ``html`` breaking.
+    "hisaab.report.assemble",
+    "hisaab.report.header",
+    # ``metric_block`` is the one entry in this block that also appears in
+    # ``tools/check_isolation.py``'s ``TRUTH_READERS`` -- see that module's docstring for
+    # why reconstructing ``roi()``'s easy/hard split needs the real, unmodified
+    # ``hisaab.scoring.report.metric_block()`` rather than a re-derivation from JSON alone.
+    "hisaab.report.metric_block",
+    "hisaab.report.exceptions",
+    "hisaab.report.matched",
+    "hisaab.report.qa",
+    "hisaab.report.html",
 )
 
 #: Gate 3's seed matrix. Seed 99 is absent on purpose: it is the holdout, and it is
@@ -4082,6 +4100,242 @@ def gate_17_explain(full: bool = True) -> None:
           f"an invented term in an otherwise-closing sum is refused")
 
 
+def gate_18_report(sizes: tuple[int, ...] = (60, 200)) -> None:
+    """Phase 11: the HTML report renders all five sections, reproducibly, with no truth leak.
+
+    Five properties:
+
+      * **Clean mode renders a complete page with an empty queue and no Q&A.** The control:
+        every check below would also pass on a page that rendered nothing at all, so the
+        vacuity case comes first -- all five section headers present, the match definition
+        quoted, the queue's own absence note, the Q&A section's own absence note.
+      * **A messy run renders a non-empty queue and at least one RESOLVED row's full
+        decomposition**, re-parsed from the rendered *text* and checked to sum to the stated
+        credit amount -- not trusted because ``Verdict.__post_init__`` already checked it
+        once in memory, since the render step is a new place a transcription error could be
+        introduced (`.plan/phase11.md` §3).
+      * **Two renders of the same input are byte-identical outside the one timestamp line.**
+        ``strip_generated_at`` locates that line by its own marker; the rest of the page
+        must match exactly.
+      * **The truth-vocabulary grep passes, scoped to two documented, measured exceptions.**
+        ``truth.json`` and ``true_`` must not appear at all. Bare ``resolvable`` may appear
+        only inside ``metric_block()``'s own shipped "Missed" caption -- a fact this phase's
+        own build discovered empirically (``hisaab/report/html.py``'s self-check comment):
+        a literal "ban resolvable" gate fails on every real report, not just a leaking one,
+        because that caption is static Phase 9 prose this phase quotes verbatim rather than
+        rewords. ``tier`` is not checked at all -- it is matcher-side vocabulary
+        (``hisaab/report/matched.py``'s own docstring), a different leaf of the same
+        reasoning check 8a's ``hisaab/explain`` exemption uses.
+      * **Two runs cannot be rendered as one.** Metrics from a different run than
+        matches.json must refuse with exit 1, the same provenance check
+        ``verdict_io.reconcile`` already makes for the matcher and scorer.
+    """
+    from hisaab.report.html import GENERATED_AT_MARKER, strip_generated_at
+    from hisaab.report.matched import MAX_ROWS_LISTED as REPORT_MAX_ROWS_LISTED
+
+    print(f"\ngate 18 -- the HTML report on sizes {list(sizes)}")
+
+    with tempfile.TemporaryDirectory(prefix="hisaab-report-") as tmp:
+        root = Path(tmp)
+
+        def _pipeline(base: Path, *, all_mess: bool, n: int, seed: int = 1) -> tuple[Path, Path, Path, Path]:
+            data, truth = base / "data", base / "truth"
+            gen_argv = [
+                sys.executable, "-m", "hisaab.generator",
+                "--seed", str(seed), "--n", str(n), "--month", "2026-08",
+                "--out", str(data), "--truth", str(truth), "--quiet",
+            ]
+            if all_mess:
+                gen_argv.append("--all-mess")
+            _run(gen_argv, f"generator{' --all-mess' if all_mess else ''}, n={n}, seed={seed}")
+
+            matches = base / "matches.json"
+            match_argv = [
+                sys.executable, "-m", "hisaab.matcher",
+                "--data", str(data), "--out", str(matches),
+                "--seed", str(seed), "--month", "2026-08", "--quiet",
+            ]
+            if all_mess:
+                match_argv += ["--window", str(MESS_WINDOW_DAYS)]
+            _run(match_argv, f"matcher{' --all-mess' if all_mess else ''}, n={n}")
+
+            metrics_path = base / "metrics.json"
+            _run(
+                [
+                    sys.executable, "-m", "hisaab.scoring",
+                    "--matches", str(matches), "--truth", str(truth),
+                    "--out", str(metrics_path), "--quiet",
+                ],
+                f"scorer, n={n}",
+            )
+            triage_path = base / "triage.json"
+            _run(
+                [
+                    sys.executable, "-m", "hisaab.triage",
+                    "--matches", str(matches), "--data", str(data),
+                    "--out", str(triage_path), "--quiet",
+                ],
+                f"triage, n={n}",
+            )
+            return matches, metrics_path, triage_path, truth
+
+        def _render(matches: Path, metrics: Path, triage: Path, out: Path) -> str:
+            _run(
+                [
+                    sys.executable, "-m", "hisaab.report",
+                    "--matches", str(matches), "--metrics", str(metrics),
+                    "--triage", str(triage), "--out", str(out), "--quiet",
+                ],
+                f"report -> {out.name}",
+            )
+            return out.read_text(encoding="utf-8")
+
+        # --- the control: clean mode, no queue, no Q&A ------------------------------------
+        clean = root / "clean"
+        c_matches, c_metrics, c_triage, _ = _pipeline(clean, all_mess=False, n=60)
+        page = _render(c_matches, c_metrics, c_triage, clean / "report.html")
+        for section in ("Header", "Metric block", "Exception queue", "Matched records", "Q&amp;A"):
+            if section not in page:
+                raise GateFailure(f"clean report is missing the {section!r} section")
+        if "set equality" not in page:
+            raise GateFailure("clean report does not quote the match definition")
+        if "Exception queue: empty" not in page:
+            raise GateFailure("clean mode resolves every row, so the queue must render empty")
+        if "Q&amp;A: none" not in page:
+            raise GateFailure("no --ask was ever run, so the Q&A section must say so")
+        print("    clean mode        all 5 sections, empty queue, no Q&A -- exit 0")
+
+        # --- the real thing: a messy run with a non-empty queue and RESOLVED rows --------
+        for n in sizes:
+            base = root / f"mess-n{n}"
+            matches, metrics_path, triage_path, truth = _pipeline(base, all_mess=True, n=n)
+            page = _render(matches, metrics_path, triage_path, base / "report.html")
+
+            verdicts = json.loads(matches.read_text(encoding="utf-8"))["verdicts"]
+            resolved = [v for v in verdicts if v["outcome"] == "RESOLVED"]
+            unresolved = [v for v in verdicts if v["outcome"] != "RESOLVED"]
+            if not unresolved:
+                raise GateFailure(
+                    f"n={n}: --all-mess produced no exception/ignored row -- the queue check "
+                    f"below would be vacuous"
+                )
+            if "Exception queue: empty" in page:
+                raise GateFailure(
+                    f"n={n}: --all-mess produced {len(unresolved)} unresolved row(s), but the "
+                    f"report renders an empty queue"
+                )
+
+            # --- re-parse a rendered decomposition from the page's own text, and sum it ---
+            # Matched records truncates at MAX_ROWS_LISTED, in matches.json's own order --
+            # so the sample must come from that same prefix, or "not found" would mean
+            # "truncated" rather than "missing".
+            listed_first = verdicts[:REPORT_MAX_ROWS_LISTED]
+            sample = next((v for v in listed_first if v["outcome"] == "RESOLVED"), None)
+            if sample is None:
+                raise GateFailure(
+                    f"n={n}: none of the first {REPORT_MAX_ROWS_LISTED} verdicts (the ones "
+                    f"Matched records actually renders) is RESOLVED, so there is no "
+                    f"decomposition on the page to check"
+                )
+            credit_id = sample["credit_id"]
+            row_start = page.find(f"{credit_id:<8} RESOLVED")
+            if row_start == -1:
+                raise GateFailure(f"n={n}: {credit_id} (RESOLVED) is not rendered in the page at all")
+            row_end = page.find("\n", row_start)
+            row_line = page[row_start:row_end if row_end != -1 else len(page)]
+
+            def _to_paise(sign: str, val: str) -> int:
+                p = round(float(val.replace(",", "")) * 100)
+                return -p if sign == "-" else p
+
+            terms = re.findall(
+                r"(gross|fee|GST|TDS|refunds|reserve) (-?)₹([\d,]+\.\d{2})", row_line
+            )
+            # ``html.escape`` turns the literal "->" into "-&gt;" -- the page went through
+            # that escape before this gate ever reads it, so the pattern has to match what
+            # is actually on the page, not what matched.py wrote before rendering.
+            expected_m = re.search(r"-&gt; expected (-?)₹([\d,]+\.\d{2})", row_line)
+            if not terms or not expected_m:
+                raise GateFailure(
+                    f"n={n}: {credit_id}'s rendered row has no decomposition bracket:\n{row_line}"
+                )
+            gross = None
+            deductions = 0
+            for label, sign, val in terms:
+                p = _to_paise(sign, val)
+                if label == "gross":
+                    gross = p
+                else:
+                    deductions += p
+            if gross is None:
+                raise GateFailure(
+                    f"n={n}: {credit_id}'s rendered decomposition has no gross term:\n{row_line}"
+                )
+            expected = _to_paise(expected_m.group(1), expected_m.group(2))
+            if gross - deductions != expected:
+                raise GateFailure(
+                    f"n={n}: {credit_id}'s rendered decomposition does not sum: gross {gross} "
+                    f"minus terms {deductions} = {gross - deductions}, but the row states "
+                    f"expected {expected}. This is the arithmetic Verdict.__post_init__ already "
+                    f"checked once in memory -- a mismatch here means the render step, not the "
+                    f"verdict, introduced a transcription error.\n{row_line}"
+                )
+            print(
+                f"    n={n:<4} queue non-empty ({len(unresolved)} row(s)), "
+                f"{credit_id}'s rendered decomposition sums exactly"
+            )
+
+            # --- truth-vocabulary grep, scoped to the two measured exceptions ------------
+            lowered = page.lower()
+            if re.search(r"\btruth\.json\b", lowered):
+                raise GateFailure(f"n={n}: 'truth.json' leaked into the rendered page")
+            if re.search(r"\btrue_", lowered):
+                raise GateFailure(f"n={n}: 'true_*' leaked into the rendered page")
+            bare_resolvable = len(re.findall(r"\bresolvable\b", page, re.IGNORECASE))
+            caption_count = page.count("resolvable, but it abstained")
+            if bare_resolvable != caption_count:
+                raise GateFailure(
+                    f"n={n}: 'resolvable' appears {bare_resolvable} time(s) but only "
+                    f"{caption_count} of them are metric_block()'s own shipped Missed-line "
+                    f"caption -- something else is leaking truth-side vocabulary."
+                )
+
+            # --- reproducibility: two renders differ only in the generated-at line ------
+            page2 = _render(matches, metrics_path, triage_path, base / "report2.html")
+            if strip_generated_at(page) != strip_generated_at(page2):
+                raise GateFailure(
+                    f"n={n}: two renders of the same input differ outside the "
+                    f"{GENERATED_AT_MARKER!r} line"
+                )
+        print("    truth-vocabulary grep clean (scoped); two renders byte-identical outside "
+              "the timestamp")
+
+        # --- and it refuses two runs pretending to be one --------------------------------
+        # Seed 2, not seed 1: every pipeline above ran at seed 1, so a metrics document from
+        # that same seed would agree with c_matches's provenance by accident and this check
+        # would pass on a run that was never actually refused.
+        other = root / "other-seed"
+        _, other_metrics, _, _ = _pipeline(other, all_mess=False, n=60, seed=2)
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "hisaab.report",
+                "--matches", str(c_matches), "--metrics", str(other_metrics),
+                "--triage", str(c_triage), "--out", str(root / "bad.html"),
+            ],
+            cwd=ROOT, capture_output=True, text=True, env={**_env(), "PYTHONUTF8": "1"},
+        )
+        if proc.returncode != 1:
+            raise GateFailure(
+                f"clean matches.json against a --all-mess metrics document exited "
+                f"{proc.returncode}, expected 1. Rendering one run's verdicts beside another "
+                f"run's score would produce a plausible report about a run that never "
+                f"happened.\n{proc.stdout[:400]}\n{proc.stderr[:400]}"
+            )
+        if "REFUSING TO RENDER" not in proc.stderr:
+            raise GateFailure(f"refused without saying so:\n{proc.stderr[:400]}")
+        print("    mismatched runs refused (exit 1)")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-10).")
     p.add_argument("--skip-slow", action="store_true",
@@ -4143,6 +4397,10 @@ def main(argv: list[str] | None = None) -> int:
         # fabrication check, which is the one the phase rests on. Nothing here needs a
         # network, a key, or the optional extra installed.
         lambda: gate_17_explain(full=not args.skip_slow),
+        # Honours --skip-slow: n=200 adds nothing gate 18 needs that n=60 does not already
+        # give it. The queue is non-empty and carries a RESOLVED row inside the truncated
+        # prefix at both sizes; a bigger pool does not change what this gate is checking.
+        lambda: gate_18_report((60,) if args.skip_slow else (60, 200)),
     ]
     try:
         for gate in gates:
@@ -4152,7 +4410,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all seventeen gates pass -- Phases 1 through 10 are complete")
+    print("all eighteen gates pass -- Phases 1 through 11 are complete")
     print("\nPhase 9 turned the scored run into a work queue -- grouped by cause, ranked by")
     print("money at risk, priced per group, with a next action and a named missing input each.")
     print("It reads matches.json and data/ only: hisaab/triage is on MATCHER_PACKAGES, so the")
@@ -4382,6 +4640,45 @@ def main(argv: list[str] | None = None) -> int:
     print("import blocked at the meta-path level, and _client() is required to refuse with")
     print("install instructions rather than fail obscurely. Nothing else in this suite needs")
     print("it installed.")
+    print("\nPhase 11 is a renderer, not a decision: it reads the (up to) five documents a run")
+    print("already wrote and prints one self-contained HTML page, stdlib only. Two gaps closed")
+    print("first -- `--out` on the scorer and the queue, mirroring what `hisaab.explain` already")
+    print("had -- and one gap stayed closed on purpose: `Metrics.as_json()` never serializes")
+    print("`landings`, so the matched-records section reads `matches.json` alone rather than")
+    print("joining a field that does not exist in any file on disk. What `Verdict.as_json()`")
+    print("already carries -- the full six-term decomposition, guaranteed to balance by")
+    print("`Verdict.__post_init__` at construction time -- turned out to be everything the")
+    print("section needed; gate 18 re-parses that decomposition back out of the rendered TEXT")
+    print("and sums it again, because the render step is a new place a transcription error")
+    print("could be introduced even though the verdict itself cannot be wrong.")
+    print("\nNo canonical match-definition sentence existed anywhere before this phase -- the")
+    print("idea was spread across tier1.py's docstring and two ASSUMPTIONS.md rows, phrased")
+    print("differently in each. MATCH_DEFINITION in hisaab/common/verdict.py is now the one")
+    print("sentence a header, a future README edit, or a judge's question can all quote instead")
+    print("of re-deriving a fourth phrasing at render time.")
+    print("\nThe truth-vocabulary grep gate 18 runs found something the plan did not predict.")
+    print("`tier` was already flagged as matcher-side vocabulary safe to render. `resolvable`")
+    print("was not, and a literal ban on it fails on every real report: hisaab/scoring/report.py's")
+    print("own shipped metric_block() prints a fixed caption on its Missed line --")
+    print("'resolvable, but it abstained' -- static Phase 9 prose this phase is required to")
+    print("quote verbatim rather than reword. Gate 18 scopes around that one exact string and")
+    print("still fails on any other occurrence, so a real leak elsewhere is still caught.")
+    print("\nThe report package earned one narrow, documented tools/check_isolation.py")
+    print("TRUTH_READERS entry -- hisaab/report/metric_block.py -- for the same reason")
+    print("hisaab/scoring/report.py itself already carries one: quoting metric_block()'s text")
+    print("verbatim means calling the real function, and that function reads m.landings, a")
+    print("field that exists only on the in-memory Metrics object. Two shortcuts that looked")
+    print("equivalent were tried and proven wrong by construction before the exact reconstruction")
+    print("formula was found: a planted-unresolvable row dismissed via IGNORED rather than raised")
+    print("as an EXCEPTION breaks the cell-only split, and a noise row wrongly RESOLVED breaks")
+    print("the shortcut named in report.py's own docstring. The module never touches")
+    print("hisaab.scoring.truth_io and is handed nothing but a JSON document a run already")
+    print("wrote to disk -- the property that matters is enforced structurally, not by the")
+    print("allowlist alone.")
+    print("\nA run with no explain artifact and no --ask still renders a complete page: every")
+    print("group falls back to its template hint with a visible note saying so, and the Q&A")
+    print("section says plainly that no question was recorded. Phase 10's optional layer stays")
+    print("optional all the way to the page a person actually opens.")
     return 0
 
 

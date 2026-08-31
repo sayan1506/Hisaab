@@ -71,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet", action="store_true",
         help="print only the JSON line, for a caller that parses rather than reads",
     )
+    p.add_argument(
+        "--out", type=Path, metavar="PATH",
+        help="also write the metric block as JSON here, for Phase 11's report to read",
+    )
     return p
 
 
@@ -126,6 +130,15 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         print()
         print(full_report(metrics))
+
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(
+            json.dumps(document, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        if not args.quiet:
+            print(f"\n  wrote {args.out.as_posix()}")
     return EXIT_OK
 
 

@@ -46,10 +46,10 @@ the matcher guessed on rows where the inputs contain no answer.
 
 ## Quick start
 
-Python 3.12. **The core has no dependencies** — the generator, matcher, scorer and
-exception queue are standard library only, so everything below runs from a fresh clone
-with no install step and no virtualenv. Phase 10's LLM layer (`hisaab/explain`) is the
-one exception and needs one package, installed deliberately:
+Python 3.12. **The core has no dependencies** — the generator, matcher, scorer, exception
+queue and HTML report are standard library only, so everything below runs from a fresh
+clone with no install step and no virtualenv. Phase 10's LLM layer (`hisaab/explain`) is
+the one exception and needs one package, installed deliberately:
 
 ```bash
 pip install -e ".[llm]"     # only for hisaab/explain; nothing else needs it
@@ -237,7 +237,7 @@ python -m hisaab.generator --seed 42 --n 60   # if you have not already
 python tools/acceptance.py
 ```
 
-Seventeen gates, one command, exit code is the verdict. Byte-identical output at a fixed
+Eighteen gates, one command, exit code is the verdict. Byte-identical output at a fixed
 seed across two processes; invariants on three seeds in memory and again re-read from
 disk; the leak audit; truth isolation; throughput; the assumptions file; the four
 known-answer fixtures; the matcher at 100/100/0 across three seeds × two sizes, including
@@ -253,7 +253,12 @@ complete, correctly valued, genuinely ranked, and honest about its own ROI claim
 17, which runs the model layer offline against a frozen fixture and a recorded client —
 proving the citation check, fabrication rejection, per-module resilience when the SDK is
 absent, and (via `qa.py`) that an invented term inside an otherwise-closing sum is refused
-by name.
+by name; and gate 18, which renders the HTML report end to end, re-sums a rendered
+decomposition off the page's own text rather than trusting the verdict that produced it,
+requires two renders of the same input byte-identical outside one timestamp line, and
+greps the page for truth vocabulary — scoped around the one caption `metric_block()`
+itself ships that legitimately contains the word "resolvable" — so a real leak elsewhere
+still fails it.
 
 Gate 10 is the one worth reading the source of, because of what it declines to assert. The
 plan called for a flat 100/100/0 under `--fees --settlement-delay`; measurement said the
@@ -289,7 +294,7 @@ while blind to its only correctness failure.
 
 ---
 
-## Current state — Phase 10 of 13
+## Current state — Phase 11 of 13
 
 | | Phase | State |
 |---|---|---|
@@ -304,7 +309,8 @@ while blind to its only correctness failure.
 | ✅ | **8. Foreign currency and patchy UTRs** | Done. `--fx` costs ~19% coverage on purpose — Tier 2's uniqueness inference is voided, not widened, when a foreign payment sits in the pool |
 | ✅ | **9. Exception ranking** | Done. The scored run becomes a triaged queue, grouped by cause, ranked by money, priced per group — and the ROI claim's sign error from Phase 2 is fixed and now withheld on any run with a wrong match |
 | ✅ | **10. LLM layer** | Done. `hisaab/explain` — citation-checked explanations and arithmetic-checked Q&A over RESOLVED rows, isolated from every privileged input, gated offline against a frozen fixture |
-| ⬜ | 11–13. HTML report, holdout, write-up | Next |
+| ✅ | **11. HTML report** | Done. `hisaab/report` — reads the (up to) five documents a run already wrote and renders one self-contained page, stdlib only; reproducible outside a single timestamp line, and re-checks every rendered decomposition's arithmetic against the text on the page rather than trusting it was correct in memory |
+| ⬜ | 12–13. Holdout, write-up | Next |
 
 The scorer was built **before** the matcher on purpose. Building it second means spending
 Phase 3 eyeballing CSVs to decide whether a change helped; building it first turns every

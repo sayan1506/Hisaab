@@ -486,6 +486,7 @@ def ask_row(
     *,
     model: str,
     client: Any | None = None,
+    out: Path | None = None,
 ) -> int:
     """The other half of step 7: one question, one RESOLVED row, checked by arithmetic.
 
@@ -493,6 +494,10 @@ def ask_row(
     single row an operator points at, not a batch pass over the queue, and the two features
     read disjoint row sets for the reason ``qa.py``'s docstring measured: an exception row
     has no decomposition to check a claim against, and a resolved row has nothing else.
+
+    ``out``, when given, persists the ``Answer`` as JSON via its own ``as_json()`` -- Phase
+    11 step 7, so the report's one Q&A section reads a recorded artifact rather than only a
+    transcript printed to a terminal that closed.
     """
     print(f"explain: asking about {row['credit_id']} via "
           f"{'a recorded double' if client is not None else client_mod.base_url()}, "
@@ -510,6 +515,15 @@ def ask_row(
         )
         print(f"     arithmetic: {terms} -> total {(answer.arithmetic or {}).get('total_paise')}p")
     print(f"  {answer.summary()}")
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(answer.as_json(), indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"\n  wrote {out.as_posix()}")
+
     if not answer.ok:
         print("\n  problem(s):", file=sys.stderr)
         for f in answer.findings:
@@ -565,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"available. Only a resolved row has a decomposition to answer questions "
                     f"against; an exception row has none, by definition."
                 )
-            return ask_row(row, question, model=args.model)
+            return ask_row(row, question, model=args.model, out=args.out)
 
         if args.fixture or args.matches is None:
             groups = groups_from_fixture(FIXTURE_PATH)

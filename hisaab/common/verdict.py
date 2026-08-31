@@ -56,6 +56,19 @@ VERDICT_SCHEMA_VERSION = 2
 
 MATCHES_JSON = "matches.json"
 
+#: The one-sentence definition of a match, quotable verbatim rather than re-derived from
+#: prose at render time. `.plan/phase11.md` measured that no single canonical sentence existed
+#: anywhere in the tree: `matcher/tier1.py`'s docstring, and `ASSUMPTIONS.md` #30 and #31, each
+#: state part of it in different words, and none is a named constant either a report or
+#: `README.md` can import or quote. Composed from all three rather than picking one, because
+#: each names something the others do not -- #30 the unit of account, #31 the equality rule,
+#: `tier1.py`'s own line the level (bank credit, not payment).
+MATCH_DEFINITION = (
+    "A match is exact set equality between the payments a credit resolves to and the "
+    "payments truth says produced it, at the bank-credit level -- no partial credit, no "
+    "tolerance."
+)
+
 
 class Outcome(str, Enum):
     """What the matcher decided about one bank row."""
@@ -386,6 +399,11 @@ if __name__ == "__main__":
         except (ValueError, TypeError):
             return
         raise AssertionError(f"Verdict accepted {label}")
+
+    # --- the canonical match definition, quoted rather than re-derived ----
+    assert MATCH_DEFINITION.strip() and MATCH_DEFINITION[0].isupper()
+    assert "set equality" in MATCH_DEFINITION and "bank-credit" in MATCH_DEFINITION
+    assert "no partial credit" in MATCH_DEFINITION
 
     # --- the decomposition, on its own ------------------------------------
     # The track spec's worked example: a Rs 1,111 card sale, 2% fee, 18% GST on the fee.

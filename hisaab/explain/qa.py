@@ -246,6 +246,33 @@ class Answer:
         how = "containment + arithmetic" if self.arithmetic_checked else "containment only"
         return f"{self.credit_id}: {state} ({how})"
 
+    def as_json(self) -> dict[str, Any]:
+        """Every field, reusing the dataclass's own -- no second shape to keep in sync.
+
+        Phase 11 step 7: a Q&A section that is a recorded artifact rather than only a
+        printed transcript. ``usage`` is flattened to the four counters ``cli.py``'s own
+        artifact already prints, not the ``Usage`` object itself -- the same reasoning as
+        ``VerdictFile.as_json`` confining non-determinism to one block: two runs of the same
+        question against the same row should differ only in usage, never in the answer or
+        the check.
+        """
+        return {
+            "credit_id": self.credit_id,
+            "question": self.question,
+            "answer": self.answer,
+            "cited_row_ids": list(self.cited_row_ids),
+            "cited_amounts_paise": list(self.cited_amounts_paise),
+            "arithmetic": self.arithmetic,
+            "ok": self.ok,
+            "findings": list(self.findings),
+            "usage": {
+                "input_tokens": self.usage.input_tokens,
+                "output_tokens": self.usage.output_tokens,
+                "cache_read_input_tokens": self.usage.cache_read,
+                "cache_creation_input_tokens": self.usage.cache_creation,
+            },
+        }
+
 
 def verify_answer(row: dict[str, Any], payload: dict[str, Any]) -> tuple[str, ...]:
     """Findings for one answer: containment, then arithmetic. Returns, never raises.
@@ -459,6 +486,24 @@ def _self_check() -> None:
     # A null arithmetic must verify on containment alone, and must be visible as such.
     no_math = {**good, "arithmetic": None}
     assert verify_answer(row, no_math) == (), "a containment-only answer was rejected"
+
+    # --- as_json: Phase 11 step 7's persisted artifact, reusing this dataclass ------
+    answer = Answer(
+        credit_id="C0001", question="why is this less than the gross?",
+        answer="fees and taxes were withheld", cited_row_ids=("C0001",),
+        cited_amounts_paise=(20679,), arithmetic=good["arithmetic"], findings=(),
+        usage=client_mod.Usage(input_tokens=100, output_tokens=20,
+                               cache_creation=0, cache_read=50),
+    )
+    doc = answer.as_json()
+    assert doc["credit_id"] == "C0001" and doc["ok"] is True and doc["findings"] == []
+    assert doc["arithmetic"] == good["arithmetic"]
+    assert doc["usage"] == {
+        "input_tokens": 100, "output_tokens": 20,
+        "cache_read_input_tokens": 50, "cache_creation_input_tokens": 0,
+    }
+    # JSON round-trips cleanly -- no tuple, no Usage object, nothing but plain types.
+    assert json.loads(json.dumps(doc)) == doc
 
     # --- the vacuity controls -----------------------------------------------------
     ids, amounts = universe(row)
