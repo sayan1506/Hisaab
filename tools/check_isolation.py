@@ -10,7 +10,7 @@ failure is silent and total: a matcher that reads the answer key still produces 
 match rate, an exception list and a confident-looking report. Nothing crashes. The
 submission is simply void, and the only way to know is to have checked.
 
-Six checks, all static -- no imports are executed, so this cannot be defeated by
+Eight checks, all static -- no imports are executed, so this cannot be defeated by
 a module that behaves differently when imported:
 
   1. Nothing on the matching path imports ``hisaab.scoring`` or ``truth_io``.
@@ -19,6 +19,14 @@ a module that behaves differently when imported:
   4. ``data/`` holds no truth file, and ``truth/`` holds no CSV.
   5. No CSV under ``data/`` contains a path reference into ``truth/``.
   6. Nothing on the matching path imports ``hisaab.generator``.
+  7. Only ``matcher/adjustments.py`` imports the declared-fee report.
+  8. Nothing on the matching path can reach a network or a model -- neither
+     directly (``urllib``, ``anthropic``) nor through ``hisaab.explain``.
+
+The header said "Six checks" until Phase 10 while check 7 had existed since
+Phase 6. Worth naming rather than quietly fixing: the count in the prose is what a
+reader trusts when deciding whether a rule is enforced, and it had been wrong for
+two phases in the file whose entire job is not taking claims on trust.
 
 In Phase 1 the matching path does not exist yet, so checks 1 and 2 scan an empty
 set. That is the point of writing this now: the moment ``hisaab/matcher/`` appears
@@ -169,6 +177,129 @@ ADJUSTMENT_IMPORT_PREFIXES: tuple[str, ...] = (
     "matcher.adjustments",
 )
 
+# --------------------------------------------------------------------------------
+# Check 8 -- the matching engine cannot reach a network or a model.
+#
+# "The matching engine is deliberately not AI" is the headline design claim of this
+# project. Until Phase 10 it had **no assertion behind it**: nothing in this file
+# mentioned a network, so ``matcher/tier1.py`` could have called a model mid-match and
+# all sixteen acceptance gates would have passed green. The claim was load-bearing in
+# the write-up and unenforced in the code, which is the exact shape of every other
+# footgun this file exists to close.
+#
+# It matters more than it sounds. A model asked "does this credit match this
+# settlement?" would produce *plausible* verdicts, so coverage and correctness would
+# still compute, still look reasonable, and mean nothing -- the numbers would measure a
+# guess. That is the same failure as reading truth.json, arrived at from the opposite
+# direction: instead of leaking the answer in, it fabricates one on the spot.
+#
+# **Scope is every ``.py`` under ``hisaab/``, not just MATCHER_PACKAGES.** Written the
+# narrow way this check would have shipped with a hole: ``hisaab/common/`` is imported
+# *by* the matcher, so one network import in ``common/money.py`` reaches the matching
+# path while sitting outside the tuple. That is precisely the mistake check 6 made and
+# the comment on MATCHER_PACKAGES above records -- it was scoped to the tuple, so triage
+# could import the generator until triage was added to it. Once is a lesson; twice would
+# be a habit. Default-deny over the package, one named exemption.
+#
+# ``tools/`` is deliberately outside this scan. The harness legitimately shells out --
+# ``acceptance.py``, ``fixtures.py`` and ``repro_check.py`` all import ``subprocess`` --
+# and none of it participates in matching. Gate 17 lives there and may import the
+# explain package to test it.
+
+#: Imports that mean "this module can reach a network or a model", each mapped to
+#: ``(category, why)``. The category decides whether ``hisaab/explain`` is exempt.
+#:
+#: **Measured before arming, across 18 matching-path files and all 30 under**
+#: ``hisaab/``: **0 would-be violations**, and 0 hits for ``urllib``/``http``/
+#: ``socket``/``ssl`` anywhere in the tree including ``tools/``. So the ban costs
+#: nothing to arm and nothing legitimate trips it -- which is the only state in which a
+#: new default-deny rule should land, because a check that fails on arrival gets
+#: weakened instead of obeyed.
+#:
+#: **``asyncio`` is deliberately NOT here**, and that is a decision rather than an
+#: oversight. Async is a concurrency model, not a network; banning it would punish code
+#: that has nothing to do with this claim, and every actual way out is already on the
+#: list. A later reader tempted to "complete" the list should leave it out.
+BANNED_IMPORTS: dict[str, tuple[str, str]] = {
+    # --- category "network": reaching outward. hisaab/explain IS exempt from these,
+    #     because calling the model is its entire job.
+    "urllib": ("network", "stdlib HTTP client"),
+    "http": ("network", "stdlib HTTP"),
+    "socket": ("network", "raw sockets"),
+    "ssl": ("network", "TLS, i.e. a socket with a certificate"),
+    "ftplib": ("network", "stdlib FTP"),
+    "smtplib": ("network", "stdlib SMTP"),
+    "poplib": ("network", "stdlib POP3"),
+    "imaplib": ("network", "stdlib IMAP"),
+    "telnetlib": ("network", "stdlib telnet"),
+    "xmlrpc": ("network", "stdlib XML-RPC"),
+    "webbrowser": ("network", "opens a URL"),
+    "requests": ("network", "third-party HTTP client"),
+    "httpx": ("network", "third-party HTTP client"),
+    "urllib3": ("network", "third-party HTTP client"),
+    "aiohttp": ("network", "third-party HTTP client"),
+    "websockets": ("network", "third-party websocket client"),
+    "anthropic": ("network", "model SDK"),
+    "openai": ("network", "model SDK"),
+    "cohere": ("network", "model SDK"),
+    "mistralai": ("network", "model SDK"),
+    "litellm": ("network", "model gateway"),
+    "langchain": ("network", "model framework"),
+    "llama_cpp": ("network", "local model runtime"),
+    "transformers": ("network", "local model runtime"),
+    "torch": ("network", "local model runtime"),
+    # --- category "reach": not a network, but a way to get to one without importing
+    #     one. NOTHING is exempt from these, hisaab/explain included: the explain
+    #     package needs an HTTP client, and it does not need to spawn processes or
+    #     resolve imports by string. Banning them keeps check 8 from being a rule about
+    #     spelling -- `subprocess.run(["curl", url])` reaches a model with no banned
+    #     module named anywhere, and `importlib.import_module("anthropic")` defeats the
+    #     AST import scan outright.
+    #
+    #     Measured: nothing under hisaab/ imports any of these today, so this half is
+    #     also free. A static check cannot stop a determined evader, and this does not
+    #     pretend to -- it removes the accidental and the casual routes, and states the
+    #     rule where the next author will read it.
+    "subprocess": ("reach", "can run curl, or another python"),
+    "importlib": ("reach", "can import a banned module by string, dodging this scan"),
+    "ctypes": ("reach", "can call a socket through the C library"),
+    "multiprocessing": ("reach", "spawns interpreters this scan never sees"),
+}
+
+#: The one tree exempt from the ``network`` half of check 8 -- the package whose job is
+#: calling the model. One entry, listed rather than prefixed, the same discipline as
+#: ``TRUTH_READERS``.
+#:
+#: **What the exemption does NOT buy, and this is the good part.** ``hisaab/explain``
+#: stays on ``MATCHER_PACKAGES``, so it keeps inheriting checks 1, 2, 6 and 7: the model
+#: layer **cannot read truth.json, cannot import the generator, and cannot read the
+#: declared fee columns**. So the component that talks to an LLM is the one component
+#: with no privileged information at all -- it explains rows from the same inputs a
+#: human reconciler would have, and every prompt it builds is auditable for that. The
+#: exemption is narrow on purpose: one category, one tree.
+NETWORK_EXEMPT_TREES: tuple[str, ...] = ("hisaab/explain",)
+
+#: Check 8b -- module names that reach the explain package however they are spelled.
+#: Relative spellings resolve to these too; see ``imports_of``.
+EXPLAIN_IMPORT_NAMES: tuple[str, ...] = ("hisaab.explain",)
+
+#: Trees allowed to import the explain package. **Empty, deliberately.**
+#:
+#: 8a alone would leave the obvious hole: ``matcher/tier1.py`` cannot ``import
+#: anthropic``, but it could ``from ..explain import ask`` and reach the same model
+#: through a module that is allowed to. Then the ban is about spelling rather than
+#: behaviour. So the explain package is a **leaf**: nothing that ships under
+#: ``hisaab/`` may import it, and it is reached two ways instead --
+#: ``python -m hisaab.explain`` as its own entry point, and from ``tools/`` (gate 17),
+#: which this check does not scan.
+#:
+#: Phase 11 renders the report from the **recorded** response artifact rather than by
+#: importing this package, so it needs no entry here. If some later phase genuinely
+#: does, adding one is a deliberate edit with a reason written next to it -- the same
+#: contract as ``ADJUSTMENT_REPORT_READERS``, which exists to keep exactly this kind of
+#: widening from happening quietly.
+EXPLAIN_IMPORT_READERS: tuple[str, ...] = ()
+
 
 class IsolationError(Exception):
     """The matching path can reach the answer key."""
@@ -273,6 +404,46 @@ def imports_adjustments(path: Path) -> list[str]:
     ]
 
 
+def banned_reach(path: Path, *, network_exempt: bool) -> list[str]:
+    """Evidence that ``path`` can reach a network or a model -- check 8a.
+
+    Fourth of the same shape, after ``reads_truth``, ``imports_generator`` and
+    ``imports_adjustments``, and separate for the same reason each of those is: the
+    failure needs its own sentence. This one is not about information leaking *in* at
+    all -- it is about a verdict being **invented**, which no residual can catch,
+    because a fabricated match still produces a decomposition-shaped answer.
+
+    ``network_exempt`` drops the ``network`` category only, for ``hisaab/explain``. The
+    ``reach`` category is never exempt: nothing that ships here needs ``subprocess`` or
+    ``importlib``, and both would turn this check into a rule about spelling.
+    """
+    evidence: list[str] = []
+    for mod in sorted(imports_of(path)):
+        top = mod.split(".")[0]
+        entry = BANNED_IMPORTS.get(top)
+        if entry is None:
+            continue
+        category, why = entry
+        if category == "network" and network_exempt:
+            continue
+        evidence.append(f"line-level import {mod!r} -- {why} [{category}]")
+    return evidence
+
+
+def imports_explain(path: Path) -> list[str]:
+    """Evidence that ``path`` imports the model layer -- check 8b.
+
+    The half that keeps 8a from being about spelling. Without it, ``matcher/tier1.py``
+    cannot ``import anthropic`` but can ``from ..explain import ask`` and reach the
+    same model through the one tree allowed to.
+    """
+    return [
+        f"imports {mod}"
+        for mod in sorted(imports_of(path))
+        if mod in EXPLAIN_IMPORT_NAMES or mod.startswith(tuple(f"{n}." for n in EXPLAIN_IMPORT_NAMES))
+    ]
+
+
 def imports_of(path: Path) -> set[str]:
     """Every module named by an import in ``path``, resolved as dotted strings."""
     try:
@@ -356,6 +527,55 @@ def check(verbose: bool = True) -> dict[str, object]:
                 f"figure, never for the matcher to resolve with.\n"
                 f"  If a verdict genuinely needs this, it does not -- it needs a rate. "
                 f"Add one to fees.py, where being wrong about it shows up as a residual."
+            )
+
+    # --- 8: nothing that ships can reach a network or a model ---------------
+    # Scoped to every .py under hisaab/, NOT to MATCHER_PACKAGES -- see the comment on
+    # BANNED_IMPORTS. hisaab/common/ is imported by the matcher, so a narrow scan would
+    # pass a network import sitting one directory over. tools/ is outside by design.
+    shipped = python_files(ROOT / "hisaab")
+    for path in shipped:
+        name = rel(path)
+        in_explain = any(
+            name.startswith(tree + "/") for tree in NETWORK_EXEMPT_TREES
+        )
+        if evidence := banned_reach(path, network_exempt=in_explain):
+            detail = "\n    ".join(evidence)
+            raise IsolationError(
+                f"{name} can reach a network or a model:\n    {detail}\n"
+                f"  The matching engine is deliberately not AI, and that is this "
+                f"project's headline design claim. A model asked 'does this credit match "
+                f"this settlement?' returns a *plausible* verdict, so coverage and "
+                f"correctness still compute and still look reasonable -- while measuring "
+                f"a guess. That is the truth.json failure reached from the other side: "
+                f"instead of leaking the answer in, it invents one.\n"
+                f"  Model calls live in hisaab/explain/, which is exempt from the "
+                f"network half of this check and from nothing else -- it still cannot "
+                f"read truth.json, import the generator, or read the declared fee "
+                f"columns, so the component that talks to an LLM is the one with no "
+                f"privileged information at all.\n"
+                f"  'reach' entries (subprocess, importlib, ctypes, multiprocessing) are "
+                f"exempt nowhere, explain included: they reach a model without naming "
+                f"one, which would make this check a rule about spelling."
+            )
+
+        # --- 8b: the model layer is a leaf; nothing shipped may import it ----
+        if (
+            not in_explain
+            and not name.startswith(tuple(t + "/" for t in EXPLAIN_IMPORT_READERS))
+            and (evidence := imports_explain(path))
+        ):
+            raise IsolationError(
+                f"{name} imports the model layer ({'; '.join(evidence)}), and "
+                f"EXPLAIN_IMPORT_READERS is deliberately empty.\n"
+                f"  Check 8a stops {name} from importing an HTTP client directly. "
+                f"Without this half it could reach the same model through "
+                f"hisaab.explain, which is allowed to -- and then the ban is about "
+                f"spelling rather than behaviour.\n"
+                f"  The explain package is a leaf, reached two ways instead: "
+                f"`python -m hisaab.explain` as its own entry point, and from tools/ "
+                f"(gate 17), which this check does not scan. Phase 11 renders from the "
+                f"recorded response artifact rather than by importing this package."
             )
 
     # --- 3: only allowlisted modules READ truth; only owners NAME its path ---
@@ -446,6 +666,26 @@ def check(verbose: bool = True) -> dict[str, object]:
                 f"  check 7: the declared fee/gst/tds columns are read only by "
                 f"{ADJUSTMENT_REPORT_MODULE}, which reports and never resolves"
             )
+        print(
+            f"  check 8: {len(shipped)} files under hisaab/ reach no network and no "
+            f"model ({len(BANNED_IMPORTS)} banned imports)"
+        )
+        print(
+            f"    the matching engine is deliberately not AI -- until Phase 10 that "
+            f"claim had no assertion behind it"
+        )
+        print(
+            f"    exempt from the network half: {', '.join(NETWORK_EXEMPT_TREES)} "
+            f"(and from nothing else -- it still cannot read truth or the generator)"
+        )
+        print(
+            f"    exempt from subprocess/importlib/ctypes/multiprocessing: nothing, "
+            f"explain included"
+        )
+        print(
+            f"    modules allowed to import the model layer: "
+            f"{len(EXPLAIN_IMPORT_READERS)} -- it is a leaf on purpose"
+        )
         print("\ngate 5 passes -- the answer key is unreachable from the matching path")
     return report
 

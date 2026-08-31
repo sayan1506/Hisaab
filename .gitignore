@@ -32,8 +32,10 @@ desktop.ini
 Thumbs.db
 $RECYCLE.BIN/
 
-# Virtualenvs. Nothing here pins an environment, because the project is standard
-# library only -- there is no requirements.txt for these to correspond to.
+# Virtualenvs. The core pins nothing -- generator, matcher, scorer and queue are standard
+# library only -- but pyproject.toml exists as of Phase 10 and pins one OPTIONAL extra
+# (`pip install -e ".[llm]"`, for hisaab/explain alone), so a venv here is now a real
+# possibility rather than a hypothetical. The manifest is committed; the environment is not.
 .venv/
 venv/
 env/

@@ -55,7 +55,9 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import csv
+import io
 import json
 import re
 import subprocess
@@ -134,6 +136,34 @@ SELF_CHECK_MODULES: tuple[str, ...] = (
     "hisaab.triage.group",
     "hisaab.triage.value",
     "hisaab.triage.hint",
+    # --- Phase 10, the LLM layer. Listed for the reason the ``fees``/``tier2`` note above
+    # records: four new modules with working self-checks that this list skipped would repeat
+    # exactly that omission, and it would be invisible in the output that exists to make
+    # omissions visible.
+    #
+    # **These four must import with ``anthropic`` absent**, because it is an optional extra
+    # and gate 0 is the gate that proves the core does not need it. That is what
+    # ``client.py``'s in-function import buys, and it is verified rather than assumed: the
+    # self-checks drive ``explain_group`` with a recorded double, so no path here constructs
+    # a real client or touches a network.
+    #
+    # ``hisaab.explain.cli`` is deliberately absent, matching ``hisaab.triage.cli``: a CLI
+    # module's ``__main__`` runs the CLI, so listing it here would have gate 0 attempt a
+    # model call. Dependency order again -- schema and prompt are leaves, verify reads the
+    # prompt's universe, client sends what both build.
+    "hisaab.explain.schema",
+    # ``cluster`` before ``prompt`` because ``prompt`` imports it: the sub-cause split decides
+    # which rows a request sends, so a broken clusterer should be reported as a broken
+    # clusterer rather than as whatever the prompt did with its output.
+    "hisaab.explain.cluster",
+    "hisaab.explain.prompt",
+    "hisaab.explain.verify",
+    "hisaab.explain.client",
+    # ``qa`` last: it imports ``client`` for ``Usage``/``_client`` and reuses ``prompt``'s id
+    # and paise regexes, so a break in either should be reported there, not here. This entry
+    # was the omission gate 17's own module-count check exists to catch -- see that check's
+    # comment on ``cluster.py`` slipping past a hardcoded tuple the same way.
+    "hisaab.explain.qa",
 )
 
 #: Gate 3's seed matrix. Seed 99 is absent on purpose: it is the holdout, and it is
@@ -258,10 +288,204 @@ def gate_4_and_leak_audit() -> None:
             print(f"    {stripped}")
 
 
+#: Gate 5's self-check battery for **check 8** (Phase 10) -- the rule that nothing which
+#: ships can reach a network or a model. Each entry is
+#: ``(label, path to plant, file body, expect_refused, marker the message must carry)``.
+#:
+#: The marker is the point. A mutant that trips *some other* check looks identical from
+#: outside to one check 8 caught, and proves nothing about check 8 -- so each case names
+#: the phrase its owning half raises, and a refusal without that phrase fails the gate as
+#: loudly as no refusal at all.
+_CHECK_8_MUTANTS: tuple[tuple[str, str, str, bool, str], ...] = (
+    (
+        "urllib under hisaab/matcher/",
+        "hisaab/matcher/_m.py",
+        "import urllib.request\n",
+        True,
+        "can reach a network or a model",
+    ),
+    (
+        "the anthropic SDK under hisaab/matcher/",
+        "hisaab/matcher/_m.py",
+        "import anthropic\n",
+        True,
+        "can reach a network or a model",
+    ),
+    (
+        "urllib imported inside a function body",
+        "hisaab/matcher/_m.py",
+        "def go():\n    from urllib import request\n    return request\n",
+        True,
+        "can reach a network or a model",
+    ),
+    (
+        "urllib under hisaab/common/ -- outside MATCHER_PACKAGES, imported by it",
+        "hisaab/common/_m.py",
+        "import urllib.request\n",
+        True,
+        "can reach a network or a model",
+    ),
+    (
+        "relative `from ..explain import ask` inside the matcher",
+        "hisaab/matcher/_m.py",
+        "from ..explain import ask\n",
+        True,
+        "imports the model layer",
+    ),
+    (
+        "absolute `import hisaab.explain.client` inside triage",
+        "hisaab/triage/_m.py",
+        "import hisaab.explain.client\n",
+        True,
+        "imports the model layer",
+    ),
+    (
+        "subprocess inside hisaab/explain/ -- the network-exempt tree",
+        "hisaab/explain/_m.py",
+        "import subprocess\n",
+        True,
+        "can reach a network or a model",
+    ),
+    # --- the two controls. Without these the gate cannot tell a working check from one
+    #     that refuses everything, and "refuses everything" is the cheapest way to make a
+    #     mutation battery look green.
+    (
+        "CONTROL: urllib inside hisaab/explain/ -- the exemption must work",
+        "hisaab/explain/_m.py",
+        "import urllib.request\n",
+        False,
+        "",
+    ),
+    (
+        "CONTROL: hisaab/explain/ importing its own siblings -- must not self-trip 8b",
+        "hisaab/explain/_m.py",
+        "from hisaab.explain import client\nimport hisaab.explain.prompt\n",
+        False,
+        "",
+    ),
+)
+
+
+def _gate_5_self_check() -> int:
+    """Attack check 8 before trusting it, and return the number of cases verified.
+
+    Check 8 went green on its first run across all 42 files under ``hisaab/``, which is
+    exactly the state in which a new default-deny rule is most likely to be silently
+    vacuous -- it is also what a rule that matched *nothing at all* would print. The
+    claim it backs ("the matching engine is deliberately not AI") is this project's
+    headline design commitment, so it gets the same treatment as gates 12-15: plant the
+    violation, require the check to refuse it, and require the refusal to come from the
+    assertion that owns it.
+
+    **Synthetic tree, patched ``ROOT``, restored in a finally.** ``check_isolation``
+    resolves every path from its module-global ``ROOT``, so pointing that at a temp
+    directory makes the tool scan a four-file fake package instead of this repo. Planting
+    a network import into real source and restoring it afterwards would work until the one
+    run that dies between the two, and leaving ``import anthropic`` in ``matcher/`` is the
+    single worst artefact this build could leave behind. The patch is asserted not to leak.
+
+    The split mirrors ``_gate_12_self_check``: the synthetic cases prove the check *can*
+    fail, and the real run below proves this tree *does* pass. Neither claim substitutes
+    for the other -- a check that only ever ran on passing input reports its own silence.
+    """
+    import importlib
+
+    ci = importlib.import_module("check_isolation")
+    real_root = ci.ROOT
+
+    # The four benign files the mutants are planted alongside. Two of them matter beyond
+    # scaffolding: hisaab/common/ is outside MATCHER_PACKAGES but imported by the matcher,
+    # and hisaab/explain/ is the one tree with an exemption.
+    scaffold = {
+        "hisaab/matcher/engine.py": "from hisaab.common import money\n",
+        "hisaab/common/money.py": "PAISE = 100\n",
+        "hisaab/triage/group.py": "from hisaab.common import money\n",
+        "hisaab/explain/client.py": "import json\n",
+    }
+
+    verified = 0
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            for rel, body in scaffold.items():
+                target = tmp / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(body, encoding="utf-8")
+            (tmp / "tools").mkdir()
+            ci.ROOT = tmp
+
+            # The vacuity guard, first: if the synthetic tree fails for any unrelated
+            # reason, every "caught" verdict below is noise rather than evidence.
+            try:
+                ci.check(verbose=False)
+            except ci.IsolationError as e:
+                raise GateFailure(
+                    f"gate 5's self-check baseline failed on its own synthetic tree "
+                    f"({e}). Every mutant result after this would be attributable to "
+                    f"the scaffold rather than to the planted violation."
+                ) from e
+
+            planted = tmp / "hisaab" / "matcher" / "_m.py"
+            for label, rel, body, expect_refused, marker in _CHECK_8_MUTANTS:
+                target = tmp / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(body, encoding="utf-8")
+                try:
+                    ci.check(verbose=False)
+                    refused, message = False, ""
+                except ci.IsolationError as e:
+                    refused, message = True, str(e)
+                finally:
+                    target.unlink()
+                    if planted.exists():
+                        planted.unlink()
+
+                if expect_refused and not refused:
+                    raise GateFailure(
+                        f"check 8 did NOT refuse a planted violation: {label}.\n"
+                        f"  Planted {rel} containing {body.strip()!r}, and "
+                        f"check_isolation passed. The rule that the matching engine "
+                        f"cannot reach a model is unenforced for this case."
+                    )
+                if expect_refused and marker not in message:
+                    raise GateFailure(
+                        f"check 8 refused {label}, but not by its own assertion.\n"
+                        f"  expected the message to carry {marker!r}\n"
+                        f"  got: {message.splitlines()[0] if message else '(empty)'}\n"
+                        f"A mutant caught by some other check looks identical to one "
+                        f"check 8 caught, and proves nothing about check 8."
+                    )
+                if not expect_refused and refused:
+                    raise GateFailure(
+                        f"check 8 raised a FALSE POSITIVE on {label}.\n"
+                        f"  {message.splitlines()[0] if message else ''}\n"
+                        f"  hisaab/explain is exempt from the network half by design -- "
+                        f"calling the model is its entire job. A check that refuses this "
+                        f"forbids the feature it was written to make safe."
+                    )
+                verified += 1
+    finally:
+        ci.ROOT = real_root
+
+    if ci.ROOT != real_root:  # pragma: no cover -- the patch must not survive
+        raise GateFailure("gate 5's self-check leaked its patched ROOT")
+    return verified
+
+
 def gate_5_isolation() -> None:
-    print("\ngate 5 -- truth isolation")
+    print("\ngate 5 -- truth isolation, and the matching engine cannot reach a model")
+    verified = _gate_5_self_check()
+    print(f"    check 8 self-check: {verified} planted cases behave")
+    print(
+        "      7 violations refused, each naming its own assertion; 2 controls pass "
+        "(hisaab/explain may call out, and may import itself)"
+    )
     out = _run([sys.executable, "tools/check_isolation.py", "--quiet"], "check_isolation")
     print(f"    the answer key is unreachable from the matching path{out and ''}")
+    print(
+        "    nothing under hisaab/ imports an HTTP client, a model SDK, subprocess, "
+        "importlib or ctypes"
+    )
 
 
 def gates_1_2_6_reproducibility() -> None:
@@ -3348,10 +3572,520 @@ def gate_16_triage(sizes: tuple[int, ...] = (60, 200)) -> None:
         print(f"    one amount off by 1p refused (ids all match, {before}p vs {before + 1}p)")
 
 
+#: Gate 17's recorded double. A hand-built object rather than a mock framework, for the
+#: reason ``client.py``'s own double states: this asserts the exact shapes the client reads
+#: off a response, and writing them out makes them reviewable.
+#:
+#: It answers each group with citations drawn from **that group's own universe**, so the
+#: clean case is checked against real fixture data rather than against something invented to
+#: satisfy the checker. In ``fabricate`` mode every citation is replaced with a figure and an
+#: id that appear in no row.
+class _ExplainDouble:
+    def __init__(self, groups: list[dict], *, fabricate: bool = False) -> None:
+        from hisaab.explain import prompt as prompt_mod
+
+        self._universe = {
+            id(g): tuple(sorted(u)[:3] for u in prompt_mod.cited_universe(g))
+            for g in groups
+        }
+        self._groups = groups
+        self._fabricate = fabricate
+        self.messages = self
+        self.calls = 0
+        self.systems_seen: list[str] = []
+
+    def create(self, **kwargs: object) -> object:
+        from hisaab.common.reasons import Reason
+        from hisaab.triage.hint import HINTS
+
+        text = kwargs["messages"][0]["content"]  # type: ignore[index]
+        self.systems_seen.append(
+            "".join(b["text"] for b in kwargs["system"])  # type: ignore[index,union-attr]
+        )
+        group = next(
+            (g for g in self._groups
+             if f"Rows in this group: {g['rows']}" in text and g["cause"] in text),
+            self._groups[0],
+        )
+        ids, amounts = self._universe[id(group)]
+        reason = group.get("reason")
+        hint = HINTS.get(Reason(reason)) if reason else None
+        if self._fabricate:
+            ids, amounts = ("setl_999999",), (123456789,)
+        payload = {
+            "summary": f"{group['rows']} rows share one cause.",
+            "why_unresolved": "The input files do not carry the evidence needed.",
+            "next_step": hint.action if hint else "Confirm with whoever knows the account.",
+            "cited_row_ids": list(ids),
+            "cited_amounts_paise": list(amounts),
+        }
+        self.calls += 1
+        # First call writes the cache, later calls read it -- so run()'s step-8 branch is
+        # exercised in both directions rather than only the one this environment produces.
+        return type("R", (), {
+            "content": [type("B", (), {"type": "text", "text": json.dumps(payload)})()],
+            "stop_reason": "end_turn",
+            "parsed_output": None,
+            "usage": type("U", (), {
+                "input_tokens": 1770 + len(text) // 4,
+                "output_tokens": 180,
+                "cache_creation_input_tokens": 1770 if self.calls == 1 else 0,
+                "cache_read_input_tokens": 0 if self.calls == 1 else 1770,
+            })(),
+        })()
+
+
+#: The meta-path blocker gate 17 uses to prove the four ``hisaab.explain`` modules work with
+#: ``anthropic`` absent. Stronger than uninstalling: it refuses the import however the module
+#: is reached, and it proves it blocks before testing anything.
+_NO_SDK_HARNESS = '''
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+class _Block:
+    def find_spec(self, name, path=None, target=None):
+        if name == "anthropic" or name.startswith("anthropic."):
+            raise ModuleNotFoundError(f"No module named {name!r}")
+        return None
+
+sys.meta_path.insert(0, _Block())
+try:
+    import anthropic
+except ModuleNotFoundError:
+    pass
+else:
+    raise SystemExit("BLOCKER FAILED: anthropic imported anyway")
+
+import runpy
+runpy.run_module(sys.argv[1], run_name="__main__")
+'''
+
+
+def gate_17_explain(full: bool = True) -> None:
+    """Phase 10: the LLM layer explains the queue, and every claim it makes is checked.
+
+    **No live call, and that is a design property rather than a convenience.** The whole
+    argument for putting a model near a reconciliation is that its output is verified, so the
+    verification has to be exercised by the gate -- and a gate that needed a key and a
+    network would be skipped on a clean checkout, which is where it matters most. Every check
+    here runs against the frozen fixture with a recorded double.
+
+    Nine properties:
+
+      * **The fixture is what it says it is.** ``explain_fixture.py --check`` rebuilds it from
+        the generator and the matcher and requires it byte-identical. Skipped under
+        ``--skip-slow`` (it costs ~11s); the committed file's shape is still validated.
+      * **The clean case passes, first.** Every check below would also pass on a pipeline that
+        refused everything, so the vacuity control leads: 8 groups explained, every citation
+        verified, exit 0, artifact written.
+      * **A fabricated citation is fatal.** The same 8 groups with every id and amount
+        replaced by figures in no row must exit 1. This is the assertion the phase rests on,
+        and without it "the model's claims are checked" is a sentence rather than a property.
+      * **The cached prefix is byte-identical across every request in a run.** Read off what
+        the double actually received, not from ``system_blocks()`` twice -- prompt caching
+        matches an exact byte prefix, so the claim is about what was *sent*.
+      * **The dry-run's arithmetic is internally consistent.** It reports the uncached input
+        total and the prefix re-sent within it, and the second must not exceed the first.
+        Written because the first version printed 12,390 tokens as a component of 11,536 -- a
+        part larger than its whole, in the output, the same way ASSUMPTIONS.md #38's ROI claim
+        printed backwards for eight phases: two figures side by side with nothing relating
+        them.
+      * **Every module under ``hisaab/explain/`` that self-checks works with ``anthropic``
+        absent.** The count is derived from the package, not written here as a number --
+        this docstring said "the four modules" until a fifth (``cluster``) and then a sixth
+        (``qa``) landed, each time silently untested by this line while the code below
+        still ran correctly. The core is stdlib-only and the SDK is an optional extra;
+        ``anthropic`` is installed in the shell this was built in, so gate 0 passing here
+        proves nothing about a clean checkout. Each module's self-check is re-run with the
+        import blocked at the meta-path level, and ``_client()`` is required to refuse with
+        install instructions rather than fail obscurely.
+      * **A resolved row's Q&A is checked by arithmetic, not containment alone.** An
+        exception row has no decomposition to verify a claim against; a resolved row does,
+        and ``qa.ask`` is the one place in this package a claim is checked against a
+        computation rather than merely matched against a string. A correct answer must
+        verify and an answer with an invented term in an otherwise-closing sum must not.
+      * **The hint comparison actually runs, and its number means what it says.** Every
+        fixture group with a declared code carries a hint; ``compare_to_hint`` must return
+        ``has_hint`` for each and must score 1.0 on the hint's own text and near-zero on an
+        unrelated sentence -- the two points ``cli.py``'s own docstring uses to say a
+        reproduction score is not an agreement score. Nothing else in this gate calls
+        ``compare_to_hint`` at all, so without this it ships unexercised.
+      * **Clustering leaves Phase 9's partition untouched.** ``cluster.sample`` picks which
+        rows a request sees; it must not change which rows belong to which reason-coded
+        group. Checked against the same fixture gate 17 already loads: every credit id
+        clustering touches is still in the group ``groups_from_fixture`` put it in.
+
+    What this does **not** prove: that the model says anything true. The double supplies the
+    text, so this gate covers the plumbing, the citation check and the exit codes -- never
+    output quality. And the citation check itself proves every figure is *real*, not that each
+    is used correctly; ``verify.py``'s docstring lists that limit and two others.
+    """
+    from hisaab.explain import EXPLAIN_SCHEMA_VERSION
+    from hisaab.explain import cli as cli_mod
+
+    print("\ngate 17 -- the LLM layer, against the frozen fixture with no live call")
+
+    fixture = ROOT / "fixtures" / "explain" / "fixture.json"
+    if not fixture.exists():
+        raise GateFailure(
+            f"{fixture.relative_to(ROOT).as_posix()} is missing. It is the recorded input this "
+            f"whole gate runs on -- build it with `python tools/explain_fixture.py`."
+        )
+
+    # --- 1. the fixture is what it says it is ----------------------------------------
+    if full:
+        _run([sys.executable, str(ROOT / "tools" / "explain_fixture.py"), "--check"],
+             "explain fixture rebuild")
+        print("    fixture rebuilds byte-identical from the generator and the matcher")
+    else:
+        print("    fixture rebuild SKIPPED (--skip-slow, ~11s); shape still checked below")
+
+    groups = cli_mod.groups_from_fixture(fixture)
+    codes = {g["reason"] for g in groups if g.get("reason")}
+    dismissals = [g for g in groups if g.get("reason") is None]
+    if len(groups) < 8 or len(codes) < 7:
+        raise GateFailure(
+            f"the fixture holds {len(groups)} group(s) covering {len(codes)} reason code(s); "
+            f"expected at least 8 and 7. A single seed x size cell tops out at 7 of 13 codes, "
+            f"which is why the fixture uses two flag sets -- if this shrank, one cell was lost."
+        )
+    if not dismissals:
+        raise GateFailure(
+            "the fixture has no dismissal group, so the uncoded path is untested. That path "
+            "printed 'Reason code: None' into the prompt and 'citations: None:' into the "
+            "report until this fixture caught both."
+        )
+
+    # ``run`` prints a full explanation for every group -- ~100 lines per call, three calls
+    # here. Captured rather than printed so this gate reads like the sixteen before it, and
+    # handed to the failure message when there is one: the output matters exactly when
+    # something is wrong, which is the opposite of printing it always.
+    # Both streams: ``run`` prints explanations to stdout and its failure list to stderr, so
+    # capturing only stdout left the fabrication report printing twice into the suite -- the
+    # exact noise this exists to remove. Kept SEPARATE rather than merged, because the phrase
+    # "NOT FOUND in the input" appears on both, and counting a merged buffer would report 16
+    # findings for 8 groups.
+    def _quiet(**kwargs: object) -> tuple[int, str, str]:
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            code = cli_mod.run(groups, model="recorded-double", **kwargs)
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    # --- 2. the clean case, first: the vacuity control for everything below -----------
+    with tempfile.TemporaryDirectory(prefix="hisaab-explain-") as tmp:
+        out = Path(tmp) / "explanations.json"
+        double = _ExplainDouble(groups)
+        code, said, said_err = _quiet(out=out, strict=True, client=double)
+        if code != 0:
+            raise GateFailure(
+                f"the clean case exited {code}. Every citation the double makes is drawn from "
+                f"its own group's rows, so a failure here is the checker refusing valid input "
+                f"-- and it would make the fabrication check below pass for the wrong reason."
+                f"\n\n{said_err.strip() or said[-1200:]}"
+            )
+        # Nothing may reach stderr on a clean run: that stream is where run() reports
+        # unverifiable citations, so anything on it here means a finding was raised and then
+        # not reflected in the exit code.
+        if said_err.strip():
+            raise GateFailure(
+                f"the clean case exited 0 but wrote to stderr, so something was flagged and "
+                f"then not counted:\n{said_err[-800:]}"
+            )
+        if double.calls != len(groups):
+            raise GateFailure(
+                f"{double.calls} request(s) for {len(groups)} group(s) -- a group was skipped "
+                f"silently, which is how a queue stops being somebody's job."
+            )
+
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        if doc["schema_version"] != EXPLAIN_SCHEMA_VERSION:
+            raise GateFailure(f"artifact schema v{doc['schema_version']} != code's")
+        if doc["citations_clean"] != len(groups) or doc["explained"] != len(groups):
+            raise GateFailure(
+                f"{doc['citations_clean']} of {doc['explained']} explanation(s) verified "
+                f"clean, expected {len(groups)}/{len(groups)}"
+            )
+        checked = sum(e["citation_check"]["checked"] for e in doc["explanations"])
+        if checked < len(groups):
+            raise GateFailure(
+                f"only {checked} citation(s) checked across {len(groups)} group(s). The check "
+                f"is passing because it is looking at almost nothing."
+            )
+        # No absolute path may reach the artifact: it is committed, and a temp dir in it would
+        # differ on every machine.
+        if tmp.replace("\\", "/") in json.dumps(doc):
+            raise GateFailure("the artifact carries an absolute temp path")
+        print(f"    {len(groups)} group(s) explained, {checked} citation(s) verified, exit 0")
+
+        # --- 3. the load-bearing assertion: a fabrication must be fatal --------------
+        bad = _ExplainDouble(groups, fabricate=True)
+        code_bad, said_bad, said_bad_err = _quiet(out=None, strict=True, client=bad)
+        if code_bad != 1:
+            raise GateFailure(
+                f"every citation in every group was replaced with an id and an amount that "
+                f"appear in no row, and the run exited {code_bad} instead of 1.\n"
+                f"This is the property the whole phase rests on: a model near a "
+                f"reconciliation is defensible only because its claims are checked. If this "
+                f"passes, the citation check is decoration.\n\n{said_bad[-1200:]}"
+            )
+        # **Exit 1 alone does not prove the citation check fired.** Any ExplainError exits 1
+        # too, so a client that simply broke would produce this same code and look like a
+        # working checker. So the fabricated values must be named in the output, and every
+        # group must be accounted for -- the same reasoning as gate 5's marker phrases, where
+        # a mutant caught by the wrong assertion is indistinguishable from a working check.
+        if "setl_999999" not in said_bad or "123456789" not in said_bad:
+            raise GateFailure(
+                f"the run exited 1, but neither fabricated value is named in its output -- so "
+                f"something else failed and the citation check may not have run at all.\n"
+                f"{said_bad[-1200:]}"
+            )
+        if said_bad.count("NOT FOUND in the input") != len(groups):
+            raise GateFailure(
+                f"{said_bad.count('NOT FOUND in the input')} of {len(groups)} group(s) "
+                f"reported a fabrication. Every group's citations were replaced, so every "
+                f"group must refuse them -- a subset means some groups are not being checked."
+            )
+        # And --permissive must still REPORT the finding while exiting 0, or the flag is a way
+        # to make fabrications invisible rather than non-fatal.
+        # The findings must also reach stderr, which is where a person or a CI log sees them.
+        # Checked separately from stdout because the two streams carry the same phrase for
+        # different reasons: stdout reports each group as it goes, stderr summarises at the end.
+        if said_bad_err.count("NOT FOUND in the input") != len(groups):
+            raise GateFailure(
+                f"stderr named {said_bad_err.count('NOT FOUND in the input')} fabrication(s) "
+                f"for {len(groups)} group(s). A finding printed only to stdout is one a CI "
+                f"log filtering for errors would miss.\n{said_bad_err[-800:]}"
+            )
+        code_perm, said_perm, said_perm_err = _quiet(
+            out=None, strict=False, client=_ExplainDouble(groups, fabricate=True)
+        )
+        if code_perm != 0:
+            raise GateFailure("--permissive did not exit 0 on a fabricated citation")
+        if "NOT FOUND in the input" not in said_perm:
+            raise GateFailure(
+                "--permissive exited 0 without reporting the fabrication, which makes it a "
+                "way to hide a bad citation rather than a way to continue past one."
+            )
+        print(f"    every citation fabricated -> exit 1, all {len(groups)} groups naming it; "
+              f"--permissive reports it and exits 0")
+
+        # --- 4. the cached prefix, read off what was actually sent -------------------
+        prefixes = set(double.systems_seen)
+        if len(prefixes) != 1:
+            raise GateFailure(
+                f"the system prefix differed across {len(prefixes)} of {double.calls} "
+                f"requests, so prompt caching can never hit. Caching matches an exact byte "
+                f"prefix -- this is checked against what the client SENT, because "
+                f"system_blocks() agreeing with itself does not prove the request did."
+            )
+        prefix_len = len(next(iter(prefixes)))
+        print(f"    the {prefix_len:,}-char prefix was byte-identical on all "
+              f"{double.calls} requests")
+
+    # --- 5. the dry-run's arithmetic must be internally consistent -------------------
+    dry = _run(
+        [sys.executable, "-m", "hisaab.explain", "--fixture", "--dry-run"],
+        "explain --dry-run",
+    )
+    uncached = re.search(r"input if nothing caches: ~([\d,]+) tokens", dry)
+    fewer = re.search(r"~([\d,]+) fewer", dry)
+    if not (uncached and fewer):
+        raise GateFailure(f"--dry-run no longer reports its token arithmetic:\n{dry[-600:]}")
+    total, saved = (int(m.group(1).replace(",", "")) for m in (uncached, fewer))
+    if not 0 <= saved <= total:
+        raise GateFailure(
+            f"the dry-run says {saved:,} tokens of a {total:,}-token total are re-sent "
+            f"prefix -- a part larger than its whole.\n"
+            f"The first version of this printed exactly that, because it divided the prefix "
+            f"in once while sending it 8 times. Nothing caught it but a reader, which is how "
+            f"the ROI claim survived eight phases."
+        )
+    if "nothing will be sent" not in dry:
+        raise GateFailure("--dry-run must say plainly that it sends nothing")
+    print(f"    --dry-run consistent: {saved:,} re-sent prefix tokens of {total:,} total")
+
+    # --- 6. the four modules must work with the optional extra absent ----------------
+    with tempfile.TemporaryDirectory(prefix="hisaab-nosdk-") as tmp:
+        harness = Path(tmp) / "_no_sdk.py"
+        # The harness puts its OWN directory on sys.path, so the repo root is linked in
+        # rather than assumed -- running a script by path does not put the cwd on sys.path,
+        # and getting that wrong reports five import failures that are all the harness's.
+        harness.write_text(
+            _NO_SDK_HARNESS.replace(
+                "Path(__file__).resolve().parent", repr(str(ROOT))
+            ),
+            encoding="utf-8",
+        )
+        control = Path(tmp) / "_no_sdk_control.py"
+        control.write_text(
+            "from hisaab.explain import client\n"
+            "try:\n"
+            "    client._client()\n"
+            "except client.ExplainError as e:\n"
+            "    assert 'optional extra' in str(e), f'wrong message: {e}'\n"
+            "    print('refused with install instructions')\n"
+            "else:\n"
+            "    raise SystemExit('built a client with no SDK installed')\n",
+            encoding="utf-8",
+        )
+        # **Derived from the package, not listed.** This was a hardcoded tuple of four names
+        # until `cluster.py` was added, at which point the gate went on reporting "all 4
+        # modules self-check with anthropic blocked" while silently skipping the fifth -- a
+        # list that prints its own count and is wrong, which is the `fees`/`tier2` omission
+        # from Phase 6 recurring in the gate written to prevent that class of thing.
+        # `cli.py` and `__main__.py` are excluded by having no `_self_check`: running them as
+        # __main__ would invoke the CLI and attempt a model call.
+        modules = tuple(
+            f"hisaab.explain.{p.stem}"
+            for p in sorted((ROOT / "hisaab" / "explain").glob("*.py"))
+            if "def _self_check" in p.read_text(encoding="utf-8")
+        )
+        if len(modules) < 6:
+            raise GateFailure(
+                f"only {len(modules)} module(s) under hisaab/explain/ define a _self_check: "
+                f"{list(modules)}. A module in this package with no self-check is a module "
+                f"gate 0 cannot run."
+            )
+        # And gate 0 must run exactly these. Two lists that can disagree is how a module with
+        # a working self-check ends up never being run by the suite that reports a clean sweep.
+        in_gate_0 = {m for m in SELF_CHECK_MODULES if m.startswith("hisaab.explain.")}
+        if in_gate_0 != set(modules):
+            raise GateFailure(
+                f"gate 0 and hisaab/explain/ disagree about which modules self-check.\n"
+                f"  on disk but not in SELF_CHECK_MODULES: {sorted(set(modules) - in_gate_0)}\n"
+                f"  in SELF_CHECK_MODULES but not on disk: {sorted(in_gate_0 - set(modules))}\n"
+                f"A module missing from gate 0 has a self-check nothing runs, and gate 0 "
+                f"prints a clean sweep while skipping it -- exactly what happened to "
+                f"matcher.fees and matcher.tier2 for three phases."
+            )
+        for name in (*modules, "_no_sdk_control"):
+            proc = subprocess.run(
+                [sys.executable, str(harness), name],
+                cwd=str(tmp) if name == "_no_sdk_control" else str(ROOT),
+                capture_output=True, text=True, env={**_env(), "PYTHONUTF8": "1"},
+            )
+            if proc.returncode != 0:
+                raise GateFailure(
+                    f"{name} fails with `anthropic` absent (exit {proc.returncode}).\n"
+                    f"The SDK is an optional extra and the core is stdlib-only -- that is "
+                    f"the claim check 8 and pyproject.toml both make. It is installed in "
+                    f"this shell, so nothing else here would notice.\n"
+                    f"{(proc.stderr or proc.stdout)[-700:]}"
+                )
+        print(f"    all {len(modules)} modules self-check with `anthropic` blocked; "
+              f"_client() refuses with install instructions")
+
+    # --- 7. the hint comparison runs, and its number means what cli.py claims ---------
+    #
+    # Nothing above calls compare_to_hint: the clean/fabricated runs in step 2/3 check the
+    # citation path, not this one. Without this block the feature ships in cli.py's own
+    # docstring and nowhere else -- exercised by hand once, never again.
+    from hisaab.common.reasons import Reason as _Reason
+    from hisaab.triage.hint import HINTS as _HINTS
+
+    coded = [g for g in groups if g.get("reason")]
+    if not coded:
+        raise GateFailure("no fixture group carries a reason code, so the hint comparison "
+                           "cannot be exercised at all")
+    for group in coded:
+        reason = _Reason(group["reason"])
+        hint = _HINTS[reason]
+        exact = cli_mod.compare_to_hint(group, hint.action)
+        if not exact["has_hint"] or exact["hint_terms_reproduced"] != 1.0:
+            raise GateFailure(
+                f"{reason}: comparing the hint's own text against itself scored "
+                f"{exact.get('hint_terms_reproduced')}, expected 1.0. compare_to_hint's "
+                f"docstring measured this exact case at 1.00 on all 7 coded groups; a lower "
+                f"score here means the term-overlap arithmetic broke."
+            )
+        unrelated = cli_mod.compare_to_hint(group, "nothing to do; ignore these rows")
+        if unrelated["hint_terms_reproduced"] > 0.10:
+            raise GateFailure(
+                f"{reason}: a flat contradiction scored "
+                f"{unrelated['hint_terms_reproduced']}, expected near zero. "
+                f"compare_to_hint's docstring measured contradictions at 0.00 on all 7 "
+                f"groups; this is the vacuity control for the metric."
+            )
+    print(f"    hint comparison: {len(coded)} coded group(s), each scores 1.0 on its own "
+          f"hint's text and ~0 on a contradiction")
+
+    # --- 8. clustering leaves the fixture's own partition untouched -------------------
+    #
+    # cluster.sample picks which rows a request SEES; it must never change which reason-coded
+    # group a row belongs to. Checked against groups_from_fixture's own output, which is what
+    # step 1 already verified matches the committed file -- so this is Phase 9's partition,
+    # not a second copy of it.
+    from hisaab.explain import cluster as cluster_mod
+    from hisaab.explain import prompt as prompt_mod_for_gate17
+
+    for group in groups:
+        own_ids = {c["credit_id"] for c in group.get("credits", ())}
+        sampled = cluster_mod.sample(group, prompt_mod_for_gate17.ROWS_PER_GROUP)
+        sampled_ids = {r["credit_id"] for r in sampled}
+        if not sampled_ids <= own_ids:
+            raise GateFailure(
+                f"{group.get('reason') or group['cause']}: cluster.sample returned "
+                f"credit(s) {sorted(sampled_ids - own_ids)} not in this group's own "
+                f"{len(own_ids)} credit(s) -- sampling must not move a row between "
+                f"reason-coded groups."
+            )
+    print(f"    clustering: every sampled row across {len(groups)} group(s) stayed inside "
+          f"its own group")
+
+    # --- 9. a resolved row's Q&A is checked by arithmetic, not containment alone ------
+    from hisaab.explain import qa as qa_mod
+
+    resolved = cli_mod.resolved_rows_from_fixture(fixture)
+    if not resolved:
+        raise GateFailure(
+            "the fixture's resolved_sample is empty, so qa.ask has nothing to be checked "
+            "against here. tools/explain_fixture.py freezes RESOLVED rows with a full "
+            "fee+GST+TDS deduction for exactly this."
+        )
+    sample_row = resolved[0]
+    decomp = sample_row["decomposition"]
+    terms = [{"label": "gross", "paise": decomp["gross_paise"]}]
+    for field in qa_mod.DEDUCTION_FIELDS:
+        if decomp.get(field):
+            terms.append({"label": field.removesuffix("_paise"), "paise": -decomp[field]})
+    good_payload = {
+        "answer": "The gateway withheld its fee, GST on that fee and TDS.",
+        "cited_row_ids": [sample_row["credit_id"]],
+        "cited_amounts_paise": [decomp["gross_paise"], decomp["expected_credit_paise"]],
+        "arithmetic": {"terms": terms, "total_paise": decomp["expected_credit_paise"]},
+    }
+    good_findings = qa_mod.verify_answer(sample_row, good_payload)
+    if good_findings:
+        raise GateFailure(
+            f"a correct answer over {sample_row['credit_id']}'s own decomposition was "
+            f"refused: {good_findings}"
+        )
+    bad_payload = {
+        **good_payload,
+        "arithmetic": {
+            "terms": [{"label": "gross", "paise": decomp["gross_paise"]},
+                      {"label": "fees", "paise": -321}],
+            "total_paise": decomp["expected_credit_paise"],
+        },
+    }
+    bad_findings = qa_mod.verify_answer(sample_row, bad_payload)
+    if not bad_findings or not any("came from nowhere" in f for f in bad_findings):
+        raise GateFailure(
+            f"a term (-321p) invented for no figure in {sample_row['credit_id']}'s row, "
+            f"inside a sum that still closes, was not refused: {bad_findings}. This is the "
+            f"failure containment alone cannot see -- every id and amount elsewhere in the "
+            f"payload is real."
+        )
+    print(f"    qa arithmetic check: {sample_row['credit_id']}'s own decomposition verifies; "
+          f"an invented term in an otherwise-closing sum is refused")
+
+
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-9).")
+    p = argparse.ArgumentParser(description="Run every acceptance gate (Phases 1-10).")
     p.add_argument("--skip-slow", action="store_true",
-                   help="skip the n=200 sweeps in gates 3, 6, 9, 10, 11, 12 and 16. Gates 13 "
+                   help="skip the n=200 sweeps in gates 3, 6, 9, 10, 11, 12, 16, and gate 17's fixture rebuild. Gates 13 "
                         "and 14 ignore this flag: gate 13's wrong-match assertion and gate "
                         "14's ambiguity and pool-cap assertions are all invisible at n=200")
     args = p.parse_args(argv)
@@ -3402,6 +4136,13 @@ def main(argv: list[str] | None = None) -> int:
         # groups, a dismissal group, and the value/effort inversion the ranking check needs.
         # Nothing here is a rate that only separates at scale.
         lambda: gate_16_triage((60,) if args.skip_slow else (60, 200)),
+        # Honours --skip-slow, and only for the fixture rebuild: that step re-runs the
+        # generator and the matcher on two cells (~11s) to prove the committed fixture is
+        # reproducible. Everything else in this gate is milliseconds against a recorded file
+        # and a double, so all six properties still run under the flag -- including the
+        # fabrication check, which is the one the phase rests on. Nothing here needs a
+        # network, a key, or the optional extra installed.
+        lambda: gate_17_explain(full=not args.skip_slow),
     ]
     try:
         for gate in gates:
@@ -3411,7 +4152,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("\n" + "=" * 62)
-    print("all sixteen gates pass -- Phases 1 through 9 are complete")
+    print("all seventeen gates pass -- Phases 1 through 10 are complete")
     print("\nPhase 9 turned the scored run into a work queue -- grouped by cause, ranked by")
     print("money at risk, priced per group, with a next action and a named missing input each.")
     print("It reads matches.json and data/ only: hisaab/triage is on MATCHER_PACKAGES, so the")
@@ -3600,6 +4341,47 @@ def main(argv: list[str] | None = None) -> int:
     print("weakened, not a code that fires. ROUNDING_DRIFT is producerless as a direct result of")
     print("declining --rounding-edge. Phase 8 is the last phase that adds flags, so it is the")
     print("last that could have given any of the three a producer.")
+    print("\nPhase 10 put a model near the queue, and check 8 is the assertion that the matcher")
+    print("itself never does. Before this phase check_isolation.py had seven checks and not")
+    print("one mentioned a network, so the headline claim -- 'the matching engine is")
+    print("deliberately not AI' -- rested on nothing a build could fail. Check 8 bans any")
+    print("HTTP client or model SDK under hisaab/, scoped to every .py file rather than to")
+    print("MATCHER_PACKAGES (hisaab/common/ sits one directory outside that tuple and is")
+    print("reachable from the matcher), with hisaab/explain carved out as the one exempt leaf")
+    print("-- exempt from the network ban and from nothing else, so the component that talks")
+    print("to an LLM still cannot read truth.json, the generator, or the declared fee columns.")
+    print("Gate 5 proves it by planting 7 mutants and requiring each refused by its own")
+    print("assertion's phrase, not merely by exit code.")
+    print("\nThe citation check turned out to have less to check than the roadmap assumed.")
+    print("Exception rows carry no computed decomposition at all -- 0 of 295, measured --")
+    print("because a row IS an exception for having nothing computed. So the check verifies")
+    print("one bank amount plus row ids, and every id or figure the model cites that appears")
+    print("in no row it was shown is fatal by default: gate 17 fabricates every citation in")
+    print("every group and requires exit 1, naming both fabricated values, in both strict and")
+    print("--permissive runs. qa.py closes the gap for the rows that DO have a decomposition")
+    print("-- the 349 of 349 RESOLVED rows whose six-term breakdown closes exactly -- by")
+    print("pulling a claimed sum out of prose into signed terms and requiring it to close,")
+    print("every term to be a real figure in that row, and the total to equal the credit.")
+    print("Gate 17 plants an invented term inside an otherwise-closing sum, the one failure")
+    print("containment alone cannot see, and requires it refused by name.")
+    print("\nStructured output could not be verified here, and the honest answer is to say so")
+    print("rather than paper over it. The same request with and without output_config")
+    print("returned the same markdown prose through this shell's proxy, and a deliberately")
+    print("invalid format value was accepted rather than rejected -- so Phase 9's 'the model")
+    print("fenced its JSON' finding is untested, not retired, and client.py's error message")
+    print("names the proxy as the likelier cause rather than asserting a protocol failure it")
+    print("cannot show happened. Cache telemetry came back absent rather than zero, which is")
+    print("not the same fact, and cost per row is stated as unmeasurable through a proxy")
+    print("rather than quoted as this project's number -- Phase 9's ~35x inflation figure did")
+    print("not reproduce on remeasurement, so the caveat no longer repeats it.")
+    print("\nThe dependency question resolved to an extra rather than a rewrite. pyproject.toml")
+    print("adds `anthropic` under [project.optional-dependencies], not to the core -- pinned")
+    print("to a major range so a 2.x cannot silently change the surface underneath. Every")
+    print("module in hisaab/explain/ that self-checks (six, derived from the package rather")
+    print("than counted by hand after the count itself went stale twice) is re-run with the")
+    print("import blocked at the meta-path level, and _client() is required to refuse with")
+    print("install instructions rather than fail obscurely. Nothing else in this suite needs")
+    print("it installed.")
     return 0
 
 

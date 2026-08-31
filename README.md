@@ -46,7 +46,18 @@ the matcher guessed on rows where the inputs contain no answer.
 
 ## Quick start
 
-Python 3.12. **No dependencies** — standard library only, no virtualenv needed.
+Python 3.12. **The core has no dependencies** — the generator, matcher, scorer and
+exception queue are standard library only, so everything below runs from a fresh clone
+with no install step and no virtualenv. Phase 10's LLM layer (`hisaab/explain`) is the
+one exception and needs one package, installed deliberately:
+
+```bash
+pip install -e ".[llm]"     # only for hisaab/explain; nothing else needs it
+```
+
+That split is enforced rather than promised: `check_isolation.py` check 8 fails the build
+if anything outside `hisaab/explain/` imports `anthropic`, or any HTTP client at all. The
+acceptance suite — every gate, including the LLM layer's — runs with nothing installed.
 
 ```bash
 # 1. Generate a month of data plus the answer key (byte-reproducible from the seed)
@@ -182,6 +193,43 @@ python -m hisaab.scoring --matches out/oracle.json --truth truth/
 The oracle exists to prove the target is *reachable* on this data, so a matcher shortfall
 is unambiguously the matcher's fault and not the dataset's. Tier 1 currently matches it.
 
+### Ask a model about the exceptions
+
+Everything above is deterministic. This is the one part that isn't, and it is scoped
+accordingly: `hisaab/explain` reads the same inputs a human reconciler would — the queue
+and `data/` — never `truth.json`, never the generator, never a declared fee column. It has
+no more information than the matcher does; it just talks about what the matcher already
+decided.
+
+```bash
+python -m hisaab.explain --fixture --dry-run          # no key needed, no network call
+python -m hisaab.explain --matches out/matches.json --data data/ --out out/explain.json
+python -m hisaab.explain --fixture --ask "C0001:why is the credit less than the gross?"
+```
+
+`--dry-run` builds every request and prints it without sending anything, so the prompt and
+the grouping can be reviewed with nothing installed. A live run needs `pip install -e
+".[llm]"` and an API key; `--fixture` runs against a frozen, committed recording instead
+(`fixtures/explain/fixture.json`), so the gate and this README example both run offline.
+
+What gets checked, and what doesn't: every row id and every rupee figure the model writes
+about an exception is checked against the statement it was shown, and anything cited that
+appears in no row it saw is refused by default (`--permissive` downgrades that to a
+warning). That check has less to verify than it sounds — an exception row carries **no**
+computed decomposition, by definition, so there is no arithmetic there to check, only the
+citations. `--ask` is where the arithmetic check lives: it only answers questions about
+**RESOLVED** rows, which do carry a full decomposition, and it pulls a claimed sum out of
+the model's prose into signed terms and requires them to close exactly, every term to be a
+real figure in that row, and the total to equal the credit — refusing an invented term even
+when the sum it sits in still adds up.
+
+The isolation claim has an assertion behind it as of this phase. `check_isolation.py`
+gained a check that bans any HTTP client or model SDK under all of `hisaab/`, with
+`hisaab/explain` carved out as the only exempt leaf — exempt from that one ban and nothing
+else, so the component allowed to talk to a model is also the one with no privileged read
+access. Nothing that ships imports it, so the matcher cannot reach a model through the one
+package allowed to hold one.
+
 ### Verify the whole thing
 
 ```bash
@@ -189,7 +237,7 @@ python -m hisaab.generator --seed 42 --n 60   # if you have not already
 python tools/acceptance.py
 ```
 
-Sixteen gates, one command, exit code is the verdict. Byte-identical output at a fixed
+Seventeen gates, one command, exit code is the verdict. Byte-identical output at a fixed
 seed across two processes; invariants on three seeds in memory and again re-read from
 disk; the leak audit; truth isolation; throughput; the assumptions file; the four
 known-answer fixtures; the matcher at 100/100/0 across three seeds × two sizes, including
@@ -200,8 +248,12 @@ gate 12, which requires both matcher tiers to carry rows so a Tier 1 regression 
 hide behind a Tier 2 success; gate 13, which adds three deduction terms and pins the one
 that must never be resolved; gate 14, which adds bank rows that are not gateway credits
 and payments that never pay out; gate 15, the eleven-flag run, with foreign currency and a
-bank statement missing its UTRs; and gate 16, which requires the exception queue to be
-complete, correctly valued, genuinely ranked, and honest about its own ROI claim.
+bank statement missing its UTRs; gate 16, which requires the exception queue to be
+complete, correctly valued, genuinely ranked, and honest about its own ROI claim; and gate
+17, which runs the model layer offline against a frozen fixture and a recorded client —
+proving the citation check, fabrication rejection, per-module resilience when the SDK is
+absent, and (via `qa.py`) that an invented term inside an otherwise-closing sum is refused
+by name.
 
 Gate 10 is the one worth reading the source of, because of what it declines to assert. The
 plan called for a flat 100/100/0 under `--fees --settlement-delay`; measurement said the
@@ -237,7 +289,7 @@ while blind to its only correctness failure.
 
 ---
 
-## Current state — Phase 6 of 13
+## Current state — Phase 10 of 13
 
 | | Phase | State |
 |---|---|---|
@@ -248,8 +300,11 @@ while blind to its only correctness failure.
 | ✅ | **4b. Planted unresolvables (`--dup-amounts`)** | Done. Each pair shares a date, an amount **and a UTR** — the last one because a tail-only join resolved 100% without either of the others |
 | ✅ | **5. Batching and the Tier 2 subset search (`--batching`)** | Done. Many payments settle as one credit; membership is withheld partially, so the search is a **counted** subset-sum with a bound that refuses rather than guesses |
 | ✅ | **6. Adjustments (`--tds`, `--netted-refunds`, `--reserve`)** | Done. Three more deduction terms. TDS and refunds net inside the settlement; the **reserve deliberately does not** — its magnitude appears in no input file, so the matcher diagnoses it and never resolves it |
-| ⬜ | 7–8. Orphans, noise rows, FX | Next. The rest of the difficulty dial, one flag at a time |
-| ⬜ | 9–13. Exception ranking, LLM layer, HTML report, holdout, write-up | |
+| ✅ | **7. Orphans and noise rows** | Done. Bank rows that are not gateway credits, payments that never pay out; `IGNORED == plainly_foreign` checked both directions |
+| ✅ | **8. Foreign currency and patchy UTRs** | Done. `--fx` costs ~19% coverage on purpose — Tier 2's uniqueness inference is voided, not widened, when a foreign payment sits in the pool |
+| ✅ | **9. Exception ranking** | Done. The scored run becomes a triaged queue, grouped by cause, ranked by money, priced per group — and the ROI claim's sign error from Phase 2 is fixed and now withheld on any run with a wrong match |
+| ✅ | **10. LLM layer** | Done. `hisaab/explain` — citation-checked explanations and arithmetic-checked Q&A over RESOLVED rows, isolated from every privileged input, gated offline against a frozen fixture |
+| ⬜ | 11–13. HTML report, holdout, write-up | Next |
 
 The scorer was built **before** the matcher on purpose. Building it second means spending
 Phase 3 eyeballing CSVs to decide whether a change helped; building it first turns every
@@ -430,6 +485,39 @@ This is a deliberate answer to "where's the AI?", not an omission. A reconciliat
 figure has to be reproducible and defensible — the same seed must give the same number,
 and every match must be explainable as arithmetic. A hallucinated journal entry is worse
 than an unresolved one.
+
+**Until Phase 10 that claim had no assertion behind it.** `check_isolation.py` had seven
+checks and not one of them mentioned a network, so `matcher/tier1.py` could have called a
+model mid-match and all sixteen gates would have passed green — the headline design claim,
+enforced by nothing but the author's memory. Phase 10 added **check 8**: nothing under
+`hisaab/` may import an HTTP client, a model SDK, or `subprocess`/`importlib`/`ctypes`
+(29 banned names, resolved by AST, measured at **0 violations across all 42 files** before
+it was armed, because a check that fails on arrival gets weakened rather than obeyed).
+
+Why this matters more than it sounds: a model asked "does this credit match this
+settlement?" returns a *plausible* verdict, so coverage and correctness still compute and
+still look reasonable — while measuring a guess. It is the `truth.json` failure reached
+from the opposite direction. Instead of leaking the answer in, it invents one.
+
+The scope is deliberately wider than the matcher. `hisaab/common/` is imported *by* the
+matching path, so a check scoped to `hisaab/matcher/` would have passed a network import
+sitting one directory over — exactly the mistake check 6 made until Phase 9, when it was
+scoped to a tuple that did not yet include `hisaab/triage/`. Once is a lesson; twice would
+be a habit.
+
+`hisaab/explain/` — the model layer — is exempt from the network half and from nothing
+else. It stays on the same list as the matcher, so **the one component that talks to an LLM
+is the one component with no privileged information at all**: it cannot read `truth.json`,
+cannot import the generator, and cannot read the declared fee columns. It explains rows
+from the same inputs a human reconciler would have. And nothing that ships may import it,
+so the matcher cannot reach a model through the one tree allowed to hold one — without
+that second half, the ban would be about spelling rather than behaviour.
+
+Proven by deliberate violation, the way check 6 was: **seven planted mutants, each refused
+by its own assertion** and named in the failure message, plus two controls that must stay
+green (a `urllib` import inside `hisaab/explain/`, and that package importing its own
+siblings). Two of the seven would have passed a narrower check — the `hisaab/common/`
+import, and `from ..explain import ask` written inside the matcher.
 
 ### 3. Nothing is dropped, and the arithmetic says so
 
