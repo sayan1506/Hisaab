@@ -98,7 +98,7 @@ if __name__ == "__main__":
         "timing": {"wall_clock_seconds": 0.02}, "verdicts": [],
     }
     metrics = {
-        "schema_version": 4,
+        "schema_version": 5,
         "run": {"seed": 42, "month": "2026-08", "clean_mode": True, "flags": [], "matcher": "tier1@0.3.0"},
         "timing": {"wall_clock_seconds": 0.01},
         "totals": {"bank_rows": 0, "payments": 0, "gateway_credits": 0, "non_gateway_credits": 0,
@@ -107,6 +107,7 @@ if __name__ == "__main__":
         "rates": {}, "exceptions": {"count": 0, "value_paise": 0, "estimated_minutes": 0},
         "dismissals": {"count": 0, "estimated_minutes": 0},
         "decomposition": {"checked": 0, "mismatches": 0},
+        "risk": {"wrong_match_value_paise": 0},
     }
     triage = {
         "schema_version": 1, "inputs": {"matches": "matches.json", "data": "data"},

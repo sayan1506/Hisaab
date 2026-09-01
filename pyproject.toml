@@ -49,5 +49,13 @@ dependencies = []
 # project chose it independently and pins it independently. It does not.
 llm = ["anthropic>=1.2,<2"]
 
+# Phase 12b adds a local trigger-and-view webapp under tools/webapp/ -- orchestration around
+# the engine, not the engine, the same trade the llm extra above already made for a leaf
+# component. It shells out to the CLIs (never imports hisaab.scoring/matcher/generator for
+# computation) and renders nothing but the report Phase 11 already writes, so it needs routing
+# and form parsing, not a scoring dependency. Pinned to a major range for the same reason as
+# anthropic above: a 2.x could change the surface underneath silently.
+web = ["flask>=3,<4"]
+
 [tool.setuptools]
 packages = ["hisaab"]

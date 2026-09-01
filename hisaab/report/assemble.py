@@ -52,7 +52,7 @@ from ..common.verdict import MATCHES_JSON, VERDICT_SCHEMA_VERSION
 #:
 #: ``hisaab.triage.cli.TRIAGE_SCHEMA_VERSION`` carries no such tax -- triage is not on
 #: ``TRUTH_READERS`` -- so it is imported rather than copied, one line below.
-METRICS_SCHEMA_VERSION = 4
+METRICS_SCHEMA_VERSION = 5
 EXPLAIN_SCHEMA_VERSION = 1
 
 from ..triage.cli import TRIAGE_SCHEMA_VERSION  # noqa: E402  (after the constants it sits beside)
@@ -60,7 +60,7 @@ from ..triage.cli import TRIAGE_SCHEMA_VERSION  # noqa: E402  (after the constan
 REQUIRED_MATCHES_KEYS: tuple[str, ...] = ("schema_version", "seed", "month", "matcher", "verdicts")
 REQUIRED_METRICS_KEYS: tuple[str, ...] = (
     "schema_version", "run", "timing", "totals", "cells", "rates",
-    "exceptions", "dismissals", "decomposition",
+    "exceptions", "dismissals", "decomposition", "risk",
 )
 REQUIRED_TRIAGE_KEYS: tuple[str, ...] = ("schema_version", "inputs", "totals", "groups")
 REQUIRED_EXPLAIN_KEYS: tuple[str, ...] = (
@@ -275,7 +275,7 @@ if __name__ == "__main__":
         "schema_version": METRICS_SCHEMA_VERSION,
         "run": {"seed": 42, "month": "2026-08", "clean_mode": True, "flags": [], "matcher": "x"},
         "timing": {"wall_clock_seconds": 0.01}, "totals": {}, "cells": {}, "rates": {},
-        "exceptions": {}, "dismissals": {}, "decomposition": {},
+        "exceptions": {}, "dismissals": {}, "decomposition": {}, "risk": {},
     }
     EXPLAIN_DOC = {
         "schema_version": EXPLAIN_SCHEMA_VERSION, "model": "m", "endpoint": "e",

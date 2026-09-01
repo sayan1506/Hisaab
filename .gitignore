@@ -40,6 +40,11 @@ $RECYCLE.BIN/
 venv/
 env/
 
+# setuptools' own build metadata from `pip install -e .`. Regenerates from pyproject.toml
+# on every install; committing it would just be a second copy of the manifest that goes
+# stale the moment a dependency changes.
+*.egg-info/
+
 # Editor and IDE state. Personal to a machine, not to the project.
 .vscode/
 .idea/

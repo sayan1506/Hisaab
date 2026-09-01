@@ -294,7 +294,7 @@ while blind to its only correctness failure.
 
 ---
 
-## Current state — Phase 11 of 13
+## Current state — Phase 12b of 13
 
 | | Phase | State |
 |---|---|---|
@@ -310,7 +310,9 @@ while blind to its only correctness failure.
 | ✅ | **9. Exception ranking** | Done. The scored run becomes a triaged queue, grouped by cause, ranked by money, priced per group — and the ROI claim's sign error from Phase 2 is fixed and now withheld on any run with a wrong match |
 | ✅ | **10. LLM layer** | Done. `hisaab/explain` — citation-checked explanations and arithmetic-checked Q&A over RESOLVED rows, isolated from every privileged input, gated offline against a frozen fixture |
 | ✅ | **11. HTML report** | Done. `hisaab/report` — reads the (up to) five documents a run already wrote and renders one self-contained page, stdlib only; reproducible outside a single timestamp line, and re-checks every rendered decomposition's arithmetic against the text on the page rather than trusting it was correct in memory |
-| ⬜ | 12–13. Holdout, write-up | Next |
+| ✅ | **12. Holdout, freeze** | Done. Seed 99, n=1000, the real eleven-flag set, run once: 56.2% coverage, 100.0% correctness, 0 wrong matches, value at risk ₹0.00. `tools/splice_cross_date_batch.py` built and applied once, merging two adjacent-date settlements into the one batch shape the generator structurally refuses to produce — the matcher resolved it without incident, a finding in itself. `ASSUMPTIONS.md` #44/#45. **No `hisaab/` module and no gate in `tools/acceptance.py` changes after this phase.** |
+| ✅ | **12b. Local webapp** | Done. `tools/webapp/` — a trigger form, a run-in-progress/result view, a past-runs list, serving Phase 11's `report.html` unmodified. Shells out to the same five CLIs a person would type by hand; verified byte-identical to a hand-run pipeline outside the timestamp line. Loopback-only, no auth, seed 99 refused at the function layer, explain is an opt-in checkbox. Lives entirely under `tools/`, never `hisaab/` — gate 5 (`check_isolation.py`) reports the same green state as before this phase |
+| ⬜ | 13. Write-up | Next |
 
 The scorer was built **before** the matcher on purpose. Building it second means spending
 Phase 3 eyeballing CSVs to decide whether a change helped; building it first turns every
@@ -610,3 +612,36 @@ equivalent of test-set leakage, and it is detectable when a judge asks how you p
 Wall clock is the one non-deterministic value, and it is quarantined inside a `timing`
 object in every document that carries it — so two runs of the same input differ only
 there, and the metric block stays byte-comparable.
+
+---
+
+## The local webapp (Phase 12b)
+
+A trigger and a window onto the pipeline above, not a second implementation of any part of
+it — one form to run a seed/size/flag combination, one page to watch it, one page listing
+past runs, all serving the exact `report.html` Phase 11 already renders.
+
+```bash
+pip install -e ".[web]"
+python -m tools.webapp.server        # binds to 127.0.0.1:8000
+```
+
+**It binds to loopback only, and there is deliberately no `--host` flag.** Triggering a run
+means the server accepts a seed/size/flag set from a form and spawns the same subprocesses
+a person would type by hand. That is bounded by the CLIs' own input validation, but the
+moment this listens on anything but `127.0.0.1` the relevant threat model changes, so the
+bind address is a literal in `tools/webapp/server.py` rather than a flag. **No
+authentication exists, and none is added** — the property this buys is "runs on your
+machine only," not "safe to expose."
+
+It lives entirely under `tools/webapp/`, never `hisaab/`: it shells out to the five CLIs
+(`hisaab.generator`, `.matcher`, `.scoring`, `.triage`, `.report`) exactly as
+`tools/acceptance.py` already does, and never imports `hisaab.generator`/`hisaab.matcher`/
+`hisaab.scoring` for computation, so it never lands on `check_isolation.py`'s truth-reading
+allowlist. Every triggered run writes to its own directory under `out/runs/`, never to the
+repo-root `data/`/`truth/` the committed reference run depends on, and seed 99 (the Phase 12
+holdout) is refused at the one function every trigger path calls, not only hidden from the
+form. Generating explanations (`hisaab.explain`) is an explicit opt-in checkbox, unticked by
+default and disabled when the `llm` extra or an API key isn't available — never automatic
+just because the extra happens to be installed, since that would spend a live, paid model
+call on a click with no rate limit and no confirmation.

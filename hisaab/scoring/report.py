@@ -280,6 +280,11 @@ def metric_block(m: Metrics) -> str:
         "",
         _line("Exceptions", str(m.exceptions)),
         _line("Value in exceptions", fmt(m.exception_value_paise)),
+        # The amendment's owed line: money already booked wrong, not money awaiting a human.
+        # A wrong match raises no exception, so it is invisible to the line above -- this is
+        # the only place a ₹2,00,000 wrong match and a ₹49 one stop reading identically.
+        _line("Value at risk", fmt(m.wrong_match_value_paise),
+              "wrong matches, already booked wrong"),
         # Four lines where there was one, and the fourth is the only one that is a *claim*.
         # The old single line printed the tool's minutes with the by-hand total as a note and
         # never compared them; these print both totals, then subtract them out loud.
@@ -474,6 +479,9 @@ if __name__ == "__main__":
     assert "seed 42, 2026-08, clean mode, flags: none" in block
     assert "Wall clock" in block and "0.02s" in block
     assert "Value in exceptions        ₹0.00" in block, block
+    # Phase 12: nothing wrong on the oracle run, so nothing at risk -- printed anyway, per
+    # this block's own rule that every counter appears even at zero.
+    assert "Value at risk              ₹0.00" in block, block
     # Phase 9: the comparison, with both sides shown. Nothing to chase here, so the by-hand
     # total is 3 rows on sight and the break-even is n/a rather than a division by no rows.
     assert "Est. human time to clear   0 min" in block, block
@@ -601,6 +609,9 @@ if __name__ == "__main__":
         _truth((_credit("C0001", ("pay_0001",)), _credit("C0002", ("pay_0002",)))),
     )
     assert wrong.wrong_matches == 1, wrong.cells
+    # The value-at-risk line must read the real fixture value here, not ₹0 -- this is the
+    # run the line exists for: money already booked wrong, priced.
+    assert wrong.wrong_match_value_paise == 100_000, wrong.wrong_match_value_paise
     block = metric_block(wrong)
     r_wrong = roi(wrong)
     # The trap: by the minutes alone this run looks perfect.
@@ -611,6 +622,7 @@ if __name__ == "__main__":
     assert "Time saved                 not claimable -- 1 wrong match(es)" in block, block
     assert "100.0%   (" not in block.split("Time saved")[1], block
     assert "not what this run left a person to do" in block, block
+    assert "Value at risk              ₹1,000.00" in block, block
     # The withholding is keyed on wrong matches, not on the queue being empty: the empty-queue
     # runs above still print their percentage.
     assert "Time saved                 100.0%" in metric_block(unconditional_zero_check := score(

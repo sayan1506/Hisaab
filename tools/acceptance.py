@@ -490,6 +490,95 @@ def _gate_5_self_check() -> int:
     return verified
 
 
+def _gate_5_runtime_open_check() -> int:
+    """Patch ``open``/``Path.open`` around a real, in-process matcher run.
+
+    Check 8 is a static ``ast.walk`` -- it cannot see a path assembled from fragments at
+    runtime (``Path(a + b)``, string concatenation, an environment variable). This is the
+    amendment's second owed debt: an actual runtime observation, alongside the static one,
+    of every file the matcher touches while it runs.
+
+    **In-process, not a subprocess.** Every other gate runs the matcher as a subprocess
+    (``_matcher_and_score``), so a patch here would not see a subprocess's file opens.
+    ``_gate_5_self_check`` already sets the precedent for reaching into a tool in-process
+    (it imports ``check_isolation`` and patches its module-global ``ROOT``) rather than
+    shelling out -- this is the same move, applied once more, because the whole point of
+    this check is to observe opens directly.
+
+    Returns the number of paths observed, so the caller can print a count rather than a
+    bare "ok" -- the same discipline gate 12's ``multi`` check and gate 5's own self-check
+    already follow: a count that could be zero is worth seeing, not worth hiding behind a
+    check that merely didn't fail.
+    """
+    import builtins
+    import importlib
+    import pathlib
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory(prefix="hisaab-gate5-open-") as tmp:
+        root = Path(tmp)
+        data_dir, truth_dir = root / "data", root / "truth"
+        cfg = GenConfig(seed=1, n=60, out_dir=data_dir, truth_dir=truth_dir)
+        story = build(cfg)
+        report = check_story(story, cfg)
+        emit(story, cfg, invariant_report=report)
+
+        opened: list[str] = []
+        real_open, real_path_open = builtins.open, pathlib.Path.open
+
+        def _tracking_open(file, *args, **kwargs):
+            opened.append(str(Path(file).resolve()))
+            return real_open(file, *args, **kwargs)
+
+        def _tracking_path_open(self, *args, **kwargs):
+            opened.append(str(self.resolve()))
+            return real_path_open(self, *args, **kwargs)
+
+        matcher_cli = importlib.import_module("hisaab.matcher.cli")
+        with patch("builtins.open", _tracking_open), \
+             patch("pathlib.Path.open", _tracking_path_open):
+            rc = matcher_cli.main([
+                "--data", str(data_dir), "--out", str(root / "matches.json"),
+                "--seed", "1", "--quiet",
+            ])
+        if rc != 0:
+            raise GateFailure(
+                f"gate 5's runtime open-check could not even run the matcher (exit {rc}) "
+                f"-- nothing was observed, so the check below would pass vacuously"
+            )
+
+        truth_dir_resolved = str(truth_dir.resolve())
+        leaked = [p for p in opened if p == truth_dir_resolved or p.startswith(truth_dir_resolved + "\\")
+                  or p.startswith(truth_dir_resolved + "/")]
+        if leaked:
+            raise GateFailure(
+                f"the matcher opened {len(leaked)} path(s) under truth/ at runtime: "
+                f"{leaked[:3]} -- a static scan cannot see this, which is exactly why "
+                f"this check patches open() directly"
+            )
+
+        # Vacuity guard: prove the patch can actually catch a truth-read, or the clean
+        # result above is unearned. A tiny script that deliberately opens a file under
+        # truth/, run through the identical patch.
+        canary = truth_dir / "run_manifest.json"
+        canary_opened: list[str] = []
+
+        def _canary_open(file, *args, **kwargs):
+            canary_opened.append(str(Path(file).resolve()))
+            return real_open(file, *args, **kwargs)
+
+        with patch("builtins.open", _canary_open):
+            with open(canary, "r", encoding="utf-8"):
+                pass
+        if str(canary.resolve()) not in canary_opened:
+            raise GateFailure(
+                "gate 5's runtime open-check baseline failed: the patch did not observe "
+                "a deliberate open() under truth/, so the clean result above proves nothing"
+            )
+
+    return len(opened)
+
+
 def gate_5_isolation() -> None:
     print("\ngate 5 -- truth isolation, and the matching engine cannot reach a model")
     verified = _gate_5_self_check()
@@ -500,6 +589,11 @@ def gate_5_isolation() -> None:
     )
     out = _run([sys.executable, "tools/check_isolation.py", "--quiet"], "check_isolation")
     print(f"    the answer key is unreachable from the matching path{out and ''}")
+    observed = _gate_5_runtime_open_check()
+    print(
+        f"    runtime open()/Path.open() patch: {observed} path(s) observed during a real "
+        f"matcher run, none under truth/ -- and the patch is proven to catch one when planted"
+    )
     print(
         "    nothing under hisaab/ imports an HTTP client, a model SDK, subprocess, "
         "importlib or ctypes"
@@ -566,6 +660,35 @@ def _matcher_and_score(
         return json.loads(first)
     except json.JSONDecodeError as e:
         raise GateFailure(f"line 1 of the scorer's stdout is not JSON: {first!r} ({e})")
+
+
+def _check_no_truth_vocab_leak(matches_path: Path) -> None:
+    """The amendment's third owed debt: an output-side leak check on ``matches.json`` itself.
+
+    Gate 18 already bans ``truth.json``/``resolvable``/``true_`` at the **rendered HTML**
+    layer, and that check needs a documented exception for ``metric_block()``'s own shipped
+    "resolvable, but it abstained" caption -- static Phase 9 prose the report quotes
+    verbatim. ``matches.json`` is different: it is the matcher's raw JSON output, and it
+    never carries report prose at all. Measured directly on a real run (Phase 12 plan
+    correction (3)): zero occurrences of any of the three terms. So this check needs no
+    caption exception -- a plain, unscoped, case-folded, word-boundary ban is sufficient,
+    and it is a narrower, simpler check than gate 18's, not a smaller version of the same
+    one.
+
+    A judge who reads the matcher's raw JSON output without ever opening the report is
+    checked by nothing today. This closes that gap.
+    """
+    text = matches_path.read_text(encoding="utf-8").lower()
+    if re.search(r"\btruth\.json\b", text):
+        raise GateFailure(f"{matches_path}: 'truth.json' leaked into the matcher's own output")
+    if re.search(r"\btrue_", text):
+        raise GateFailure(f"{matches_path}: 'true_*' leaked into the matcher's own output")
+    if re.search(r"\bresolvable\b", text):
+        raise GateFailure(
+            f"{matches_path}: 'resolvable' leaked into the matcher's own output -- "
+            f"matches.json carries no report prose, so unlike gate 18's HTML-level check "
+            f"this one needs no caption exception at all"
+        )
 
 
 def _decisions(matches: Path) -> list[tuple[object, ...]]:
@@ -681,6 +804,10 @@ def gate_9_matcher(sizes: tuple[int, ...] = (60, 200)) -> None:
                 "block, so something non-deterministic reached a verdict -- a set "
                 "iteration, a dict insertion order, or an unsorted candidate list"
             )
+        # Phase 12 step 1c, the amendment's third owed debt: matches.json itself must not
+        # carry truth vocabulary, additive to every assertion already made about this file.
+        _check_no_truth_vocab_leak(first)
+        print("    matches.json carries no truth-side vocabulary (truth.json/resolvable/true_)")
         clocks = [
             json.loads(p.read_text(encoding="utf-8"))["timing"]["wall_clock_seconds"]
             for p in (first, second)
@@ -1726,6 +1853,14 @@ def gate_12_tier_mix(sizes: tuple[int, ...] = (60, 200)) -> None:
     with tempfile.TemporaryDirectory(prefix="hisaab-tiers-") as tmp:
         root = Path(tmp)
         failures: list[str] = []
+        # Phase 12 step 2: the per-seed tier split above was never checked *across* seeds,
+        # only for "both tiers nonzero" on each one individually. Measured on the real
+        # composable() flag set, TIER_MIX_SEEDS, sizes (60, 200): Tier 2 share ranges
+        # 0.2917-0.3111 at n=60 and 0.2880-0.3040 at n=200 -- both comfortably inside
+        # 0.27-0.32. n=1000 measures 0.2316-0.2582, which does NOT overlap that band, so
+        # this assertion is scoped to sizes=(60, 200) and must be re-measured, not reused,
+        # if `sizes` is ever widened to include n=1000.
+        tier2_shares: list[float] = []
         for seed in TIER_MIX_SEEDS:
             for n in sizes:
                 base = root / f"s{seed}n{n}"
@@ -1811,6 +1946,9 @@ def gate_12_tier_mix(sizes: tuple[int, ...] = (60, 200)) -> None:
                         f"    seed {seed}, n={n:<4} tier1={by_tier.get(1, 0):<4} "
                         f"tier2={by_tier.get(2, 0):<4} multi-payment rows={multi}"
                     )
+                    total_tiered = sum(by_tier.values())
+                    if total_tiered:
+                        tier2_shares.append(by_tier.get(2, 0) / total_tiered)
 
         if failures:
             raise GateFailure(
@@ -1818,6 +1956,22 @@ def gate_12_tier_mix(sizes: tuple[int, ...] = (60, 200)) -> None:
                 f"not exercise both tiers.\n\n  " + "\n  ".join(failures[:4])
                 + (f"\n  ... and {len(failures) - 4} more" if len(failures) > 4 else "")
             )
+
+        # Phase 12 step 2: the cross-seed band, scoped to sizes=(60, 200) only -- see the
+        # comment where tier2_shares is declared. Do not widen this band's use to a call
+        # site with a different `sizes` without re-measuring first.
+        out_of_band = [s for s in tier2_shares if not (0.27 <= s <= 0.32)]
+        if out_of_band:
+            raise GateFailure(
+                f"Tier 2 share left the 0.27-0.32 band on {len(out_of_band)} of "
+                f"{len(tier2_shares)} run(s) (e.g. {out_of_band[:4]}). This band is measured "
+                f"only for sizes=(60, 200); a run at a different size does not belong in "
+                f"this average."
+            )
+        print(
+            f"    tier2 share across {len(tier2_shares)} runs: "
+            f"{min(tier2_shares):.4f}-{max(tier2_shares):.4f}, all within 0.27-0.32"
+        )
 
         # Last, because it is the most expensive line in the gate and there is no reason to
         # pay for it when the distribution above is already wrong.

@@ -260,6 +260,14 @@ class Metrics:
     exception_minutes: int = 0
     ignores_total: int = 0
 
+    #: Money already booked wrong -- the credit value behind every ``WRONG_MATCH_CELLS``
+    #: landing. Distinct from ``exception_value_paise``: an exception is money *awaiting* a
+    #: human, a wrong match is money a human was never told to look at because the matcher
+    #: committed to an answer instead of raising one. A ₹2,00,000 wrong match and a ₹49 one
+    #: both used to just increment ``wrong_matches`` by one -- this is the amendment's owed
+    #: value-at-risk line, priced instead of merely counted.
+    wrong_match_value_paise: int = 0
+
     #: Minutes charged for dismissals -- ``ignores_total x DISMISSAL_MINUTES``. **A separate
     #: counter rather than more minutes in ``exception_minutes``**, because an ``IGNORED`` row
     #: is not an exception: that field serialises as ``exceptions.estimated_minutes``, and
@@ -414,11 +422,24 @@ class Metrics:
                 "checked": self.decomposition_checked,
                 "mismatches": self.decomposition_mismatches,
             },
+            # Its own block, not a key under ``exceptions``: a wrong match raises no
+            # exception, so folding this into that block would make its name wrong for the
+            # population it counts -- the same reasoning ``dismissals`` already got its own
+            # block for.
+            "risk": {
+                "wrong_match_value_paise": self.wrong_match_value_paise,
+            },
         }
 
 
 #: Bumped on a breaking change to ``Metrics.as_json``. Phase 9 re-ranks this document
 #: and Phase 11 renders it; a format that shifts silently costs both.
+#:
+#: v5 (Phase 12 step 1a): a new ``risk`` block, carrying ``wrong_match_value_paise`` -- the
+#: amendment's owed value-at-risk line. Breaking for the same reason v4 was: a v4 reader
+#: that defaults a missing ``risk`` key to ``{"wrong_match_value_paise": 0}`` cannot tell
+#: "measured zero" from "never measured", and the whole point of this field is that a run
+#: with a real wrong-match value must not read as indistinguishable from one that has none.
 #:
 #: v4 (Phase 9 step 1): a new ``dismissals`` block. Breaking by the same rule as v2 and v3
 #: below -- a renderer reading ``dismissals.estimated_minutes`` would otherwise have to branch
@@ -444,7 +465,7 @@ class Metrics:
 #: v1 document is a run where the arithmetic was never checked -- which is a different fact
 #: from a run where it was checked and agreed. Refusing the old document says so; reading
 #: it and defaulting the missing key would not.
-METRICS_SCHEMA_VERSION = 4
+METRICS_SCHEMA_VERSION = 5
 
 
 class MetricsError(Exception):
@@ -538,6 +559,7 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
     landings: list[Landing] = []
     exception_value = 0
     exception_minutes = 0
+    wrong_match_value = 0
     checked = 0
     mismatched = 0
 
@@ -607,6 +629,8 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
         if verdict.outcome is Outcome.EXCEPTION:
             exception_value += value
             exception_minutes += minutes_for(verdict.reason)
+        if cell in WRONG_MATCH_CELLS:
+            wrong_match_value += value
 
     gateway = [c for c in truth.credits if c.credit_id not in noise_ids]
 
@@ -645,6 +669,7 @@ def score(run: VerdictFile, truth: Truth) -> Metrics:
         exceptions=counts["EXCEPTION"],
         exception_value_paise=exception_value,
         exception_minutes=exception_minutes,
+        wrong_match_value_paise=wrong_match_value,
         ignores_total=counts["IGNORED"],
         # Charged per row, by the act rather than the code -- see ``DISMISSAL_MINUTES``.
         dismissal_minutes=counts["IGNORED"] * DISMISSAL_MINUTES,
@@ -714,6 +739,7 @@ if __name__ == "__main__":
     assert m.abstention_rate is None, "clean mode plants none -- must be n/a, not 0%"
     assert m.noise_precision is None and m.noise_recall is None
     assert m.exceptions == 0 and m.exception_value_paise == 0 and m.exception_minutes == 0
+    assert m.wrong_match_value_paise == 0, "nothing wrong, nothing at risk"
     # Step 5: the arithmetic was checked on all three, and agreed on all three.
     assert m.decomposition_checked == 3 and m.decomposition_mismatches == 0
     assert m.decomposition_agreement == 1.0
@@ -805,6 +831,10 @@ if __name__ == "__main__":
     ):
         m = score(_run((_resolved("C0001", guess),)), _truth(batched))
         assert m.cells[expect] == 1, (guess, expect, m.cells)
+        # Priced only when it's wrong: a correct match is not money at risk.
+        assert m.wrong_match_value_paise == (VALUE if expect is Cell.WRONG_MATCH else 0), (
+            expect, m.wrong_match_value_paise,
+        )
         # The arithmetic is scored only where the payment sets agree. On a wrong match the
         # two decompositions describe *different* sets of money, so every term would differ
         # and the mismatch count would be measuring the linkage failure a second time --
@@ -833,11 +863,13 @@ if __name__ == "__main__":
     m = score(_run((_resolved("C0001", ("pay_0009",)),)), t)
     assert m.cells[Cell.WRONG_MATCH_INVENTED] == 1 and m.wrong_matches == 1
     assert m.cells[Cell.WRONG_MATCH] == 0, "invented must not be pooled with wrong_match"
+    assert m.wrong_match_value_paise == VALUE, "WRONG_MATCH_INVENTED is priced too -- both live in WRONG_MATCH_CELLS"
     # guessing right is luck, not correctness -- and is NOT impossible
     m = score(_run((_resolved("C0001", ("pay_0001",)),)), t)
     assert m.cells[Cell.LUCKY_GUESS] == 1 and m.cells[Cell.CORRECT] == 0
     assert m.correctness == 0.0, "credit for a lucky guess would reward guessing"
     assert m.wrong_matches == 1
+    assert m.wrong_match_value_paise == VALUE, "a lucky guess is still money nobody was told to check"
     # ...and its arithmetic *is* scored, deliberately: the payment set matches, so the two
     # decompositions describe the same money and the comparison is meaningful. The gate is
     # set equality, not the cell -- the linkage is uncredited here for a separate reason
@@ -855,6 +887,7 @@ if __name__ == "__main__":
     assert m.cells[Cell.WRONG_IGNORE] == 1
     assert m.wrong_matches == 0, "a wrong ignore is not a wrong match -- different fix"
     assert m.coverage == 0.0, "ignoring is not committing"
+    assert m.wrong_match_value_paise == 0, "WRONG_IGNORE is not in WRONG_MATCH_CELLS"
 
     # --- noise stays out of the headline (Phase 7 shape) -------------------
     mixed = (_credit("C0001", ("pay_0001",)), _credit("C0002", ("pay_0002",)))
@@ -909,6 +942,8 @@ if __name__ == "__main__":
         "a Landing must never carry truth's answer -- that is how Phase 3 starts "
         "fitting the answer key"
     )
+    assert m.wrong_match_value_paise == VALUE
+    assert m.as_json()["risk"] == {"wrong_match_value_paise": VALUE}
 
     # --- the payment count: derived, and cross-checked against the header -----
     # The positive path runs on every real file, since the generator always writes

@@ -69,7 +69,7 @@ from ..common.verdict import Outcome
 #: this module's only ``hisaab.scoring`` import to the two symbols that need the allowlist
 #: entry -- ``Metrics``, ``Cell`` and ``metric_block`` -- rather than reaching back into
 #: ``assemble`` for a version number that has nothing to do with rendering.
-METRICS_SCHEMA_VERSION = 4
+METRICS_SCHEMA_VERSION = 5
 
 # The two symbols this module exists to import. Importing *anything* under ``hisaab.scoring``
 # counts as reaching truth under ``tools/check_isolation.py``'s own rule, so this module is
@@ -135,6 +135,12 @@ def reconstruct(doc: dict[str, Any]) -> Metrics:
     ``doc`` -- verified for eleven runs in this module's self-check -- but it is not a real
     ``Metrics``: nothing downstream of this function should read ``.landings`` for anything
     other than what ``roi()`` reads it for.
+
+    ``wrong_match_value_paise`` (Phase 12) is the one money field this function does not
+    have to reconstruct from a shortcut: ``score()`` already prices it directly onto
+    ``Metrics`` and serialises it in the document's own ``risk`` block, so it is read here
+    the same way ``exception_value_paise`` is -- a real number, not a placeholder tied to
+    ``_synthetic_landings``'s zeroed ``value_paise``.
     """
     version = doc.get("schema_version")
     if version != METRICS_SCHEMA_VERSION:
@@ -167,6 +173,7 @@ def reconstruct(doc: dict[str, Any]) -> Metrics:
         exceptions=doc["exceptions"]["count"],
         exception_value_paise=doc["exceptions"]["value_paise"],
         exception_minutes=doc["exceptions"]["estimated_minutes"],
+        wrong_match_value_paise=doc["risk"]["wrong_match_value_paise"],
         ignores_total=doc["dismissals"]["count"],
         dismissal_minutes=doc["dismissals"]["estimated_minutes"],
         decomposition_checked=doc["decomposition"]["checked"],
