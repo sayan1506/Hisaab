@@ -1,7 +1,7 @@
 # Hisaab
 
 **Multi-source payment reconciliation with a measured, honest match rate.**
-Razorpay AI Buildathon — Track 04, AI Finance Controller.
+Razorpay AI Buildathon - Track 04, AI Finance Controller.
 
 *Hisaab* is Hindi for **accounts**, and also for **a reckoning**. Both readings apply: the
 tool reconciles payments against settlements against a bank statement, and it reports
